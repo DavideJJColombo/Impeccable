@@ -63,11 +63,13 @@
   const MANUAL_APPLY_STATE_TTL_MS = 15 * 60 * 1000;
   // No idFactory: the session helper's default works on plain-HTTP origins,
   // where the secure-context-only randomUUID does not exist (issue #1055).
+  let liveStorage = null;
+  try { liveStorage = window.localStorage; } catch { /* storage denied */ }
   let sessionState = null;
   try {
     sessionState = window.__IMPECCABLE_LIVE_SESSION__?.createLiveBrowserSessionState({
       prefix: PREFIX,
-      storage: localStorage,
+      storage: liveStorage,
     });
   } catch (err) {
     console.error('[impeccable] Live mode could not create its session state.', err);
