@@ -1300,6 +1300,15 @@ describe('live-browser source contracts', () => {
       assert.match(inlineMd(`[docs](${href})`), /^<a href="/, href);
     }
   });
+
+  it('removes the helper token from window on every run, including a double-init', () => {
+    for (const alreadyInit of [false, true]) {
+      const window = { __IMPECCABLE_TOKEN__: 'secret', __IMPECCABLE_LIVE_INIT__: alreadyInit };
+      // No port: a fresh run returns right after reading it, before any DOM work.
+      runInNewContext(SOURCE, { window, console });
+      assert.equal('__IMPECCABLE_TOKEN__' in window, false, `alreadyInit=${alreadyInit}`);
+    }
+  });
   it('reads localStorage for the session helper inside a try', () => {
     // A denied store throws on the property read itself; unguarded, init
     // aborts with __IMPECCABLE_LIVE_INIT__ still true and never retries.

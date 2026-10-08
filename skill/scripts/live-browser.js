@@ -13,13 +13,17 @@
   'use strict';
   if (typeof window === 'undefined') return;
 
+  // Take the helper token out of the global before anything else, including
+  // on the double-init return below: each served copy re-prepends it.
+  const TOKEN = window.__IMPECCABLE_TOKEN__;
+  try { delete window.__IMPECCABLE_TOKEN__; } catch { /* non-configurable */ }
+
   // Guard against double-init. Bun's HTML loader may process the <script> tag
   // and create a bundled copy alongside the external load, or HMR may re-execute.
-  // Check BEFORE reading token/port to catch all cases.
+  // Check BEFORE reading port to catch all cases.
   if (window.__IMPECCABLE_LIVE_INIT__) return;
   window.__IMPECCABLE_LIVE_INIT__ = true;
 
-  const TOKEN = window.__IMPECCABLE_TOKEN__;
   const PORT = window.__IMPECCABLE_PORT__;
   const APP_ROOT = window.__IMPECCABLE_APP_ROOT__ || null;
   if (!TOKEN || !PORT) {
