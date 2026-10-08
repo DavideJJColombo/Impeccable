@@ -13463,12 +13463,22 @@ void main() {
     // Code spans
     s = s.replace(/`([^`]+)`/g, (_, code) => `<code>${code}</code>`);
     // Links [text](url)
-    s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, t, u) => `<a href="${u}" target="_blank" rel="noopener noreferrer">${t}</a>`);
+    s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, t, u) => (
+      isSafeHref(u) ? `<a href="${u}" target="_blank" rel="noopener noreferrer">${t}</a>` : t
+    ));
     // Bold
     s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
     // Italic (only single *…*, skip if inside bold already handled)
     s = s.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>');
     return s;
+  }
+
+  function isSafeHref(url) {
+    // Browsers drop ASCII whitespace and C0 controls inside a scheme, so
+    // "java\tscript:" still runs; strip them before reading the scheme.
+    const probe = String(url).replace(/[\u0000-\u0020\u007f]/g, '');
+    const scheme = probe.match(/^([a-z][a-z0-9+.-]*):/i);
+    return !scheme || ['http', 'https', 'mailto'].includes(scheme[1].toLowerCase());
   }
 
   function highlightBold(text) {
