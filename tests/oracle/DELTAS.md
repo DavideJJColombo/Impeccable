@@ -7038,3 +7038,12 @@ Product decision (maintainer, 2026-10-11). Decision-page cards on direction and 
 Re-recorded from the binary and reviewed by hand, 38 goldens plus one new. Every change is one of the lines named above.
 
 Review round, 2026-10-12 (PR review). Seed references are now salted per user (`IMPECCABLE_SEED_SALT` pins it in the oracle), so every `seed-*` golden's `SEED REFERENCE` line carries a new value. The roll record names its seed by reference and drops `at` (its age is the file's mtime), so the `seed-*` goldens that snapshot `roll.json` show `"seed":"seed:<hex>"` where they showed the key and the time. `grounded` joins the card kinds, which adds it to the `question-schema` note and the `question-update-card-identity-missing` refusal. `question-update-comps-next` declares kinds on its cards, so it reaches NEXT again; the history lines that named it as an accepted delta no longer start with its id, so the case is checked, and its golden changes only by the payload digest. Re-recorded from the binary and reviewed by hand, 29 goldens.
+## Hard offset shadow advisory (#929)
+
+Added four reviewed goldens: the new fixture in JSON/text modes, plus an isolated
+advisory-only target with and without `--no-advisory`. The fixture has exactly
+four `hard-offset-shadow` advisory findings and exits 0. The isolated case also
+exits 0, and its `--no-advisory` control returns `[]`. None of the existing
+individual fixture goldens changed. Existing accepted directory/scope deltas
+remain; the new fixture adds four advisories to the applicable directory scans.
+Frozen function-level vectors were not regenerated.
