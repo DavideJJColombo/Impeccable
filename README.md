@@ -2,6 +2,8 @@
 
 Design guidance for AI coding agents. 1 skill, 24 commands, live browser iteration, and 59 deterministic detector rules for AI-generated frontend design.
 
+[![Gaia Skill: Impeccable](https://gaiaskilltree.com/badges/_assets/pbakaus/impeccable.svg?repo=pbakaus/impeccable)](https://gaiaskilltree.com/named/#explorer/pbakaus/impeccable)
+
 > **Quick start:** From your project root, run `npx impeccable install`, then run `/impeccable init` inside your AI coding tool. Full docs: [impeccable.style](https://impeccable.style).
 
 ## Why Impeccable?
