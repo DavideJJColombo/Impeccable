@@ -338,13 +338,36 @@ fn roll_file(qdir: &str) -> String {
     jsp::join(&[qdir, "roll.json"])
 }
 
+/// What a roll the API dealt adds to its record: the seed's mode and
+/// register, and the response's `poolRevision` when it was well formed.
+pub struct ApiRoll<'a> {
+    pub mode: Option<&'a str>,
+    pub register: Option<&'a str>,
+    pub pool_revision: Option<&'a str>,
+}
+
 /// Records a concept-seed roll for the next decision page. Best effort: a
-/// roll never fails because its record could not be written.
-pub fn record_roll(cwd: &str, scope: &str, key: &str, reroll: usize, worlds: &[Value]) {
+/// roll never fails because its record could not be written. A roll the API
+/// dealt (`api`) also records `"source": "api"`, its `poolRevision`, `mode`
+/// and `register`, which the page carries into its hand (`roll_seed`) so the
+/// picker can send the choice ping itself.
+pub fn record_roll(cwd: &str, scope: &str, key: &str, reroll: usize, worlds: &[Value], api: Option<&ApiRoll>) {
     let qdir = jsp::join(&[cwd, ".impeccable", "questions"]);
     let mut record = json!({ "scope": scope, "key": key, "reroll": reroll, "at": now_ms() as u64 });
     if !worlds.is_empty() {
         record["worlds"] = Value::Array(worlds.to_vec());
+    }
+    if let Some(a) = api {
+        record["source"] = json!("api");
+        if let Some(p) = a.pool_revision.filter(|p| crate::telemetry::valid_pool_revision(p)) {
+            record["poolRevision"] = json!(p);
+        }
+        if let Some(m) = a.mode {
+            record["mode"] = json!(m);
+        }
+        if let Some(r) = a.register {
+            record["register"] = json!(r);
+        }
     }
     let _ = std::fs::create_dir_all(&qdir).and_then(|_| write_atomic(&roll_file(&qdir), &json_compact(&record)));
 }
@@ -491,6 +514,31 @@ fn dealt_worlds(roll: Option<&str>, payload: &Value) -> Vec<Value> {
 /// The worlds recorded in a hand (`dealt_worlds` at the time it was dealt).
 fn hand_worlds(hand: Option<&Map<String, Value>>) -> Vec<Value> {
     hand.and_then(|h| h.get("worlds")).and_then(Value::as_array).map(|a| a.iter().filter_map(world_card).collect()).unwrap_or_default()
+}
+
+/// The telemetry context a decision page takes from an API-dealt roll: the
+/// seed `key`, `scope`, `reroll`, `mode`, `register`, `poolRevision`, and
+/// `dealt` (every printed world `world_card` accepts), under the same
+/// conditions as `dealt_worlds` but for either scope. `None` for any other
+/// roll, so a hand that took a local or degraded roll never pings.
+fn roll_seed(roll: Option<&str>, payload: &Value) -> Option<Value> {
+    if !payload.get("buildPath").is_some_and(|b| !b.is_null()) {
+        return None;
+    }
+    let record = roll.and_then(|t| serde_json::from_str::<Value>(t).ok())?;
+    let fresh = record.get("at").and_then(Value::as_f64).is_some_and(|at| now_ms() - at < ROLL_WINDOW_MS);
+    if !fresh || record.get("source").and_then(Value::as_str) != Some("api") {
+        return None;
+    }
+    let mut seed = Map::new();
+    for k in ["key", "scope", "reroll", "mode", "register", "poolRevision", "source"] {
+        if let Some(v) = record.get(k).filter(|v| !v.is_null()) {
+            seed.insert(k.into(), v.clone());
+        }
+    }
+    let dealt: Vec<Value> = record.get("worlds").and_then(Value::as_array).map(|a| a.iter().filter_map(world_card).collect()).unwrap_or_default();
+    seed.insert("dealt".into(), Value::Array(dealt));
+    Some(Value::Object(seed))
 }
 
 /// A decision page took the roll it was gated against: the payload carries
@@ -664,13 +712,14 @@ pub fn record_generated(cwd: &str, out: &str) -> Result<Vec<String>, String> {
 /// already holds a file, so that file never passes for this hand's comp.
 #[cfg(test)]
 fn new_hand(cwd: &str, payload: &Value) -> Map<String, Value> {
-    new_hand_dealt(cwd, payload, &[])
+    new_hand_dealt(cwd, payload, &[], None)
 }
 
 /// `new_hand` for a page that takes a roll: `worlds` (`dealt_worlds`) ride in
 /// the hand, because the roll record is gone once the page has taken it and
 /// the NEXT line is printed after that, and again by a later `--wait` flip.
-fn new_hand_dealt(cwd: &str, payload: &Value, worlds: &[Value]) -> Map<String, Value> {
+/// `seed` (`roll_seed`) rides in it the same way, for the picker's ping.
+fn new_hand_dealt(cwd: &str, payload: &Value, worlds: &[Value], seed: Option<Value>) -> Map<String, Value> {
     let comps = declared_comps(payload);
     let mut pre = Map::new();
     // Sketches share the comps' staleness rule: a re-roll that reuses a card
@@ -695,6 +744,9 @@ fn new_hand_dealt(cwd: &str, payload: &Value, worlds: &[Value]) -> Map<String, V
     m.insert("startedAt".into(), Value::from(now_ms() as i64));
     if !worlds.is_empty() {
         m.insert("worlds".into(), Value::Array(worlds.to_vec()));
+    }
+    if let Some(seed) = seed {
+        m.insert("seed".into(), seed);
     }
     m
 }
@@ -738,12 +790,12 @@ fn hand_marker_id(hand: &Map<String, Value>) -> String {
 /// carries this payload's digest (a restart keeps its fingerprints), else a
 /// new one, written before the server spawns. `worlds` (`dealt_worlds`) go
 /// into a new hand only: a restart keeps the worlds its hand was dealt.
-fn start_hand(qdir: &str, key: &str, cwd: &str, payload: &Value, worlds: &[Value]) -> Result<Map<String, Value>, String> {
+fn start_hand(qdir: &str, key: &str, cwd: &str, payload: &Value, worlds: &[Value], seed: Option<Value>) -> Result<Map<String, Value>, String> {
     let digest = hand_digest(payload);
     if let Some(h) = read_hand(qdir, key).filter(|h| h.get("digest").and_then(Value::as_str) == Some(digest.as_str())) {
         return Ok(h);
     }
-    let h = new_hand_dealt(cwd, payload, worlds);
+    let h = new_hand_dealt(cwd, payload, worlds, seed);
     write_hand(qdir, key, &h)?;
     Ok(h)
 }
@@ -1148,7 +1200,7 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
         // A delivered round is always a new hand. Recorded before delivery:
         // on failure the page keeps the previous round, whose hand file is
         // untouched, so nothing is served without its provenance.
-        let hand = new_hand_dealt(&cwd, &next_round, &dealt_worlds(roll.as_deref(), &next_round));
+        let hand = new_hand_dealt(&cwd, &next_round, &dealt_worlds(roll.as_deref(), &next_round), roll_seed(roll.as_deref(), &next_round));
         if let Err(e) = write_hand(&qdir, &key, &hand) {
             io.err(&format!("serve-question: could not record the hand ({}); nothing was delivered. Make .impeccable/questions/ writable and rerun --update on the same key.\n", e));
             return 1;
@@ -1183,7 +1235,7 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
         }
         let _ = std::fs::create_dir_all(&qdir);
         let key = a.arg("key").unwrap_or_else(random_key);
-        let hand = match start_hand(&qdir, &key, &cwd, &start_payload, &dealt_worlds(roll.as_deref(), &start_payload)) {
+        let hand = match start_hand(&qdir, &key, &cwd, &start_payload, &dealt_worlds(roll.as_deref(), &start_payload), roll_seed(roll.as_deref(), &start_payload)) {
             Ok(h) => h,
             Err(e) => {
                 io.err(&format!("serve-question: could not record the hand ({}); the page was not served. Make .impeccable/questions/ writable and rerun --start.\n", e));
@@ -1554,6 +1606,22 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
                 }
             }
             let answer = json_compact(&Value::Object(ans));
+            // The choice ping, sent by the page itself when the hand took an
+            // API-dealt roll and the card's kind is certain (`picker_choice`).
+            // The round is marked sent before the answer is written, so the
+            // agent's `--kind` rerun, which only runs once it has the answer,
+            // finds the mark and sends nothing.
+            let picker_ping = if is_reroll || crate::telemetry::telemetry_disabled(&env) {
+                None
+            } else {
+                st.detached_key
+                    .as_deref()
+                    .and_then(|k| read_hand(&st.qdir, k))
+                    .filter(|h| h.get("digest").and_then(Value::as_str) == Some(hand_digest(&st.payload).as_str()))
+                    .and_then(|h| h.get("seed").cloned())
+                    .and_then(|seed| crate::telemetry::picker_choice(&seed, &st.payload, option_id.as_str().unwrap_or("")))
+                    .filter(|p| crate::telemetry::mark_recorded(&st.cwd, p.key.as_deref().unwrap_or(""), p.reroll.unwrap_or(0), "picker"))
+            };
             let was_awaiting = st.awaiting_next;
             st.awaiting_next = (is_reroll || followup_open) && st.detached_key.is_some();
             if st.awaiting_next && !was_awaiting {
@@ -1566,10 +1634,24 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
                 print_answer(io, &answer, &declared_comps(&st.payload));
                 let _ = io.stdout.flush();
             }
+            // Sent after the answer is on disk, off the request loop, within
+            // the API budget; a ping that fails clears its mark so the
+            // agent's rerun may still send it. Never fails the round.
+            let ping_thread = picker_ping.map(|ping| {
+                let (env, cwd) = (env.clone(), st.cwd.clone());
+                std::thread::spawn(move || {
+                    if !crate::telemetry::send_choice(&env, &cwd, &ping, crate::telemetry::api_timeout(&env)) {
+                        crate::telemetry::unmark_recorded(&cwd, ping.key.as_deref().unwrap_or(""), ping.reroll.unwrap_or(0), "picker");
+                    }
+                })
+            });
             if !((is_reroll || followup_open) && st.detached_key.is_some()) {
                 drop(st);
                 sleep_ms(150);
                 let _ = io.stdout.flush();
+                if let Some(t) = ping_thread {
+                    let _ = t.join();
+                }
                 return 0;
             }
             continue;
@@ -2433,19 +2515,19 @@ mod tests {
 
         // Fresh start, a file an earlier session left at the slot: NEXT.
         write_file(&dir.join(slot), b"earlier session");
-        let fresh = start_hand(&qdir, "k1", &cwd, &hand1, &[]).unwrap();
+        let fresh = start_hand(&qdir, "k1", &cwd, &hand1, &[], None).unwrap();
         assert!(comps_expected(&hand1, &cwd, Some(&fresh)));
         assert_eq!(read_hand(&qdir, "k1").as_ref(), Some(&fresh));
 
         // The comp lands; the server dies; a restart of the same payload on the
         // same key keeps the recorded fingerprints: no NEXT.
         write_file(&dir.join(slot), b"this hand");
-        let restart = start_hand(&qdir, "k1", &cwd, &hand1, &[]).unwrap();
+        let restart = start_hand(&qdir, "k1", &cwd, &hand1, &[], None).unwrap();
         assert_eq!(restart, fresh);
         assert!(!comps_expected(&hand1, &cwd, Some(&restart)));
 
         // A different payload on that key is a new hand: the landed file is stale.
-        let other = start_hand(&qdir, "k1", &cwd, &hand2, &[]).unwrap();
+        let other = start_hand(&qdir, "k1", &cwd, &hand2, &[], None).unwrap();
         assert_ne!(other, fresh);
         assert!(comps_expected(&hand2, &cwd, Some(&other)));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2471,7 +2553,7 @@ mod tests {
 
         // The server dies before the new comp lands; a restart of the re-roll
         // payload keeps the re-roll's hand, so the old file still does not count.
-        let restart = start_hand(&qdir, "k1", &cwd, &reroll, &[]).unwrap();
+        let restart = start_hand(&qdir, "k1", &cwd, &reroll, &[], None).unwrap();
         assert_eq!(restart, hand);
         assert!(comps_expected(&reroll, &cwd, Some(&restart)));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2792,7 +2874,7 @@ mod tests {
         let qdir = jsp::join(&[&dir.to_string_lossy(), ".impeccable", "questions"]);
         let roll = dir.join(".impeccable/questions/roll.json");
         // Recorded the way concept-seed records a roll.
-        record_roll(&dir.to_string_lossy(), "surface", "seed-1", 0, &[]);
+        record_roll(&dir.to_string_lossy(), "surface", "seed-1", 0, &[], None);
         assert!(surface_roll_pending(read_roll(&qdir).as_deref()));
         std::fs::write(dir.join("p.json"), surface_round(false).to_string()).unwrap();
         let run_err = |args: &[&str]| {
@@ -3283,8 +3365,8 @@ mod tests {
         // --start records the worlds in a new hand; the roll record is then
         // gone, and a restart of the same payload keeps the hand's worlds.
         let dealt = dealt_worlds(Some(&json!({ "scope": "direction", "key": "k", "reroll": 0, "at": now_ms() as u64, "worlds": worlds }).to_string()), &code_led);
-        let hand = start_hand(&qdir, "k1", &cwd, &code_led, &dealt).unwrap();
-        let restart = start_hand(&qdir, "k1", &cwd, &code_led, &[]).unwrap();
+        let hand = start_hand(&qdir, "k1", &cwd, &code_led, &dealt, None).unwrap();
+        let restart = start_hand(&qdir, "k1", &cwd, &code_led, &[], None).unwrap();
         assert_eq!(restart, hand);
         assert_eq!(Value::Array(hand_worlds(Some(&restart))), worlds);
         // The code-led round flips to comp: its NEXT line names the cards.
@@ -3566,5 +3648,125 @@ mod tests {
         assert_eq!(parse_request_url("//evil host/x"), None);
         // Dot segments normalize like the URL parser.
         assert_eq!(parse_request_url("/x/../answer"), Some(("/answer".into(), String::new())));
+    }
+
+    /// A stand-in `/api/chosen`: records each body with its client header.
+    fn chosen_api() -> (String, std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>) {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let base = format!("http://127.0.0.1:{}/api", server.server_addr().to_ip().unwrap().port());
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> = Default::default();
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for mut req in server.incoming_requests() {
+                let header = req.headers().iter().find(|h| h.field.equiv("X-Impeccable-Client")).map(|h| h.value.as_str().to_string()).unwrap_or_default();
+                let mut body = String::new();
+                let _ = std::io::Read::read_to_string(req.as_reader(), &mut body);
+                log.lock().unwrap().push((header, body));
+                let _ = req.respond(tiny_http::Response::from_string("{}"));
+            }
+        });
+        (base, seen)
+    }
+
+    /// Serves `payload` as a detached page on key `pk` in-process, answers it
+    /// with `option`, and returns the server's exit code once it exits.
+    fn answer_on_page(dir: &std::path::Path, payload: &Value, option: &str, extra_env: &[(&str, &str)]) -> i32 {
+        let qdir = dir.join(".impeccable/questions");
+        let _ = std::fs::remove_file(qdir.join("pk.state.json"));
+        std::fs::write(dir.join("payload.json"), payload.to_string()).unwrap();
+        let mut env = Env::from([("IMPECCABLE_SELF".to_string(), "impeccable".to_string())]);
+        for (k, v) in extra_env {
+            env.insert(k.to_string(), v.to_string());
+        }
+        let cwd = dir.to_path_buf();
+        let server = std::thread::spawn(move || {
+            let (mut io, _cap) = Io::captured("", cwd, env);
+            // --timeout 0: the lifetime watchdog never fires in the test process.
+            let argv: Vec<String> = ["--payload", "payload.json", "--detached-serve", "--key", "pk", "--timeout", "0", "--no-open"].iter().map(|s| s.to_string()).collect();
+            run(&argv, &mut io)
+        });
+        let deadline = now_ms() + 5000.0;
+        let port = loop {
+            if let Some(p) = read_state(&qdir.to_string_lossy(), "pk").and_then(|s| s.get("port").and_then(Value::as_u64)) {
+                break p;
+            }
+            assert!(now_ms() < deadline, "server never wrote its state");
+            sleep_ms(20);
+        };
+        ureq::post(&format!("http://127.0.0.1:{}/answer?key=pk", port)).send_string(&json!({ "optionId": option }).to_string()).unwrap();
+        server.join().unwrap()
+    }
+
+    #[test]
+    fn the_page_sends_the_choice_ping_itself_and_the_agent_rerun_becomes_a_no_op() {
+        let dir = temp_project("picker-ping");
+        let cwd = dir.to_string_lossy().to_string();
+        let qdir = dir.join(".impeccable/questions").to_string_lossy().to_string();
+        let worlds = json!([
+            { "id": "teletext-service", "board": "https://cards.test/teletext-service.webp", "hero": "https://cards.test/teletext-service-hero.webp" },
+            { "id": "microfiche-reader", "board": "https://cards.test/microfiche-reader.webp", "hero": "https://cards.test/microfiche-reader-hero.webp" }
+        ]);
+        let payload = json!({
+            "options": [
+                { "id": "assigned", "label": "Fillmore", "kicker": "THE ROLL" },
+                { "id": "challenger-teletext", "label": "Teletext", "verdict": "competitive", "hero": "https://cards.test/teletext-service-hero.webp" }
+            ],
+            "buildPath": { "value": "code", "toggle": true }, "canon": true
+        });
+        let round = |n: usize| crate::telemetry::SeedRound { scope: "direction".into(), reroll: n, mode: Some("persuade".into()), pool_revision: Some("0123456789ab".into()), dealt: vec!["teletext-service".into(), "microfiche-reader".into()], ..Default::default() };
+        // What concept-seed leaves after an API roll, then what --start does with it.
+        let deal = |n: usize| {
+            record_roll(&cwd, "direction", "seed-1", n, worlds.as_array().unwrap(), Some(&ApiRoll { mode: Some("persuade"), register: None, pool_revision: Some("0123456789ab") }));
+            crate::telemetry::record_seed_round(&cwd, "seed-1", &round(n));
+            let roll = read_roll(&qdir);
+            let _ = std::fs::remove_file(hand_file(&qdir, "pk"));
+            let seed = roll_seed(roll.as_deref(), &payload);
+            assert!(seed.is_some());
+            start_hand(&qdir, "pk", &cwd, &payload, &dealt_worlds(roll.as_deref(), &payload), seed).unwrap();
+        };
+        let (base, seen) = chosen_api();
+
+        deal(0);
+        assert_eq!(answer_on_page(&dir, &payload, "challenger-teletext", &[("IMPECCABLE_API_URL", &base), ("IMPECCABLE_TELEMETRY_CHANNEL", "test")]), 0);
+        let got = seen.lock().unwrap().clone();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].0, format!("impeccable/{}+engine test", env!("CARGO_PKG_VERSION")));
+        assert_eq!(got[0].1, r#"{"chosenId":"teletext-service","key":"seed-1","scope":"direction","mode":"persuade","kind":"challenger","reroll":0,"poolRevision":"0123456789ab","source":"picker"}"#);
+        assert_eq!(crate::telemetry::read_seed_round(&cwd, "seed-1", Some(0)).unwrap().recorded.as_deref(), Some("picker"));
+        // The agent's rerun for the same round sends nothing.
+        let ping_env = Env::from([("IMPECCABLE_API_URL".to_string(), base.clone())]);
+        let (mut io, cap) = Io::captured("", dir.clone(), ping_env);
+        let argv: Vec<String> = ["--kind", "challenger", "--chosen", "teletext-service", "--from", "seed-1", "--scope", "direction"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(crate::concept_seed::run(&argv, &mut io), 0);
+        assert_eq!(String::from_utf8(cap.stdout.borrow().clone()).unwrap(), "choice already recorded\n");
+        assert_eq!(seen.lock().unwrap().len(), 1);
+
+        // Opted out: no ping and no mark, so nothing claims the round.
+        deal(1);
+        answer_on_page(&dir, &payload, "assigned", &[("IMPECCABLE_API_URL", &base), ("DO_NOT_TRACK", "1")]);
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert_eq!(crate::telemetry::read_seed_round(&cwd, "seed-1", Some(1)).unwrap().recorded, None);
+
+        // A ping that cannot leave the machine clears its mark for the agent's rerun.
+        deal(2);
+        answer_on_page(&dir, &payload, "assigned", &[("IMPECCABLE_API_URL", "http://127.0.0.1:9/api"), ("IMPECCABLE_API_TIMEOUT", "300")]);
+        assert_eq!(crate::telemetry::read_seed_round(&cwd, "seed-1", Some(2)).unwrap().recorded, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_an_api_roll_seeds_the_hand() {
+        let page = json!({ "options": [{ "id": "a" }], "buildPath": { "value": "comp", "toggle": true } });
+        let record = |extra: Value| {
+            let mut r = json!({ "scope": "surface", "key": "k", "reroll": 1, "at": now_ms() as u64 });
+            r.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            r.to_string()
+        };
+        assert_eq!(roll_seed(Some(&record(json!({}))), &page), None, "a local roll");
+        let api = record(json!({ "source": "api", "poolRevision": "0123456789ab", "mode": "operate" }));
+        assert_eq!(roll_seed(Some(&api), &page), Some(json!({ "key": "k", "scope": "surface", "reroll": 1, "mode": "operate", "poolRevision": "0123456789ab", "source": "api", "dealt": [] })));
+        assert_eq!(roll_seed(Some(&api), &json!({ "options": [{ "id": "a" }] })), None, "a page that takes no roll");
+        let stale = json!({ "scope": "direction", "key": "k", "reroll": 0, "at": (now_ms() - ROLL_WINDOW_MS - 1000.0) as u64, "source": "api" }).to_string();
+        assert_eq!(roll_seed(Some(&stale), &page), None);
     }
 }

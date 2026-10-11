@@ -6,9 +6,10 @@ use crate::jsp;
 use crate::roll_selection::*;
 use crate::seed_text as t;
 use crate::target_args::TargetOptions;
+use crate::telemetry;
 use crate::util::Env;
 use impeccable_common::Io;
-use serde_json::{Map, Value};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::time::{Duration, Instant};
 
@@ -111,9 +112,7 @@ struct ApiBudget {
 
 impl ApiBudget {
     fn new(env: &Env) -> ApiBudget {
-        let ms = env.get("IMPECCABLE_API_TIMEOUT").filter(|v| !v.is_empty()).map(|v| crate::critique_storage::js_number(v)).unwrap_or(4000.0);
-        let ms = if ms.is_nan() { 0.0 } else { ms.max(0.0) };
-        ApiBudget { deadline: None, timeout: Duration::from_millis(ms as u64) }
+        ApiBudget { deadline: None, timeout: telemetry::api_timeout(env) }
     }
     fn remaining(&mut self) -> Duration {
         let d = *self.deadline.get_or_insert_with(|| Instant::now() + self.timeout);
@@ -122,16 +121,11 @@ impl ApiBudget {
 }
 
 fn api_base(env: &Env) -> String {
-    let base = env.get("IMPECCABLE_API_URL").filter(|v| !v.is_empty()).cloned().unwrap_or_else(|| "https://impeccable.style/api".to_string());
-    base.strip_suffix('/').unwrap_or(&base).to_string()
+    telemetry::api_base(env)
 }
 
 pub(crate) fn card_base(env: &Env) -> String {
     env.get("IMPECCABLE_CARD_BASE").filter(|v| !v.is_empty()).cloned().unwrap_or_else(|| "https://impeccable.style/worlds/cards".to_string())
-}
-
-fn agent(timeout: Duration) -> ureq::Agent {
-    crate::http::agent_builder().timeout_connect(timeout).timeout(timeout).build()
 }
 
 /// URLSearchParams serialization (application/x-www-form-urlencoded).
@@ -147,7 +141,7 @@ fn form_encode(s: &str) -> String {
     out
 }
 
-fn fetch_roll(env: &Env, budget: &mut ApiBudget, scope: &str, key: &str, mode: Option<&str>, grain: Option<&str>, platform: Option<&str>, reroll: usize) -> Option<Value> {
+fn fetch_roll(env: &Env, cwd: &str, budget: &mut ApiBudget, scope: &str, key: &str, mode: Option<&str>, grain: Option<&str>, platform: Option<&str>, reroll: usize) -> Option<Value> {
     let mut params = vec![("scope", scope.to_string()), ("key", key.to_string()), ("reroll", reroll.to_string())];
     if let Some(m) = mode {
         params.push(("mode", m.to_string()));
@@ -164,7 +158,7 @@ fn fetch_roll(env: &Env, budget: &mut ApiBudget, scope: &str, key: &str, mode: O
     if remaining.is_zero() {
         return None;
     }
-    let res = agent(remaining).get(&url).call().ok()?;
+    let res = telemetry::agent(remaining).get(&url).set(telemetry::CLIENT_HEADER, &telemetry::client_header(env, cwd)).call().ok()?;
     if res.status() < 200 || res.status() >= 300 {
         return None;
     }
@@ -177,64 +171,85 @@ fn fetch_roll(env: &Env, budget: &mut ApiBudget, scope: &str, key: &str, mode: O
     Some(roll)
 }
 
-fn telemetry_disabled(env: &Env) -> bool {
-    env.get("IMPECCABLE_NO_TELEMETRY").map(|v| !v.is_empty()).unwrap_or(false) || env.get("DO_NOT_TRACK").map(|v| !v.is_empty()).unwrap_or(false)
+/// The agent-run choice ping's arguments, as the `--kind` command passed them.
+struct PingArgs<'a> {
+    chosen_id: Option<&'a str>,
+    key: Option<&'a str>,
+    scope: Option<&'a str>,
+    mode: Option<&'a str>,
+    kind: Option<&'a str>,
+    register: Option<&'a str>,
+    /// `--reroll <n>` when it was a valid round (0 to 8).
+    reroll: Option<usize>,
 }
 
-/// JS: pingChosen
-fn ping_chosen(env: &Env, budget: &mut ApiBudget, chosen_id: Option<&str>, key: Option<&str>, scope: Option<&str>, mode: Option<&str>, kind: Option<&str>, register: Option<&str>) -> bool {
-    if telemetry_disabled(env) {
-        return false;
+enum PingOutcome {
+    Sent,
+    Skipped,
+    AlreadyRecorded,
+}
+
+/// JS: pingChosen. When the seed ledger holds the round for `--from <key>`
+/// (the `--reroll` round, else the latest), that record fills `reroll` and
+/// `poolRevision`, a `chosenId` outside the round's dealt catalog ids is
+/// dropped (the kind still goes), and a round whose choice was already sent
+/// (by the decision page or an earlier ping) sends nothing. With no record
+/// the arguments go as given.
+fn ping_chosen(env: &Env, cwd: &str, budget: &mut ApiBudget, a: &PingArgs) -> PingOutcome {
+    if telemetry::telemetry_disabled(env) {
+        return PingOutcome::Skipped;
     }
-    let chosen_id = chosen_id.filter(|s| !s.is_empty());
-    let kind = kind.filter(|s| !s.is_empty());
-    let register = register.filter(|s| !s.is_empty());
+    let mut chosen_id = a.chosen_id.filter(|s| !s.is_empty());
+    let kind = a.kind.filter(|s| !s.is_empty());
+    let register = a.register.filter(|s| !s.is_empty());
     if let Some(k) = kind {
-        if !["assigned", "pick", "challenger", "canon"].contains(&k) {
-            return false;
+        if !telemetry::KINDS.contains(&k) {
+            return PingOutcome::Skipped;
         }
     }
     if let Some(r) = register {
         if r != "safer" && r != "bolder" {
-            return false;
+            return PingOutcome::Skipped;
         }
     }
     if chosen_id.is_none() && kind.is_none() {
-        return false;
+        return PingOutcome::Skipped;
     }
     if (kind == Some("challenger") || kind.is_none()) && chosen_id.is_none() {
-        return false;
+        return PingOutcome::Skipped;
     }
-    let mut body = Map::new();
-    if let Some(c) = chosen_id {
-        body.insert("chosenId".into(), Value::String(c.to_string()));
+    let round = a.key.filter(|k| !k.is_empty()).and_then(|k| telemetry::read_seed_round(cwd, k, a.reroll));
+    if let Some(r) = &round {
+        if r.recorded.is_some() {
+            return PingOutcome::AlreadyRecorded;
+        }
+        if chosen_id.is_some_and(|c| !r.dealt.iter().any(|d| d == c)) {
+            // Not a catalog id from this round's hand: a grounded direction's
+            // name never leaves the machine. Without a kind there is nothing left.
+            chosen_id = None;
+            if kind.is_none() {
+                return PingOutcome::Skipped;
+            }
+        }
     }
-    // JSON.stringify omits undefined values
-    if let Some(k) = key {
-        body.insert("key".into(), Value::String(k.to_string()));
+    let ping = telemetry::ChoicePing {
+        chosen_id: chosen_id.map(str::to_string),
+        key: a.key.map(str::to_string),
+        scope: a.scope.map(str::to_string),
+        mode: a.mode.map(str::to_string),
+        kind: kind.map(str::to_string),
+        register: register.map(str::to_string),
+        reroll: Some(round.as_ref().map(|r| r.reroll).or(a.reroll).unwrap_or(0)),
+        pool_revision: round.as_ref().and_then(|r| r.pool_revision.clone()),
+        source: "agent",
+    };
+    if !telemetry::send_choice(env, cwd, &ping, budget.remaining()) {
+        return PingOutcome::Skipped;
     }
-    if let Some(s) = scope {
-        body.insert("scope".into(), Value::String(s.to_string()));
+    if let (Some(k), Some(r)) = (a.key, &round) {
+        telemetry::mark_recorded(cwd, k, r.reroll, "agent");
     }
-    if let Some(m) = mode {
-        body.insert("mode".into(), Value::String(m.to_string()));
-    }
-    if let Some(k) = kind {
-        body.insert("kind".into(), Value::String(k.to_string()));
-    }
-    if let Some(r) = register {
-        body.insert("register".into(), Value::String(r.to_string()));
-    }
-    let remaining = budget.remaining();
-    if remaining.is_zero() {
-        return false;
-    }
-    let url = format!("{}/chosen", api_base(env));
-    agent(remaining)
-        .post(&url)
-        .set("Content-Type", "application/json")
-        .send_string(&serde_json::to_string(&Value::Object(body)).unwrap())
-        .is_ok()
+    PingOutcome::Sent
 }
 
 fn vs(v: &Value, key: &str) -> String {
@@ -350,20 +365,28 @@ fn unit(scope: &str, salt: &str, key: &str) -> f64 {
     u32::from_be_bytes([d[0], d[1], d[2], d[3]]) as f64 / 4294967295.0
 }
 
+/// What a roll leaves for its records: the catalog worlds it printed as
+/// challengers (`{"id", "board", "hero"}` each), and, for a roll the API
+/// dealt, the response's `poolRevision` (`None` for a local or degraded roll).
+pub(crate) struct RollMeta {
+    pub worlds: Vec<Value>,
+    pub api: bool,
+    pub pool_revision: Option<String>,
+}
+
 /// JS: renderConceptSeed
-/// Returns the text plus the catalog worlds the roll printed as challengers
-/// (`{"id", "board", "hero"}` each), for the roll record.
-fn render_concept_seed(env: &Env, cwd: &str, budget: &mut ApiBudget, a: &SeedArgs) -> Result<(String, Vec<Value>), String> {
-    let (scope, reroll, roll, degraded, worlds) = render_roll(env, cwd, budget, a)?;
+/// Returns the text plus the roll's `RollMeta`, for the roll record.
+fn render_concept_seed(env: &Env, cwd: &str, budget: &mut ApiBudget, a: &SeedArgs) -> Result<(String, RollMeta), String> {
+    let (scope, reroll, roll, degraded, meta) = render_roll(env, cwd, budget, a)?;
     // PRESENTATION closes every roll, where a middle-truncated read still
     // reaches it, like the restated lines above it.
     let register = a.register.clone().flatten();
-    Ok((roll + &presentation_block(env, cwd, scope, reroll, degraded, register.as_deref(), a.mode.clone().flatten().as_deref(), a.build_path.as_ref()), worlds))
+    Ok((roll + &presentation_block(env, cwd, scope, reroll, degraded, register.as_deref(), a.mode.clone().flatten().as_deref(), a.build_path.as_ref()), meta))
 }
 
-/// The roll itself: (scope, re-roll round, text, degraded, printed worlds).
+/// The roll itself: (scope, re-roll round, text, degraded, records).
 #[allow(clippy::type_complexity)]
-fn render_roll(env: &Env, cwd: &str, budget: &mut ApiBudget, a: &SeedArgs) -> Result<(&'static str, usize, String, bool, Vec<Value>), String> {
+fn render_roll(env: &Env, cwd: &str, budget: &mut ApiBudget, a: &SeedArgs) -> Result<(&'static str, usize, String, bool, RollMeta), String> {
     let scope = match a.scope.as_deref() {
         Some("surface") => "surface",
         Some("direction") => "direction",
@@ -445,7 +468,7 @@ fn render_roll(env: &Env, cwd: &str, budget: &mut ApiBudget, a: &SeedArgs) -> Re
             composition_match: Some(comps.match_),
         })
     } else {
-        fetch_roll(env, budget, scope, key, mode, grain, platform, reroll).map(|roll| RollData {
+        fetch_roll(env, cwd, budget, scope, key, mode, grain, platform, reroll).map(|roll| RollData {
             source: "api".into(),
             pool_revision: vs(&roll, "poolRevision"),
             approved_count: vs(&roll, "approvedCount"),
@@ -504,7 +527,7 @@ fn render_roll(env: &Env, cwd: &str, budget: &mut ApiBudget, a: &SeedArgs) -> Re
             let mut pairs = common.clone();
             pairs.push(("DEGRADEDHEADER", &degraded_header));
             pairs.push(("AUTHORITYINSTRUCTION", &authority));
-            return Ok((scope, reroll, fill(t::DEGRADED_SAFER, &pairs), true, vec![]));
+            return Ok((scope, reroll, fill(t::DEGRADED_SAFER, &pairs), true, RollMeta { worlds: vec![], api: false, pool_revision: None }));
         }
         let degraded_register = if register == Some("bolder") { t::DEGRADED_BOLDER.to_string() } else { String::new() };
         let mut pairs = common.clone();
@@ -514,7 +537,7 @@ fn render_roll(env: &Env, cwd: &str, budget: &mut ApiBudget, a: &SeedArgs) -> Re
         pairs.push(("PROMOTEDINSTRUCTION", &promoted));
         pairs.push(("AUTHORITYINSTRUCTION", &authority));
         pairs.push(("RESTATED_ASSIGNED_OR_DEALT", &restated_assigned_or_dealt));
-        return Ok((scope, reroll, fill(t::DEGRADED_BODY, &pairs), true, vec![]));
+        return Ok((scope, reroll, fill(t::DEGRADED_BODY, &pairs), true, RollMeta { worlds: vec![], api: false, pool_revision: None }));
     };
 
     let compositions_enabled = env.get("IMPECCABLE_COMPOSITIONS").map(|v| v == "1").unwrap_or(false);
@@ -596,7 +619,9 @@ fn render_roll(env: &Env, cwd: &str, budget: &mut ApiBudget, a: &SeedArgs) -> Re
     pairs.push(("RICHNESSINSTRUCTION", &richness));
     pairs.push(("TELEMETRYBLOCK", &telemetry_block));
     pairs.push(("RESTATED", &restated));
-    Ok((scope, reroll, fill(t::MAIN, &pairs), false, worlds))
+    let api = data.source == "api";
+    let pool_revision = Some(data.pool_revision.clone()).filter(|p| api && telemetry::valid_pool_revision(p));
+    Ok((scope, reroll, fill(t::MAIN, &pairs), false, RollMeta { worlds, api, pool_revision }))
 }
 
 fn random_hex8() -> String {
@@ -618,18 +643,17 @@ pub fn run(args: &[String], io: &mut Io) -> i32 {
     let chosen = val("--chosen");
     let kind = val("--kind");
     if chosen.is_some() || kind.is_some() {
-        let flat = |v: &Option<Option<String>>| -> Option<String> { v.clone().flatten() };
-        let sent = ping_chosen(
-            &env,
-            &mut budget,
-            flat(&chosen).as_deref(),
-            flat(&val("--from")).as_deref(),
-            flat(&val("--scope")).as_deref(),
-            flat(&val("--mode")).as_deref(),
-            flat(&kind).as_deref(),
-            flat(&val("--register")).as_deref(),
-        );
-        io.out(if sent { "choice recorded\n" } else { "choice ping skipped\n" });
+        let flat = |v: Option<Option<String>>| -> Option<String> { v.flatten() };
+        let (chosen, from, scope, mode, kind, register) = (flat(chosen), flat(val("--from")), flat(val("--scope")), flat(val("--mode")), flat(kind), flat(val("--register")));
+        // `--reroll <n>`: the round the choice resolved on, 0 to 8; anything
+        // else is ignored rather than sent.
+        let reroll = flat(val("--reroll")).map(|s| crate::critique_storage::js_number(&s)).filter(|n| n.is_finite() && n.fract() == 0.0 && *n >= 0.0 && *n <= telemetry::MAX_REROLL as f64).map(|n| n as usize);
+        let args = PingArgs { chosen_id: chosen.as_deref(), key: from.as_deref(), scope: scope.as_deref(), mode: mode.as_deref(), kind: kind.as_deref(), register: register.as_deref(), reroll };
+        io.out(match ping_chosen(&env, &cwd, &mut budget, &args) {
+            PingOutcome::Sent => "choice recorded\n",
+            PingOutcome::Skipped => "choice ping skipped\n",
+            PingOutcome::AlreadyRecorded => "choice already recorded\n",
+        });
         return 0;
     }
     let ctx = load_context(&cwd, &TargetOptions::default(), &env);
@@ -657,12 +681,22 @@ pub fn run(args: &[String], io: &mut Io) -> i32 {
         build_path: crate::context_cli::recorded_build_path(&ctx, &cwd),
     };
     match render_concept_seed(&env, &cwd, &mut budget, &seed) {
-        Ok((text, worlds)) => {
+        Ok((text, meta)) => {
             // A valid roll: the scope and re-roll round passed validation.
             // serve-question reads the record to know a surface round when
             // it serves one, and which catalog worlds were dealt, so it can
             // name their card images when the comps are due (`record_roll`).
-            crate::serve_question::record_roll(&cwd, seed.scope.as_deref().unwrap_or("surface"), &seed.key, seed.reroll as usize, &worlds);
+            let scope = seed.scope.as_deref().unwrap_or("surface");
+            let mode = seed.mode.clone().flatten();
+            let register = seed.register.clone().flatten();
+            let api = meta.api.then(|| crate::serve_question::ApiRoll { mode: mode.as_deref(), register: register.as_deref(), pool_revision: meta.pool_revision.as_deref() });
+            crate::serve_question::record_roll(&cwd, scope, &seed.key, seed.reroll as usize, &meta.worlds, api.as_ref());
+            // An API-dealt round also enters the seed ledger, which outlives
+            // the roll record, for the choice ping that follows the round.
+            if meta.api {
+                let dealt = meta.worlds.iter().filter_map(|w| w.get("id").and_then(Value::as_str)).map(str::to_string).collect();
+                telemetry::record_seed_round(&cwd, &seed.key, &telemetry::SeedRound { scope: scope.to_string(), reroll: seed.reroll as usize, mode, register, pool_revision: meta.pool_revision.clone(), dealt, recorded: None });
+            }
             io.out(&text);
             0
         }
@@ -1003,5 +1037,107 @@ mod tests {
         assert_eq!((r["scope"].as_str(), r["key"].as_str(), r["reroll"].as_u64()), (Some("direction"), Some("k2"), Some(1)));
         // A degraded roll dealt no world: the record keeps its old shape.
         assert!(r.get("worlds").is_none(), "{r}");
+    }
+
+    /// A stand-in roll API on loopback: answers `GET /api/roll` with two
+    /// dealt worlds and `POST /api/chosen` with 200, and records every
+    /// request as (method, url, X-Impeccable-Client, body).
+    type Seen = std::sync::Arc<std::sync::Mutex<Vec<(String, String, String, String)>>>;
+    fn roll_api() -> (String, Seen) {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let base = format!("http://127.0.0.1:{}/api", server.server_addr().to_ip().unwrap().port());
+        let seen: Seen = Default::default();
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for mut req in server.incoming_requests() {
+                let header = req.headers().iter().find(|h| h.field.equiv("X-Impeccable-Client")).map(|h| h.value.as_str().to_string()).unwrap_or_default();
+                let mut body = String::new();
+                let _ = std::io::Read::read_to_string(req.as_reader(), &mut body);
+                log.lock().unwrap().push((req.method().as_str().to_string(), req.url().to_string(), header, body));
+                let roll = serde_json::json!({
+                    "poolRevision": "0123456789ab", "approvedCount": 2, "catalogCount": 3,
+                    "challengers": [
+                        { "id": "teletext-service", "form": "Teletext", "spark": "s", "system": ["r"], "webLeverage": "w" },
+                        { "id": "microfiche-reader", "form": "Microfiche", "spark": "s", "system": ["r"], "webLeverage": "w" }
+                    ]
+                });
+                let text = if req.url().starts_with("/api/roll") { roll.to_string() } else { "{}".to_string() };
+                let _ = req.respond(tiny_http::Response::from_string(text));
+            }
+        });
+        (base, seen)
+    }
+
+    fn seed_api(proj: &std::path::Path, skill: &std::path::Path, base: &str, args: &[&str]) -> String {
+        let env = Env::from([
+            ("IMPECCABLE_SKILL_DIR".into(), skill.to_string_lossy().into_owned()),
+            ("IMPECCABLE_CATALOG_DIR".into(), proj.join("no-such-catalog").to_string_lossy().into_owned()),
+            ("IMPECCABLE_API_URL".into(), base.to_string()),
+            ("IMPECCABLE_API_TIMEOUT".into(), "3000".into()),
+            ("IMPECCABLE_TELEMETRY_CHANNEL".into(), "test".into()),
+            ("IMPECCABLE_NO_STALENESS_CHECK".into(), "1".into()),
+            ("IMPECCABLE_SELF".into(), "impeccable".into()),
+        ]);
+        let (mut io, cap) = Io::captured("", proj.to_path_buf(), env);
+        let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        assert_eq!(run(&argv, &mut io), 0);
+        let out = String::from_utf8(cap.stdout.borrow().clone()).unwrap();
+        out
+    }
+
+    fn chosen_bodies(seen: &Seen) -> Vec<String> {
+        seen.lock().unwrap().iter().filter(|r| r.0 == "POST").map(|r| r.3.clone()).collect()
+    }
+
+    #[test]
+    fn api_rolls_send_the_client_header_and_record_the_pool_revision() {
+        let (proj, skill) = fixture("api-roll", &[("mode-persuade", MODE_FILE)]);
+        let (base, seen) = roll_api();
+        let engine = format!("impeccable/{}+engine test", env!("CARGO_PKG_VERSION"));
+        let out = seed_api(&proj, &skill, &base, &["--scope", "direction", "--mode", "persuade", "--from", "k1"]);
+        assert!(out.contains("source: api; approved pool: 0123456789ab"), "{out}");
+        assert!(out.contains("--kind <assigned|pick|challenger|canon> --from k1 --scope direction --mode persuade,\n"), "round 0 carries no --reroll: {out}");
+        let roll = seen.lock().unwrap()[0].clone();
+        assert_eq!((roll.0.as_str(), roll.2.as_str()), ("GET", engine.as_str()));
+        let record: Value = serde_json::from_str(&std::fs::read_to_string(proj.join(".impeccable/questions/roll.json")).unwrap()).unwrap();
+        assert_eq!(record["poolRevision"], "0123456789ab");
+        assert_eq!(record["source"], "api");
+        assert_eq!(record["mode"], "persuade");
+        let round = telemetry::read_seed_round(&proj.to_string_lossy(), "k1", Some(0)).unwrap();
+        assert_eq!(round.dealt, vec!["teletext-service", "microfiche-reader"]);
+        assert_eq!(round.pool_revision.as_deref(), Some("0123456789ab"));
+
+        // A re-roll's TELEMETRY line names its round.
+        let out = seed_api(&proj, &skill, &base, &["--scope", "direction", "--mode", "persuade", "--from", "k1", "--reroll", "2"]);
+        assert!(out.contains("--from k1 --scope direction --mode persuade --reroll 2,\n"), "{out}");
+    }
+
+    #[test]
+    fn agent_pings_fill_the_round_from_the_ledger_and_send_only_dealt_ids() {
+        let (proj, skill) = fixture("api-ping", &[("mode-persuade", MODE_FILE)]);
+        let (base, seen) = roll_api();
+        seed_api(&proj, &skill, &base, &["--scope", "direction", "--mode", "persuade", "--from", "k1"]);
+        seed_api(&proj, &skill, &base, &["--scope", "direction", "--mode", "persuade", "--from", "k1", "--reroll", "1"]);
+        // No --reroll: the latest round. An agent-invented id is dropped and the kind still goes.
+        let out = seed_api(&proj, &skill, &base, &["--kind", "challenger", "--chosen", "challenger-teletext", "--from", "k1", "--scope", "direction", "--mode", "persuade"]);
+        assert_eq!(out, "choice recorded\n");
+        assert_eq!(chosen_bodies(&seen).last().unwrap(), r#"{"key":"k1","scope":"direction","mode":"persuade","kind":"challenger","reroll":1,"poolRevision":"0123456789ab","source":"agent"}"#);
+        let post = seen.lock().unwrap().iter().rfind(|r| r.0 == "POST").cloned().unwrap();
+        assert_eq!((post.1.as_str(), post.2.as_str()), ("/api/chosen", format!("impeccable/{}+engine test", env!("CARGO_PKG_VERSION")).as_str()));
+        // The same round again: already sent.
+        let out = seed_api(&proj, &skill, &base, &["--kind", "assigned", "--from", "k1", "--scope", "direction", "--reroll", "1"]);
+        assert_eq!(out, "choice already recorded\n");
+        // Round 0 by --reroll: a dealt catalog id passes.
+        let out = seed_api(&proj, &skill, &base, &["--kind", "challenger", "--chosen", "microfiche-reader", "--from", "k1", "--scope", "direction", "--reroll", "0"]);
+        assert_eq!(out, "choice recorded\n");
+        assert_eq!(chosen_bodies(&seen).last().unwrap(), r#"{"chosenId":"microfiche-reader","key":"k1","scope":"direction","kind":"challenger","reroll":0,"poolRevision":"0123456789ab","source":"agent"}"#);
+        // No ledger for the key: sent as given, with the --reroll round.
+        let n = chosen_bodies(&seen).len();
+        let out = seed_api(&proj, &skill, &base, &["--kind", "challenger", "--chosen", "own-grounded-3", "--from", "k9", "--scope", "direction", "--reroll", "3"]);
+        assert_eq!(out, "choice recorded\n");
+        assert_eq!(chosen_bodies(&seen)[n], r#"{"chosenId":"own-grounded-3","key":"k9","scope":"direction","kind":"challenger","reroll":3,"source":"agent"}"#);
+        // An out-of-range --reroll is ignored rather than sent.
+        seed_api(&proj, &skill, &base, &["--kind", "pick", "--from", "k8", "--scope", "direction", "--reroll", "12"]);
+        assert_eq!(chosen_bodies(&seen).last().unwrap(), r#"{"key":"k8","scope":"direction","kind":"pick","reroll":0,"source":"agent"}"#);
     }
 }

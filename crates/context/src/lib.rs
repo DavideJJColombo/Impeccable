@@ -40,6 +40,7 @@ pub use doctor::run as run_doctor;
 pub mod catalog;
 pub mod roll_selection;
 pub mod seed_text;
+pub mod telemetry;
 pub mod concept_seed;
 pub use concept_seed::run as run_concept_seed;
 pub mod generate_image;

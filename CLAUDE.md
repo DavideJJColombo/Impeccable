@@ -93,7 +93,7 @@ As of v4 the repo holds only the open-source product layer: the skill, CLI, exte
 Consequences here:
 
 - `impeccable concept-seed` has no local catalog. It resolves data via `IMPECCABLE_CATALOG_DIR` (private repo, evals, tests), then the roll API at impeccable.style, then a degraded promotion-only seed. Oracle cases run against `tests/fixtures/concept-catalog/`.
-- The choice-ping telemetry (`--chosen`) honors `DO_NOT_TRACK` and `IMPECCABLE_NO_TELEMETRY` and only fires for API-dealt rolls.
+- The choice-ping telemetry (`--chosen`) honors `DO_NOT_TRACK` and `IMPECCABLE_NO_TELEMETRY` and only fires for API-dealt rolls. Every roll and choice request carries `X-Impeccable-Client: impeccable/<version>[ <channel>]`; tests and CI set `IMPECCABLE_TELEMETRY_CHANNEL=test` so their traffic is tagged (keep it that way for anything new that can reach the API). The decision page sends the ping itself (`source: "picker"`) when the card's kind is certain, and marks the round in `.impeccable/questions/seeds/` so the agent's `--kind` rerun prints `choice already recorded`; `crates/context/src/telemetry.rs` holds the rules.
 - Site copy, changelog, theme, and count validation for site pages happen in impeccable-site; this repo's `validateProse` scans only the READMEs.
 - The release script reads the changelog from `../impeccable-site/site/pages/changelog.astro` when releasing from here.
 - Never add catalog data files back to this repo; the catalog is the paid-service moat.
