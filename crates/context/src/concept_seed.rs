@@ -158,7 +158,13 @@ fn fetch_roll(env: &Env, cwd: &str, budget: &mut ApiBudget, scope: &str, key: &s
     if remaining.is_zero() {
         return None;
     }
-    let res = telemetry::agent(remaining).get(&url).set(telemetry::CLIENT_HEADER, &telemetry::client_header(env, cwd)).call().ok()?;
+    let mut req = telemetry::agent(remaining).get(&url).set(telemetry::CLIENT_HEADER, &telemetry::client_header(env, cwd));
+    // Opted out: the roll is still the feature, so it is requested, and the
+    // server is told to record nothing for it.
+    if telemetry::telemetry_disabled(env, cwd) {
+        req = req.set(telemetry::TELEMETRY_HEADER, "off");
+    }
+    let res = req.call().ok()?;
     if res.status() < 200 || res.status() >= 300 {
         return None;
     }
@@ -199,7 +205,7 @@ enum PingOutcome {
 /// (by the decision page or an earlier ping) sends nothing. With no record
 /// the arguments go as given.
 fn ping_chosen(env: &Env, cwd: &str, budget: &mut ApiBudget, a: &PingArgs) -> PingOutcome {
-    if telemetry::telemetry_disabled(env) {
+    if telemetry::telemetry_disabled(env, cwd) {
         return PingOutcome::Skipped;
     }
     let mut chosen_id = a.chosen_id.filter(|s| !s.is_empty());
@@ -249,6 +255,7 @@ fn ping_chosen(env: &Env, cwd: &str, budget: &mut ApiBudget, a: &PingArgs) -> Pi
         option: a.option,
         reroll: Some(round.as_ref().map(|r| r.reroll).or(a.reroll).unwrap_or(0)),
         pool_revision: round.as_ref().and_then(|r| r.pool_revision.clone()),
+        hand_id: round.as_ref().and_then(|r| r.hand_id.clone()),
         kind_source: None,
         source: "agent",
     };
@@ -349,6 +356,7 @@ fn load_local(catalog_dir: &str) -> Option<Local> {
 struct RollData {
     source: String,
     pool_revision: String,
+    hand_id: Option<String>,
     approved_count: String,
     catalog_count: String,
     challengers: Vec<Value>,
@@ -381,6 +389,8 @@ pub(crate) struct RollMeta {
     pub worlds: Vec<Value>,
     pub api: bool,
     pub pool_revision: Option<String>,
+    /// The response's `handId` when well formed.
+    pub hand_id: Option<String>,
 }
 
 /// JS: renderConceptSeed
@@ -390,7 +400,8 @@ fn render_concept_seed(env: &Env, cwd: &str, budget: &mut ApiBudget, a: &SeedArg
     // PRESENTATION closes every roll, where a middle-truncated read still
     // reaches it, like the restated lines above it.
     let register = a.register.clone().flatten();
-    Ok((roll + &presentation_block(env, cwd, scope, reroll, degraded, register.as_deref(), a.mode.clone().flatten().as_deref(), a.build_path.as_ref()), meta))
+    let reference = fill(t::SEED_REFERENCE, &[("REFERENCE", &telemetry::seed_reference(&a.key))]);
+    Ok((roll + &reference + &presentation_block(env, cwd, scope, reroll, degraded, register.as_deref(), a.mode.clone().flatten().as_deref(), a.build_path.as_ref()), meta))
 }
 
 /// The roll itself: (scope, re-roll round, text, degraded, records).
@@ -470,6 +481,7 @@ fn render_roll(env: &Env, cwd: &str, budget: &mut ApiBudget, a: &SeedArgs) -> Re
         Some(RollData {
             source: "local".into(),
             pool_revision: approved_pool_revision(&local.concepts),
+            hand_id: None,
             approved_count: sel.approved.len().to_string(),
             catalog_count: local.concepts.len().to_string(),
             challengers: sel.picks,
@@ -480,6 +492,7 @@ fn render_roll(env: &Env, cwd: &str, budget: &mut ApiBudget, a: &SeedArgs) -> Re
         fetch_roll(env, cwd, budget, scope, key, mode, grain, platform, reroll).map(|roll| RollData {
             source: "api".into(),
             pool_revision: vs(&roll, "poolRevision"),
+            hand_id: roll.get("handId").and_then(Value::as_str).map(str::to_string),
             approved_count: vs(&roll, "approvedCount"),
             catalog_count: vs(&roll, "catalogCount"),
             challengers: roll.get("challengers").and_then(|c| c.as_array()).cloned().unwrap_or_default(),
@@ -536,7 +549,7 @@ fn render_roll(env: &Env, cwd: &str, budget: &mut ApiBudget, a: &SeedArgs) -> Re
             let mut pairs = common.clone();
             pairs.push(("DEGRADEDHEADER", &degraded_header));
             pairs.push(("AUTHORITYINSTRUCTION", &authority));
-            return Ok((scope, reroll, fill(t::DEGRADED_SAFER, &pairs), true, RollMeta { worlds: vec![], api: false, pool_revision: None }));
+            return Ok((scope, reroll, fill(t::DEGRADED_SAFER, &pairs), true, RollMeta { worlds: vec![], api: false, pool_revision: None, hand_id: None }));
         }
         let degraded_register = if register == Some("bolder") { t::DEGRADED_BOLDER.to_string() } else { String::new() };
         let mut pairs = common.clone();
@@ -546,7 +559,7 @@ fn render_roll(env: &Env, cwd: &str, budget: &mut ApiBudget, a: &SeedArgs) -> Re
         pairs.push(("PROMOTEDINSTRUCTION", &promoted));
         pairs.push(("AUTHORITYINSTRUCTION", &authority));
         pairs.push(("RESTATED_ASSIGNED_OR_DEALT", &restated_assigned_or_dealt));
-        return Ok((scope, reroll, fill(t::DEGRADED_BODY, &pairs), true, RollMeta { worlds: vec![], api: false, pool_revision: None }));
+        return Ok((scope, reroll, fill(t::DEGRADED_BODY, &pairs), true, RollMeta { worlds: vec![], api: false, pool_revision: None, hand_id: None }));
     };
 
     let compositions_enabled = env.get("IMPECCABLE_COMPOSITIONS").map(|v| v == "1").unwrap_or(false);
@@ -636,7 +649,8 @@ fn render_roll(env: &Env, cwd: &str, budget: &mut ApiBudget, a: &SeedArgs) -> Re
     pairs.push(("RESTATED", &restated));
     let api = data.source == "api";
     let pool_revision = Some(data.pool_revision.clone()).filter(|p| api && telemetry::valid_pool_revision(p));
-    Ok((scope, reroll, fill(t::MAIN, &pairs), false, RollMeta { worlds, api, pool_revision }))
+    let hand_id = data.hand_id.clone().filter(|h| api && telemetry::valid_hand_id(h));
+    Ok((scope, reroll, fill(t::MAIN, &pairs), false, RollMeta { worlds, api, pool_revision, hand_id }))
 }
 
 fn random_hex8() -> String {
@@ -664,6 +678,16 @@ pub fn run(args: &[String], io: &mut Io) -> i32 {
         // else is ignored rather than sent.
         let reroll = flat(val("--reroll")).map(|s| crate::critique_storage::js_number(&s)).filter(|n| n.is_finite() && n.fract() == 0.0 && *n >= 0.0 && *n <= telemetry::MAX_REROLL as f64).map(|n| n as usize);
         let option = flat(val("--option")).map(|s| crate::critique_storage::js_number(&s)).filter(|n| n.is_finite() && n.fract() == 0.0 && *n >= 0.0 && *n <= telemetry::MAX_OPTION as f64).map(|n| n as usize);
+        // A seed reference resolves to its key; one this machine never
+        // recorded sends nothing, since the ping needs the key the roll used.
+        let from = match from.as_deref().map(|f| telemetry::resolve_seed(&cwd, f)) {
+            Some(Err(_)) => {
+                io.out("choice ping skipped\n");
+                return 0;
+            }
+            Some(Ok(k)) => Some(k),
+            None => None,
+        };
         let args = PingArgs { chosen_id: chosen.as_deref(), key: from.as_deref(), scope: scope.as_deref(), mode: mode.as_deref(), kind: kind.as_deref(), register: register.as_deref(), reroll, option };
         io.out(match ping_chosen(&env, &cwd, &mut budget, &args) {
             PingOutcome::Sent => "choice recorded\n",
@@ -678,16 +702,26 @@ pub fn run(args: &[String], io: &mut Io) -> i32 {
         return 1;
     }
     let num = |v: Option<Option<String>>| -> Option<f64> { v.map(|x| x.map(|s| crate::critique_storage::js_number(&s)).unwrap_or(f64::NAN)) };
+    let given = match val("--from") {
+        Some(Some(k)) => k,
+        Some(None) => "undefined".to_string(),
+        None => env.get("IMPECCABLE_CONCEPT_SEED").filter(|v| !v.is_empty()).cloned().unwrap_or_else(random_hex8),
+    };
+    // A seed reference (what the surface brief records) stands for the key
+    // this machine rolled it from; the deal depends on the key itself.
+    let key = match telemetry::resolve_seed(&cwd, &given) {
+        Ok(k) => k,
+        Err(r) => {
+            io.err(&format!("concept-seed: {} is a seed reference this machine has no record of. A reference resolves only where its roll was made (in .impeccable/questions/seeds/, which is never committed). To reproduce that deal here, pass the original key with --from; otherwise roll anew without --from.\n", r));
+            return 1;
+        }
+    };
     let seed = SeedArgs {
         scope: match val("--scope") {
             None => Some("surface".to_string()),
             Some(v) => v, // undefined value -> None -> invalid scope
         },
-        key: match val("--from") {
-            Some(Some(k)) => k,
-            Some(None) => "undefined".to_string(),
-            None => env.get("IMPECCABLE_CONCEPT_SEED").filter(|v| !v.is_empty()).cloned().unwrap_or_else(random_hex8),
-        },
+        key,
         reroll: num(val("--reroll")).unwrap_or(0.0),
         register: val("--register"),
         mode: val("--mode"),
@@ -705,13 +739,18 @@ pub fn run(args: &[String], io: &mut Io) -> i32 {
             let scope = seed.scope.as_deref().unwrap_or("surface");
             let mode = seed.mode.clone().flatten();
             let register = seed.register.clone().flatten();
-            let api = meta.api.then(|| crate::serve_question::ApiRoll { mode: mode.as_deref(), register: register.as_deref(), pool_revision: meta.pool_revision.as_deref() });
+            // Telemetry off: the roll record and ledger keep only what the
+            // feature needs (worlds for serve-question, the key behind the
+            // reference), none of the ping's fields.
+            let tracked = meta.api && !telemetry::telemetry_disabled(&env, &cwd);
+            telemetry::record_seed_key(&cwd, &seed.key);
+            let api = tracked.then(|| crate::serve_question::ApiRoll { mode: mode.as_deref(), register: register.as_deref(), pool_revision: meta.pool_revision.as_deref(), hand_id: meta.hand_id.as_deref() });
             crate::serve_question::record_roll(&cwd, scope, &seed.key, seed.reroll as usize, &meta.worlds, api.as_ref());
             // An API-dealt round also enters the seed ledger, which outlives
             // the roll record, for the choice ping that follows the round.
-            if meta.api {
+            if tracked {
                 let dealt = meta.worlds.iter().filter_map(|w| w.get("id").and_then(Value::as_str)).map(str::to_string).collect();
-                telemetry::record_seed_round(&cwd, &seed.key, &telemetry::SeedRound { scope: scope.to_string(), reroll: seed.reroll as usize, mode, register, pool_revision: meta.pool_revision.clone(), dealt, recorded: None });
+                telemetry::record_seed_round(&cwd, &seed.key, &telemetry::SeedRound { scope: scope.to_string(), reroll: seed.reroll as usize, mode, register, pool_revision: meta.pool_revision.clone(), hand_id: meta.hand_id.clone(), dealt, recorded: None });
             }
             io.out(&text);
             0
@@ -874,7 +913,8 @@ mod tests {
         let (code, out) = seed(&proj, &skill, true, &["--scope", "direction", "--mode", "persuade", "--from", "k1"]);
         assert_eq!(code, 0, "{out}");
         let block = presentation(&out);
-        assert!(out.contains("seed key k1.\nPRESENTATION (the decision round, condensed from new-work.md;"), "block follows the restated line: {out}");
+        let reference = telemetry::seed_reference("k1");
+        assert!(out.contains(&format!("seed key k1.\nSEED REFERENCE: {reference}. Write this, never the key, wherever the seed is recorded (the surface brief's FORM line, build-phase start --direction); on this machine --from accepts it in place of the key.\nPRESENTATION (the decision round, condensed from new-work.md;")), "the reference, then the block, follow the restated line: {out}");
         let lines: Vec<&str> = block.trim_end().split('\n').collect();
         assert_eq!(lines.len(), 6, "{block}");
         assert_eq!(lines[1], PRESENT_FIRST_LINE);
@@ -1058,7 +1098,7 @@ mod tests {
     /// A stand-in roll API on loopback: answers `GET /api/roll` with two
     /// dealt worlds and `POST /api/chosen` with 200, and records every
     /// request as (method, url, X-Impeccable-Client, body).
-    type Seen = std::sync::Arc<std::sync::Mutex<Vec<(String, String, String, String)>>>;
+    type Seen = std::sync::Arc<std::sync::Mutex<Vec<(String, String, String, String, String)>>>;
     fn roll_api() -> (String, Seen) {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let base = format!("http://127.0.0.1:{}/api", server.server_addr().to_ip().unwrap().port());
@@ -1069,9 +1109,10 @@ mod tests {
                 let header = req.headers().iter().find(|h| h.field.equiv("X-Impeccable-Client")).map(|h| h.value.as_str().to_string()).unwrap_or_default();
                 let mut body = String::new();
                 let _ = std::io::Read::read_to_string(req.as_reader(), &mut body);
-                log.lock().unwrap().push((req.method().as_str().to_string(), req.url().to_string(), header, body));
+                let off = req.headers().iter().find(|h| h.field.equiv("X-Impeccable-Telemetry")).map(|h| h.value.as_str().to_string()).unwrap_or_default();
+                log.lock().unwrap().push((req.method().as_str().to_string(), req.url().to_string(), header, body, off));
                 let roll = serde_json::json!({
-                    "poolRevision": "0123456789ab", "approvedCount": 2, "catalogCount": 3,
+                    "poolRevision": "0123456789ab", "handId": "00112233445566778899aabbccddeeff", "approvedCount": 2, "catalogCount": 3,
                     "challengers": [
                         { "id": "teletext-service", "form": "Teletext", "spark": "s", "system": ["r"], "webLeverage": "w" },
                         { "id": "microfiche-reader", "form": "Microfiche", "spark": "s", "system": ["r"], "webLeverage": "w" }
@@ -1091,6 +1132,8 @@ mod tests {
             ("IMPECCABLE_API_URL".into(), base.to_string()),
             ("IMPECCABLE_API_TIMEOUT".into(), "3000".into()),
             ("IMPECCABLE_TELEMETRY_CHANNEL".into(), "test".into()),
+            ("HOME".into(), proj.join("home").to_string_lossy().into_owned()),
+            ("USERPROFILE".into(), proj.join("home").to_string_lossy().into_owned()),
             ("IMPECCABLE_NO_STALENESS_CHECK".into(), "1".into()),
             ("IMPECCABLE_SELF".into(), "impeccable".into()),
         ]);
@@ -1114,7 +1157,7 @@ mod tests {
         assert!(out.contains("source: api; approved pool: 0123456789ab"), "{out}");
         assert!(out.contains("--from k1 --scope direction --mode persuade plus what the user did:\n"), "round 0 carries no --reroll: {out}");
         let roll = seen.lock().unwrap()[0].clone();
-        assert_eq!((roll.0.as_str(), roll.2.as_str()), ("GET", engine.as_str()));
+        assert_eq!((roll.0.as_str(), roll.2.as_str(), roll.4.as_str()), ("GET", engine.as_str(), ""));
         let record: Value = serde_json::from_str(&std::fs::read_to_string(proj.join(".impeccable/questions/roll.json")).unwrap()).unwrap();
         assert_eq!(record["poolRevision"], "0123456789ab");
         assert_eq!(record["source"], "api");
@@ -1137,7 +1180,7 @@ mod tests {
         // No --reroll: the latest round. An agent-invented id is dropped and the kind still goes.
         let out = seed_api(&proj, &skill, &base, &["--kind", "challenger", "--chosen", "challenger-teletext", "--from", "k1", "--scope", "direction", "--mode", "persuade"]);
         assert_eq!(out, "choice recorded\n");
-        assert_eq!(chosen_bodies(&seen).last().unwrap(), r#"{"key":"k1","scope":"direction","mode":"persuade","kind":"challenger","reroll":1,"poolRevision":"0123456789ab","source":"agent"}"#);
+        assert_eq!(chosen_bodies(&seen).last().unwrap(), r#"{"key":"k1","scope":"direction","mode":"persuade","kind":"challenger","reroll":1,"poolRevision":"0123456789ab","handId":"00112233445566778899aabbccddeeff","source":"agent"}"#);
         let post = seen.lock().unwrap().iter().rfind(|r| r.0 == "POST").cloned().unwrap();
         assert_eq!((post.1.as_str(), post.2.as_str()), ("/api/chosen", format!("impeccable/{}+engine test", env!("CARGO_PKG_VERSION")).as_str()));
         // The same round again: already sent.
@@ -1146,7 +1189,7 @@ mod tests {
         // Round 0 by --reroll: a dealt catalog id passes.
         let out = seed_api(&proj, &skill, &base, &["--kind", "challenger", "--chosen", "microfiche-reader", "--from", "k1", "--scope", "direction", "--reroll", "0"]);
         assert_eq!(out, "choice recorded\n");
-        assert_eq!(chosen_bodies(&seen).last().unwrap(), r#"{"chosenId":"microfiche-reader","key":"k1","scope":"direction","kind":"challenger","reroll":0,"poolRevision":"0123456789ab","source":"agent"}"#);
+        assert_eq!(chosen_bodies(&seen).last().unwrap(), r#"{"chosenId":"microfiche-reader","key":"k1","scope":"direction","kind":"challenger","reroll":0,"poolRevision":"0123456789ab","handId":"00112233445566778899aabbccddeeff","source":"agent"}"#);
         // No ledger for the key: sent as given, with the --reroll round.
         let n = chosen_bodies(&seen).len();
         let out = seed_api(&proj, &skill, &base, &["--kind", "challenger", "--chosen", "own-grounded-3", "--from", "k9", "--scope", "direction", "--reroll", "3"]);
@@ -1165,16 +1208,71 @@ mod tests {
         // A surface round's dealt structure other than the lead goes by position.
         let out = seed_api(&proj, &skill, &base, &["--option", "2", "--from", "s1", "--scope", "surface", "--mode", "operate"]);
         assert_eq!(out, "choice recorded\n");
-        assert_eq!(chosen_bodies(&seen).last().unwrap(), r#"{"key":"s1","scope":"surface","mode":"operate","option":2,"reroll":0,"poolRevision":"0123456789ab","source":"agent"}"#);
+        assert_eq!(chosen_bodies(&seen).last().unwrap(), r#"{"key":"s1","scope":"surface","mode":"operate","option":2,"reroll":0,"poolRevision":"0123456789ab","handId":"00112233445566778899aabbccddeeff","source":"agent"}"#);
         // A rejected hand: kind reroll, the steer as register, never a card id.
         seed_api(&proj, &skill, &base, &["--scope", "direction", "--from", "d1"]);
         let out = seed_api(&proj, &skill, &base, &["--kind", "reroll", "--chosen", "teletext-service", "--register", "bolder", "--from", "d1", "--scope", "direction"]);
         assert_eq!(out, "choice recorded\n");
-        assert_eq!(chosen_bodies(&seen).last().unwrap(), r#"{"key":"d1","scope":"direction","kind":"reroll","register":"bolder","reroll":0,"poolRevision":"0123456789ab","source":"agent"}"#);
+        assert_eq!(chosen_bodies(&seen).last().unwrap(), r#"{"key":"d1","scope":"direction","kind":"reroll","register":"bolder","reroll":0,"poolRevision":"0123456789ab","handId":"00112233445566778899aabbccddeeff","source":"agent"}"#);
         assert_eq!(seed_api(&proj, &skill, &base, &["--kind", "assigned", "--from", "d1", "--scope", "direction"]), "choice already recorded\n");
         // The surface TELEMETRY line names the position flag and the re-roll report.
         let out = seed_api(&proj, &skill, &base, &["--scope", "surface", "--mode", "operate", "--from", "s2"]);
         assert!(out.contains("--option <n>"), "{out}");
         assert!(out.contains("--kind reroll"), "{out}");
+    }
+
+    #[test]
+    fn a_seed_reference_stands_for_its_key_on_the_machine_that_rolled_it() {
+        let (proj, skill) = fixture("seed-reference", &[("mode-persuade", MODE_FILE)]);
+        let (base, seen) = roll_api();
+        let first = seed_api(&proj, &skill, &base, &["--scope", "direction", "--mode", "persuade", "--from", "3f9a1c2e"]);
+        let reference = telemetry::seed_reference("3f9a1c2e");
+        assert!(first.contains(&format!("SEED REFERENCE: {reference}.")), "{first}");
+        // The reference reproduces the same deal and asks the API with the real key.
+        let again = seed_api(&proj, &skill, &base, &["--scope", "direction", "--mode", "persuade", "--from", &reference]);
+        assert_eq!(again, first);
+        assert!(seen.lock().unwrap().iter().filter(|r| r.0 == "GET").all(|r| r.1.contains("key=3f9a1c2e")), "{:?}", seen.lock().unwrap());
+        // The ping by reference carries the key.
+        assert_eq!(seed_api(&proj, &skill, &base, &["--kind", "assigned", "--from", &reference, "--scope", "direction"]), "choice recorded\n");
+        assert!(chosen_bodies(&seen).last().unwrap().contains(r#""key":"3f9a1c2e""#));
+        // A reference rolled elsewhere is refused with the way out, never rolled as a key.
+        let env = Env::from([
+            ("IMPECCABLE_SKILL_DIR".into(), skill.to_string_lossy().into_owned()),
+            ("IMPECCABLE_NO_STALENESS_CHECK".into(), "1".into()),
+            ("HOME".into(), proj.join("home").to_string_lossy().into_owned()),
+        ]);
+        let (mut io, cap) = Io::captured("", proj.clone(), env);
+        let unknown = telemetry::seed_reference("elsewhere");
+        let argv: Vec<String> = ["--scope", "direction", "--from", unknown.as_str()].iter().map(|s| s.to_string()).collect();
+        assert_eq!(run(&argv, &mut io), 1);
+        let err = String::from_utf8(cap.stderr.borrow().clone()).unwrap();
+        assert!(err.contains("is a seed reference this machine has no record of") && err.contains("pass the original key with --from"), "{err}");
+        let n = chosen_bodies(&seen).len();
+        assert_eq!(seed_api(&proj, &skill, &base, &["--kind", "assigned", "--from", &unknown, "--scope", "direction"]), "choice ping skipped\n");
+        assert_eq!(chosen_bodies(&seen).len(), n);
+    }
+
+    #[test]
+    fn opted_out_rolls_still_roll_and_tell_the_server_to_record_nothing() {
+        let (proj, skill) = fixture("opt-out", &[("mode-persuade", MODE_FILE)]);
+        let (base, seen) = roll_api();
+        let home = proj.join("home");
+        std::fs::create_dir_all(home.join(".impeccable")).unwrap();
+        std::fs::write(home.join(".impeccable/config.json"), r#"{"telemetry": false}"#).unwrap();
+        let out = seed_api(&proj, &skill, &base, &["--scope", "direction", "--from", "k1"]);
+        assert!(out.contains("source: api;"), "the roll still happens: {out}");
+        let roll = seen.lock().unwrap()[0].clone();
+        assert_eq!(roll.0, "GET");
+        assert_eq!(roll.4, "off", "the server is told not to record it");
+        // No telemetry fields are written, only the key behind the reference.
+        let record: Value = serde_json::from_str(&std::fs::read_to_string(proj.join(".impeccable/questions/roll.json")).unwrap()).unwrap();
+        assert!(record.get("poolRevision").is_none() && record.get("source").is_none(), "{record}");
+        assert_eq!(telemetry::read_seed_round(&proj.to_string_lossy(), "k1", None), None);
+        assert_eq!(telemetry::resolve_seed(&proj.to_string_lossy(), &telemetry::seed_reference("k1")).unwrap(), "k1");
+        assert_eq!(seed_api(&proj, &skill, &base, &["--kind", "assigned", "--from", "k1", "--scope", "direction"]), "choice ping skipped\n");
+        assert!(chosen_bodies(&seen).is_empty());
+        // DO_NOT_TRACK=0 is not an opt-out.
+        std::fs::remove_file(home.join(".impeccable/config.json")).unwrap();
+        assert!(!telemetry::telemetry_disabled(&Env::from([("DO_NOT_TRACK".into(), "0".into()), ("HOME".into(), home.to_string_lossy().into_owned())]), &proj.to_string_lossy()));
     }
 }

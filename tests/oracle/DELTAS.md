@@ -7030,3 +7030,9 @@ Re-recorded from the binary and reviewed by hand, 28 goldens, one or two lines e
 
 Review round, same day, 19 goldens re-recorded. The surface roll body (`PROMOTED_SURFACE`) asks for each card's HTML sketch with the wireframe as the fallback, where it still asked for the wireframe outright; the sketch line names `htmlFrame` for phone and native surfaces; `question-schema` documents `htmlFrame`. A hand now records `startedAt` (normalized to `<EPOCH>`) and, when the round declares any, `sketches`, which moves `question-update-comps-next`'s hand file by that one key.
 
+
+## Recorded 2026-10-11: telemetry v2, card identity, seed reference
+
+Product decision (maintainer, 2026-10-11). Decision-page cards on direction and surface rounds declare `kind` (and `catalogId` on challengers), and `serve-question --start` / `--update` refuse a payload that does not: `question-schema` now shows the fields on its example cards, and the new case `question-update-card-identity-missing` pins the refusal. The fixtures' direction and surface payloads gained the fields, which changes none of their goldens. Committed files stop carrying the raw seed key: every successful roll prints one `SEED REFERENCE: seed:<16 hex>. ...` line between the roll and the PRESENTATION block, which every `seed-*` golden that rolls shows as one added line. `telemetry` joins the config keys `doctor` recognizes, so the `config-unknown-keys` summary in the `context-legacy`, `context-staleness-*` and `doctor-*` goldens names it, one line each, and `cli-help` lists the new `telemetry off|on|status` verb.
+
+Re-recorded from the binary and reviewed by hand, 38 goldens plus one new. Every change is one of the lines named above.

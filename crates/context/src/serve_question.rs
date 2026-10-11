@@ -414,6 +414,7 @@ pub struct ApiRoll<'a> {
     pub mode: Option<&'a str>,
     pub register: Option<&'a str>,
     pub pool_revision: Option<&'a str>,
+    pub hand_id: Option<&'a str>,
 }
 
 /// Records a concept-seed roll for the next decision page. Best effort: a
@@ -431,6 +432,9 @@ pub fn record_roll(cwd: &str, scope: &str, key: &str, reroll: usize, worlds: &[V
         record["source"] = json!("api");
         if let Some(p) = a.pool_revision.filter(|p| crate::telemetry::valid_pool_revision(p)) {
             record["poolRevision"] = json!(p);
+        }
+        if let Some(h) = a.hand_id.filter(|h| crate::telemetry::valid_hand_id(h)) {
+            record["handId"] = json!(h);
         }
         if let Some(m) = a.mode {
             record["mode"] = json!(m);
@@ -605,7 +609,7 @@ fn roll_seed(roll: Option<&str>, payload: &Value) -> Option<Value> {
         return None;
     }
     let mut seed = Map::new();
-    for k in ["key", "scope", "reroll", "mode", "register", "poolRevision", "source"] {
+    for k in ["key", "scope", "reroll", "mode", "register", "poolRevision", "handId", "source"] {
         if let Some(v) = record.get(k).filter(|v| !v.is_null()) {
             seed.insert(k.into(), v.clone());
         }
@@ -1701,7 +1705,7 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
             // The round is marked sent before the answer is written, so the
             // agent's `--kind` rerun, which only runs once it has the answer,
             // finds the mark and sends nothing.
-            let picker_ping = if crate::telemetry::telemetry_disabled(&env) {
+            let picker_ping = if crate::telemetry::telemetry_disabled(&env, &st.cwd) {
                 None
             } else {
                 st.detached_key
@@ -3773,7 +3777,8 @@ mod tests {
         let qdir = dir.join(".impeccable/questions");
         let _ = std::fs::remove_file(qdir.join("pk.state.json"));
         std::fs::write(dir.join("payload.json"), payload.to_string()).unwrap();
-        let mut env = Env::from([("IMPECCABLE_SELF".to_string(), "impeccable".to_string())]);
+        let home = dir.join("home").to_string_lossy().into_owned();
+        let mut env = Env::from([("IMPECCABLE_SELF".to_string(), "impeccable".to_string()), ("HOME".to_string(), home.clone()), ("USERPROFILE".to_string(), home)]);
         for (k, v) in extra_env {
             env.insert(k.to_string(), v.to_string());
         }
@@ -3818,7 +3823,7 @@ mod tests {
         let round = |n: usize| crate::telemetry::SeedRound { scope: "direction".into(), reroll: n, mode: Some("persuade".into()), pool_revision: Some("0123456789ab".into()), dealt: vec!["teletext-service".into(), "microfiche-reader".into()], ..Default::default() };
         // What concept-seed leaves after an API roll, then what --start does with it.
         let deal = |n: usize| {
-            record_roll(&cwd, "direction", "seed-1", n, worlds.as_array().unwrap(), Some(&ApiRoll { mode: Some("persuade"), register: None, pool_revision: Some("0123456789ab") }));
+            record_roll(&cwd, "direction", "seed-1", n, worlds.as_array().unwrap(), Some(&ApiRoll { mode: Some("persuade"), register: None, pool_revision: Some("0123456789ab"), hand_id: Some("00112233445566778899aabbccddeeff") }));
             crate::telemetry::record_seed_round(&cwd, "seed-1", &round(n));
             let roll = read_roll(&qdir);
             let _ = std::fs::remove_file(hand_file(&qdir, "pk"));
@@ -3833,7 +3838,7 @@ mod tests {
         let got = seen.lock().unwrap().clone();
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0].0, format!("impeccable/{}+engine test", env!("CARGO_PKG_VERSION")));
-        assert_eq!(got[0].1, r#"{"chosenId":"teletext-service","key":"seed-1","scope":"direction","mode":"persuade","kind":"challenger","option":1,"reroll":0,"poolRevision":"0123456789ab","kindSource":"explicit","source":"picker"}"#);
+        assert_eq!(got[0].1, r#"{"chosenId":"teletext-service","key":"seed-1","scope":"direction","mode":"persuade","kind":"challenger","option":1,"reroll":0,"poolRevision":"0123456789ab","handId":"00112233445566778899aabbccddeeff","kindSource":"explicit","source":"picker"}"#);
         assert_eq!(crate::telemetry::read_seed_round(&cwd, "seed-1", Some(0)).unwrap().recorded.as_deref(), Some("picker"));
         // The agent's rerun for the same round sends nothing.
         let ping_env = Env::from([("IMPECCABLE_API_URL".to_string(), base.clone())]);
@@ -3856,7 +3861,7 @@ mod tests {
         while seen.lock().unwrap().len() < 2 && now_ms() < deadline {
             sleep_ms(20);
         }
-        assert_eq!(seen.lock().unwrap().last().unwrap().1, r#"{"key":"seed-1","scope":"direction","mode":"persuade","kind":"reroll","reroll":3,"poolRevision":"0123456789ab","kindSource":"explicit","source":"picker"}"#);
+        assert_eq!(seen.lock().unwrap().last().unwrap().1, r#"{"key":"seed-1","scope":"direction","mode":"persuade","kind":"reroll","reroll":3,"poolRevision":"0123456789ab","handId":"00112233445566778899aabbccddeeff","kindSource":"explicit","source":"picker"}"#);
         assert_eq!(crate::telemetry::read_seed_round(&cwd, "seed-1", Some(3)).unwrap().recorded.as_deref(), Some("picker"));
 
         // A ping that cannot leave the machine clears its mark for the agent's rerun.

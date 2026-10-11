@@ -120,6 +120,22 @@ fn save_state(io: &Io, state: &Value) {
     let _ = std::fs::write(p, util::json_pretty(state));
 }
 
+/// The seed reference the state records for `--direction`: a reference
+/// (`seed:` + 16 lowercase hex) as given, a raw seed key as its reference
+/// (first 16 hex of SHA-256 of `impeccable-seed:` + key, the formula
+/// concept-seed prints), so the build state never holds the key the roll
+/// API saw. The direction is only ever shown, never resolved, so nothing is
+/// lost.
+fn seed_reference(v: &str) -> String {
+    let is_ref = v.strip_prefix("seed:").is_some_and(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+    if is_ref {
+        return v.to_string();
+    }
+    use sha2::{Digest, Sha256};
+    let hex: String = Sha256::digest(format!("impeccable-seed:{}", v).as_bytes()).iter().take(8).map(|b| format!("{:02x}", b)).collect();
+    format!("seed:{}", hex)
+}
+
 fn new_state(comp: Option<&str>, breakpoint: Option<&str>, artifact: Option<&str>, direction: Option<&str>) -> Value {
     let first = if comp.is_some() { "spec" } else { "comps" };
     let mut phases = Map::new();
@@ -2965,6 +2981,9 @@ mod transparency_guidance_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let (io, _) = Io::captured("", dir.clone(), Default::default());
+        assert_eq!(seed_reference("seed:0123456789abcdef"), "seed:0123456789abcdef");
+        let r = seed_reference("3f9a1c2e");
+        assert!(r.starts_with("seed:") && r.len() == 21 && !r.contains("3f9a1c2e"), "{r}");
         save_state(&io, &new_state(None, None, None, Some("seed-1")));
         let ignore = dir.join(".impeccable/build/.gitignore");
         let expected = format!("{}\nstate.json\n", impeccable_common::git::RUNTIME_IGNORE_HEADER);
@@ -3436,7 +3455,8 @@ pub fn run_with_renderer(argv: &[String],io: &mut Io,organic_scan: OrganicScan,r
             // A new comp round: the comp it approves is kept when the comps gate closes.
             None => crate::approved_comp::forget(io),
         }
-        let mut state = new_state(comp, breakpoint.as_deref(), arg(argv, "artifact"), direction);
+        let direction_ref = direction.map(seed_reference);
+        let mut state = new_state(comp, breakpoint.as_deref(), arg(argv, "artifact"), direction_ref.as_deref());
         if let Some(d) = chosen_decision { state["decisionComp"] = json!(d); }
         if io.env("IMPECCABLE_NATIVE_CAPTURE")==Some("1") {state["capturePolicy"]=json!("native-html-v1");}
         // Session identity is transport metadata, never guessed from a project

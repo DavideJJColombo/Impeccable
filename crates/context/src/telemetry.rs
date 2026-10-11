@@ -5,14 +5,17 @@
 //! - the request plumbing: API base, timeout, opt-outs, and the
 //!   `X-Impeccable-Client` header every `/api/roll` and `/api/chosen` request
 //!   carries;
-//! - the seed ledger, `.impeccable/questions/seeds/<sha256(key)>.json`: one
-//!   file per seed key, named by the key's hash and holding neither the key
-//!   nor a timestamp, one entry per API-dealt round (`poolRevision`, the dealt
-//!   catalog ids), plus the marker that a round's choice was already sent.
-//!   Unlike `roll.json`, which a decision page removes when it takes the
-//!   roll, the ledger outlives the page, so the ping the agent sends after
-//!   the round still finds its round by hashing its `--from` value. It sits
-//!   in the self-ignoring questions directory, so it never reaches a commit;
+//! - the seed reference and the seed ledger. The reference,
+//!   `seed:<16 hex of sha256("impeccable-seed:" + key)>`, is what committed
+//!   files (the surface brief's FORM line) record instead of the key. The
+//!   ledger, `.impeccable/questions/seeds/<those 16 hex>.json`, is the local,
+//!   self-ignored record that resolves a reference back to its key on this
+//!   machine (`{"key"}`, written for every roll), plus, only while telemetry
+//!   is on, one entry per API-dealt round (`poolRevision`, the dealt catalog
+//!   ids) and the marker that a round's choice was already sent. Unlike
+//!   `roll.json`, which a decision page removes when it takes the roll, the
+//!   ledger outlives the page, so the ping the agent sends after the round
+//!   still finds its round;
 //! - the choice ping body and its send.
 
 use crate::jsp;
@@ -48,9 +51,53 @@ pub fn api_timeout(env: &Env) -> Duration {
     Duration::from_millis(ms as u64)
 }
 
-pub fn telemetry_disabled(env: &Env) -> bool {
-    env.get("IMPECCABLE_NO_TELEMETRY").map(|v| !v.is_empty()).unwrap_or(false) || env.get("DO_NOT_TRACK").map(|v| !v.is_empty()).unwrap_or(false)
+/// An opt-out variable is set when it is non-empty and not `0` or `false`
+/// (any case): `DO_NOT_TRACK=1` opts out, `DO_NOT_TRACK=0` does not.
+pub fn env_opts_out(v: Option<&String>) -> bool {
+    v.map(|v| v.trim()).is_some_and(|v| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"))
 }
+
+/// The user-level config, `~/.impeccable/config.json`, where
+/// `impeccable telemetry off` records `"telemetry": false`.
+pub fn user_config_path(env: &Env) -> String {
+    jsp::join(&[&crate::util::homedir(env), ".impeccable", "config.json"])
+}
+
+fn config_says_off(path: &str) -> bool {
+    safe_read(path).and_then(|t| serde_json::from_str::<Value>(&t).ok()).and_then(|v| v.get("telemetry").and_then(Value::as_bool)) == Some(false)
+}
+
+/// Why telemetry is off, or `None` when it is on: `DO_NOT_TRACK` or
+/// `IMPECCABLE_NO_TELEMETRY` (`env_opts_out`), `"telemetry": false` in the
+/// user config, or in the project's `.impeccable/config.json` /
+/// `config.local.json` (a project may opt everyone out; nothing opts back in
+/// over an off anywhere).
+pub fn opt_out_reason(env: &Env, cwd: &str) -> Option<String> {
+    for var in ["DO_NOT_TRACK", "IMPECCABLE_NO_TELEMETRY"] {
+        if env_opts_out(env.get(var)) {
+            return Some(format!("{} is set", var));
+        }
+    }
+    let user = user_config_path(env);
+    if config_says_off(&user) {
+        return Some(format!("\"telemetry\": false in {}", user));
+    }
+    for name in ["config.local.json", "config.json"] {
+        let p = jsp::join(&[cwd, ".impeccable", name]);
+        if config_says_off(&p) {
+            return Some(format!("\"telemetry\": false in .impeccable/{}", name));
+        }
+    }
+    None
+}
+
+pub fn telemetry_disabled(env: &Env, cwd: &str) -> bool {
+    opt_out_reason(env, cwd).is_some()
+}
+
+/// Sent on the roll request when telemetry is off: the roll still happens
+/// (it is the feature), and the server records nothing for it.
+pub const TELEMETRY_HEADER: &str = "X-Impeccable-Telemetry";
 
 pub fn agent(timeout: Duration) -> ureq::Agent {
     crate::http::agent_builder().timeout_connect(timeout).timeout(timeout).build()
@@ -85,6 +132,13 @@ pub fn valid_pool_revision(v: &str) -> bool {
     v.len() == 12 && v.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// A roll response's `handId` (32 lowercase hex, the server's opaque name
+/// for the exact hand) is kept and forwarded only in that shape; older
+/// servers omit it and nothing is sent.
+pub fn valid_hand_id(v: &str) -> bool {
+    v.len() == 32 && v.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 // ---- seed ledger -------------------------------------------------------------
 
 /// One API-dealt round as concept-seed recorded it.
@@ -95,6 +149,7 @@ pub struct SeedRound {
     pub mode: Option<String>,
     pub register: Option<String>,
     pub pool_revision: Option<String>,
+    pub hand_id: Option<String>,
     /// The catalog ids the round printed as challengers, in print order.
     pub dealt: Vec<String>,
     /// `picker` or `agent` once that round's choice was sent.
@@ -105,16 +160,54 @@ fn seeds_dir(cwd: &str) -> String {
     jsp::join(&[cwd, ".impeccable", "questions", "seeds"])
 }
 
-/// The key as a file name: its SHA-256, so the ledger never stores the key
-/// the roll API saw, a key can never name a path, and a lookup by `--from`
-/// hashes the flag value.
+/// The 16 hex of a key's reference: the first 8 bytes of
+/// SHA-256(`impeccable-seed:` + key). Not reversible, and a key can never
+/// name a path.
 fn seed_tag(key: &str) -> String {
     use sha2::{Digest, Sha256};
-    Sha256::digest(format!("impeccable-seed:{}", key).as_bytes()).iter().take(16).map(|b| format!("{:02x}", b)).collect()
+    Sha256::digest(format!("impeccable-seed:{}", key).as_bytes()).iter().take(8).map(|b| format!("{:02x}", b)).collect()
+}
+
+/// The seed reference committed files record instead of the key.
+pub fn seed_reference(key: &str) -> String {
+    format!("seed:{}", seed_tag(key))
+}
+
+/// The 16 hex of a `seed:<16 lowercase hex>` reference, else `None`.
+pub fn parse_seed_reference(v: &str) -> Option<&str> {
+    v.strip_prefix("seed:").filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+}
+
+fn seed_file_for_tag(cwd: &str, tag: &str) -> String {
+    jsp::join(&[&seeds_dir(cwd), &format!("{}.json", tag)])
 }
 
 fn seed_file(cwd: &str, key: &str) -> String {
-    jsp::join(&[&seeds_dir(cwd), &format!("{}.json", seed_tag(key))])
+    seed_file_for_tag(cwd, &seed_tag(key))
+}
+
+/// A seed value as given to `--from`: a key stands as itself; a reference
+/// resolves to the key this machine recorded for it. `Err` names a
+/// reference this machine has no record of.
+pub fn resolve_seed(cwd: &str, v: &str) -> Result<String, String> {
+    let Some(tag) = parse_seed_reference(v) else { return Ok(v.to_string()) };
+    safe_read(&seed_file_for_tag(cwd, tag))
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|l| l.get("key").and_then(Value::as_str).map(str::to_string))
+        .filter(|k| seed_tag(k) == tag)
+        .ok_or_else(|| v.to_string())
+}
+
+/// Records the key behind a reference so `resolve_seed` finds it on this
+/// machine. Written for every roll; telemetry plays no part.
+pub fn record_seed_key(cwd: &str, key: &str) {
+    let mut ledger = read_ledger(cwd, key).unwrap_or_default();
+    if ledger.get("key").and_then(Value::as_str) == Some(key) {
+        return;
+    }
+    ledger.insert("key".into(), Value::String(key.to_string()));
+    write_ledger(cwd, key, &ledger);
+    prune_ledgers(cwd);
 }
 
 /// Ledger files older than this are pruned when a new one is written.
@@ -145,6 +238,7 @@ fn round_from(v: &Value, reroll: usize) -> SeedRound {
         mode: s("mode"),
         register: s("register"),
         pool_revision: s("poolRevision").filter(|p| valid_pool_revision(p)),
+        hand_id: s("handId").filter(|h| valid_hand_id(h)),
         dealt: v.get("dealt").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default(),
         recorded: s("recorded"),
     }
@@ -155,6 +249,7 @@ fn round_from(v: &Value, reroll: usize) -> SeedRound {
 /// it is a new presentation). Best effort, like the roll record.
 pub fn record_seed_round(cwd: &str, key: &str, round: &SeedRound) {
     let mut ledger = read_ledger(cwd, key).unwrap_or_default();
+    ledger.insert("key".into(), Value::String(key.to_string()));
     let mut rounds = ledger.get("rounds").and_then(Value::as_object).cloned().unwrap_or_default();
     let mut r = Map::new();
     r.insert("scope".into(), Value::String(round.scope.clone()));
@@ -166,6 +261,9 @@ pub fn record_seed_round(cwd: &str, key: &str, round: &SeedRound) {
     }
     if let Some(p) = round.pool_revision.as_ref().filter(|p| valid_pool_revision(p)) {
         r.insert("poolRevision".into(), Value::String(p.clone()));
+    }
+    if let Some(h) = round.hand_id.as_ref().filter(|h| valid_hand_id(h)) {
+        r.insert("handId".into(), Value::String(h.clone()));
     }
     r.insert("dealt".into(), json!(round.dealt));
     rounds.insert(round.reroll.to_string(), Value::Object(r));
@@ -241,6 +339,7 @@ pub struct ChoicePing {
     pub option: Option<usize>,
     pub reroll: Option<usize>,
     pub pool_revision: Option<String>,
+    pub hand_id: Option<String>,
     pub kind_source: Option<&'static str>,
     pub source: &'static str,
 }
@@ -268,6 +367,9 @@ impl ChoicePing {
         }
         if let Some(p) = self.pool_revision.as_ref().filter(|p| valid_pool_revision(p)) {
             body.insert("poolRevision".into(), Value::String(p.clone()));
+        }
+        if let Some(h) = self.hand_id.as_ref().filter(|h| valid_hand_id(h)) {
+            body.insert("handId".into(), Value::String(h.clone()));
         }
         if let Some(k) = self.kind_source {
             body.insert("kindSource".into(), Value::String(k.to_string()));
@@ -369,6 +471,7 @@ pub fn picker_choice(seed: &Value, payload: &Value, option_id: &str, steer: Opti
         register: register.map(str::to_string),
         reroll: Some(reroll),
         pool_revision: s("poolRevision").filter(|p| valid_pool_revision(p)),
+        hand_id: s("handId").filter(|h| valid_hand_id(h)),
         kind_source: Some("explicit"),
         source: "picker",
         ..Default::default()
@@ -406,6 +509,58 @@ pub fn picker_choice(seed: &Value, payload: &Value, option_id: &str, steer: Opti
         (lead.then_some("assigned"), None)
     };
     Some(ChoicePing { kind: kind.map(str::to_string), chosen_id, option, kind_source: Some("inferred"), ..base })
+}
+
+// ---- `impeccable telemetry off|on|status` -------------------------------------
+
+pub const PRIVACY_URL: &str = "https://impeccable.style/privacy";
+
+fn status_line(env: &Env, cwd: &str) -> String {
+    match opt_out_reason(env, cwd) {
+        Some(reason) => format!("telemetry: off ({}). Rolls still work; the roll API is told not to record them, and no choice is sent.\n", reason),
+        None => format!("telemetry: on. The roll request and the choice ping carry the seed key, scope, mode, round, pool revision, the card kind and catalog id that won, and the client version; never your project's names or code. Turn it off with `impeccable telemetry off`, DO_NOT_TRACK=1, or IMPECCABLE_NO_TELEMETRY=1. Details: {}\n", PRIVACY_URL),
+    }
+}
+
+/// `impeccable telemetry off|on|status`: `off` records `"telemetry": false`
+/// in the user config (`user_config_path`), `on` removes it, `status` says
+/// whether telemetry is on and, when off, why. Other keys in the file are
+/// kept.
+pub fn run(args: &[String], io: &mut impeccable_common::Io) -> i32 {
+    let env = io.env.clone();
+    let cwd = io.cwd.to_string_lossy().into_owned();
+    let path = user_config_path(&env);
+    let read = || -> Map<String, Value> { safe_read(&path).and_then(|t| serde_json::from_str::<Value>(&t).ok()).and_then(|v| v.as_object().cloned()).unwrap_or_default() };
+    let write = |m: &Map<String, Value>| -> Result<(), String> {
+        let dir = jsp::join(&[&crate::util::homedir(&env), ".impeccable"]);
+        std::fs::create_dir_all(&dir)
+            .and_then(|_| std::fs::write(&path, format!("{}\n", crate::util::json_pretty(&Value::Object(m.clone())))))
+            .map_err(|e| format!("{}: {}", path, e))
+    };
+    match args.first().map(String::as_str) {
+        Some("status") | None => {
+            io.out(&status_line(&env, &cwd));
+            0
+        }
+        Some(cmd @ ("off" | "on")) => {
+            let mut m = read();
+            if cmd == "off" {
+                m.insert("telemetry".into(), Value::Bool(false));
+            } else {
+                m.remove("telemetry");
+            }
+            if let Err(e) = write(&m) {
+                io.err(&format!("telemetry: could not write the user config ({})\n", e));
+                return 1;
+            }
+            io.out(&status_line(&env, &cwd));
+            0
+        }
+        Some(other) => {
+            io.err(&format!("telemetry: unknown command \"{}\"; use off, on, or status\n", other));
+            1
+        }
+    }
 }
 
 #[cfg(test)]
@@ -462,6 +617,7 @@ mod tests {
             mode: Some("persuade".into()),
             register: None,
             pool_revision: Some("0123456789ab".into()),
+            hand_id: Some("00112233445566778899aabbccddeeff".into()),
             dealt: dealt.iter().map(|s| s.to_string()).collect(),
             recorded: None,
         };
@@ -481,20 +637,24 @@ mod tests {
         // A key that is not a plain slug never names a path.
         record_seed_round(&cwd, "../Evil Key", &round(0, &["x"]));
         assert_eq!(read_seed_round(&cwd, "../Evil Key", None).unwrap().dealt, vec!["x"]);
-        // Files are named by the key's hash and hold neither the key nor a time.
+        // Files are named by the reference's hex, hold no time, and resolve the reference.
         for e in std::fs::read_dir(format!("{}/.impeccable/questions/seeds", cwd)).unwrap().flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
-            assert!(name.len() == 37 && name.ends_with(".json") && !name.contains("k1") && !name.contains("Evil"), "{name}");
+            assert!(name.len() == 21 && name.ends_with(".json") && !name.contains("k1") && !name.contains("Evil"), "{name}");
             let text = std::fs::read_to_string(e.path()).unwrap();
-            assert!(!text.contains("Evil") && !text.contains("\"key\"") && !text.contains("\"at\""), "{text}");
+            assert!(!text.contains("\"at\""), "{text}");
         }
+        assert_eq!(resolve_seed(&cwd, &seed_reference("../Evil Key")).unwrap(), "../Evil Key");
         // The questions directory ignores itself, ledger included.
         assert_eq!(std::fs::read_to_string(format!("{}/.impeccable/questions/.gitignore", cwd)).unwrap(), format!("{}\n*\n", impeccable_common::git::RUNTIME_IGNORE_HEADER));
         // A malformed poolRevision is never recorded.
         let mut r = round(2, &[]);
         r.pool_revision = Some("NOT-HEX".into());
+        r.hand_id = Some("00112233445566778899AABBCCDDEEFF".into());
         record_seed_round(&cwd, "k1", &r);
-        assert_eq!(read_seed_round(&cwd, "k1", Some(2)).unwrap().pool_revision, None);
+        let back = read_seed_round(&cwd, "k1", Some(2)).unwrap();
+        assert_eq!((back.pool_revision, back.hand_id), (None, None), "malformed values are never stored");
+        assert_eq!(read_seed_round(&cwd, "k1", Some(0)).unwrap().hand_id.as_deref(), Some("00112233445566778899aabbccddeeff"));
     }
 
     #[test]
@@ -509,11 +669,16 @@ mod tests {
             option: Some(3),
             reroll: Some(2),
             pool_revision: Some("0123456789ab".into()),
+            hand_id: Some("00112233445566778899aabbccddeeff".into()),
             kind_source: Some("explicit"),
             source: "picker",
         };
-        assert_eq!(json_compact(&p.body()), r#"{"chosenId":"w1","key":"k","scope":"direction","kind":"challenger","register":"bolder","option":3,"reroll":2,"poolRevision":"0123456789ab","kindSource":"explicit","source":"picker"}"#);
-        let p = ChoicePing { reroll: Some(9), option: Some(16), pool_revision: Some("xyz".into()), source: "picker", ..Default::default() };
+        assert_eq!(json_compact(&p.body()), r#"{"chosenId":"w1","key":"k","scope":"direction","kind":"challenger","register":"bolder","option":3,"reroll":2,"poolRevision":"0123456789ab","handId":"00112233445566778899aabbccddeeff","kindSource":"explicit","source":"picker"}"#);
+        // A handId in any other shape (an older or odd server) is never sent.
+        for bad in ["00112233445566778899AABBCCDDEEFF", "0011", "00112233445566778899aabbccddeeffaa", "zz112233445566778899aabbccddeeff"] {
+            assert!(!valid_hand_id(bad), "{bad}");
+        }
+        let p = ChoicePing { reroll: Some(9), option: Some(16), pool_revision: Some("xyz".into()), hand_id: Some("0011".into()), source: "picker", ..Default::default() };
         assert_eq!(json_compact(&p.body()), r#"{"source":"picker"}"#);
     }
 
@@ -637,5 +802,79 @@ mod tests {
         let mut s = seed(None);
         s["reroll"] = json!(9);
         assert_eq!(picker_choice(&s, &pg, "a", None), None);
+    }
+
+    #[test]
+    fn seed_references_are_stable_hashes_that_resolve_only_where_recorded() {
+        let cwd = temp_dir("reference");
+        let r = seed_reference("3f9a1c2e");
+        assert!(parse_seed_reference(&r).is_some() && r.len() == 21 && !r.contains("3f9a1c2e"), "{r}");
+        assert_eq!(seed_reference("3f9a1c2e"), r, "stable");
+        for bad in ["seed:XYZ", "seed:0123", "seed:0123456789ABCDEF", "k1"] {
+            assert_eq!(parse_seed_reference(bad), None, "{bad}");
+        }
+        // A key resolves to itself; a reference only once this machine recorded its key.
+        assert_eq!(resolve_seed(&cwd, "k1").unwrap(), "k1");
+        assert_eq!(resolve_seed(&cwd, &r), Err(r.clone()));
+        record_seed_key(&cwd, "3f9a1c2e");
+        assert_eq!(resolve_seed(&cwd, &r).unwrap(), "3f9a1c2e");
+        // The key record carries no telemetry round.
+        assert_eq!(read_seed_round(&cwd, "3f9a1c2e", None), None);
+    }
+
+    #[test]
+    fn opt_outs_follow_the_env_convention_and_both_configs() {
+        let cwd = temp_dir("optout");
+        let home = format!("{}/home", cwd);
+        let base = |extra: &[(&str, &str)]| {
+            let mut e = env(&[("HOME", home.as_str()), ("USERPROFILE", home.as_str())]);
+            for (k, v) in extra {
+                e.insert(k.to_string(), v.to_string());
+            }
+            e
+        };
+        assert_eq!(opt_out_reason(&base(&[]), &cwd), None);
+        for v in ["1", "true", "yes", "anything"] {
+            assert!(telemetry_disabled(&base(&[("DO_NOT_TRACK", v)]), &cwd), "{v}");
+            assert!(telemetry_disabled(&base(&[("IMPECCABLE_NO_TELEMETRY", v)]), &cwd), "{v}");
+        }
+        for v in ["", "0", "false", "FALSE", " "] {
+            assert!(!telemetry_disabled(&base(&[("DO_NOT_TRACK", v)]), &cwd), "{v:?}");
+        }
+        std::fs::create_dir_all(format!("{}/.impeccable", home)).unwrap();
+        std::fs::write(format!("{}/.impeccable/config.json", home), r#"{"telemetry": false}"#).unwrap();
+        assert!(opt_out_reason(&base(&[]), &cwd).unwrap().contains("telemetry\": false in"));
+        std::fs::write(format!("{}/.impeccable/config.json", home), r#"{"telemetry": true}"#).unwrap();
+        assert_eq!(opt_out_reason(&base(&[]), &cwd), None);
+        std::fs::create_dir_all(format!("{}/.impeccable", cwd)).unwrap();
+        std::fs::write(format!("{}/.impeccable/config.json", cwd), r#"{"telemetry": false}"#).unwrap();
+        assert_eq!(opt_out_reason(&base(&[]), &cwd).as_deref(), Some("\"telemetry\": false in .impeccable/config.json"));
+    }
+
+    #[test]
+    fn the_telemetry_verb_records_the_choice_in_the_user_config() {
+        let cwd = temp_dir("verb");
+        let home = format!("{}/home", cwd);
+        let call = |args: &[&str]| {
+            let e = env(&[("HOME", home.as_str()), ("USERPROFILE", home.as_str())]);
+            let (mut io, cap) = impeccable_common::Io::captured("", std::path::PathBuf::from(&cwd), e);
+            let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            let code = run(&argv, &mut io);
+            let out = String::from_utf8(cap.stdout.borrow().clone()).unwrap();
+            (code, out)
+        };
+        assert!(call(&["status"]).1.starts_with("telemetry: on."));
+        std::fs::create_dir_all(format!("{}/.impeccable", home)).unwrap();
+        std::fs::write(format!("{}/.impeccable/config.json", home), r#"{"other": 1}"#).unwrap();
+        let (code, out) = call(&["off"]);
+        assert_eq!(code, 0);
+        assert!(out.starts_with("telemetry: off (\"telemetry\": false in "), "{out}");
+        let cfg: Value = serde_json::from_str(&std::fs::read_to_string(format!("{}/.impeccable/config.json", home)).unwrap()).unwrap();
+        assert_eq!(cfg, json!({ "other": 1, "telemetry": false }));
+        assert!(call(&["status"]).1.starts_with("telemetry: off"));
+        assert!(call(&["on"]).1.starts_with("telemetry: on."));
+        let cfg: Value = serde_json::from_str(&std::fs::read_to_string(format!("{}/.impeccable/config.json", home)).unwrap()).unwrap();
+        assert_eq!(cfg, json!({ "other": 1 }));
+        assert_eq!(call(&["maybe"]).0, 1);
     }
 }

@@ -395,6 +395,20 @@ Impeccable also keeps its own `.gitignore` in the folders that hold decision-rou
 
 If an ephemeral file (a screenshot, `config.local.json`) was committed before you added the block, `.gitignore` will not untrack it automatically. Run `git rm --cached <path>` to stop tracking it without deleting your local copy.
 
+## Telemetry
+
+When a new design starts, the skill asks the roll API at impeccable.style to deal a hand of visual worlds from the catalog. That request is the feature, so it always happens. Unless you opt out, it also feeds an anonymous record of which hand was shown and which card won, which is how the catalog learns what works.
+
+What is sent, on the roll request and on the choice that follows it:
+
+- the roll key (a random value per decision round), scope (direction or surface), visitor mode, and re-roll round
+- the catalog revision the hand came from, and on the choice the kind of card that won (assigned, pick, challenger, canon, or a re-roll), its catalog id when a catalog world won, and its position on the page
+- the client version and whether the choice came from the decision page or the agent
+
+Never sent: your project's name, files, code, PRODUCT.md, or the names of the directions your agent wrote. Committed files record only a one-way seed reference, never the roll key.
+
+To turn it off, run `npx impeccable telemetry off` (stored in `~/.impeccable/config.json`), or set `DO_NOT_TRACK=1` or `IMPECCABLE_NO_TELEMETRY=1`. A project can opt everyone out with `"telemetry": false` in `.impeccable/config.json`. `npx impeccable telemetry status` shows the current state. Opted out, the roll still works and the API is told not to record it. Details: https://impeccable.style/privacy
+
 ## Design hook
 
 On Claude Code, GitHub Copilot, Codex, Cursor, and Grok Build, `npx impeccable install` and `npx impeccable update` install a provider-native hook manifest along with the skill payload. The hook runs the Impeccable design detector on direct UI file edits and surfaces findings back into the agent flow. Claude Code, GitHub Copilot, and Codex surface findings after the edit (and run a deeper pass on Stop where supported). Grok Build scans after the edit to warm Stop, then surfaces on Stop; PostToolUse stdout never reaches the model. Cursor blocks bad proposed writes before they land.
