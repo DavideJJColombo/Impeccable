@@ -29,3 +29,57 @@ fn scoped_and_comment_waivers_preserve_intentional_shadows() {
         assert!(!findings.iter().any(|f| f.antipattern == "hard-offset-shadow"), "{findings:#?}");
     }
 }
+
+#[test]
+fn named_and_functional_colors_survive_the_static_cascade() {
+    for (shadow, expected) in [
+        ("4px 4px red", 1),
+        ("gray -4px 4px", 1),
+        ("4px 4px rebeccapurple", 1),
+        ("4px 4px hwb(0 0% 0%)", 1),
+        ("4px 4px color(srgb 1 0 0)", 1),
+        ("4px 4px color-mix(in srgb, rgb(255, 0, 0) 50%, blue)", 1),
+        ("4px 4px hwb(0 0% 0% / 10%)", 0),
+        ("4px 4px transparent", 0),
+        ("inset 4px 4px red", 0),
+    ] {
+        let html = format!("<style>.card {{ width:220px; height:96px; box-shadow:{shadow}; }}</style><div class=card>Color regression</div>");
+        let findings = detect_html_source(
+            &html,
+            Path::new("/tmp/shadow-colors.html"),
+            &DetectHtmlOptions::default(),
+        );
+        let hits: Vec<_> = findings
+            .iter()
+            .filter(|f| f.antipattern == "hard-offset-shadow")
+            .collect();
+        assert_eq!(hits.len(), expected, "{shadow}: {hits:#?}");
+        assert!(hits
+            .iter()
+            .all(|f| f.advisory == Some(true) && f.severity == "advisory"));
+    }
+}
+
+#[test]
+fn color_fixture_has_four_advisories_and_no_control_findings() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/hard-offset-shadow/colors.html");
+    let html = std::fs::read_to_string(&path).unwrap();
+    let findings = detect_html_source(&html, &path, &DetectHtmlOptions::default());
+    let hits: Vec<_> = findings
+        .iter()
+        .filter(|f| f.antipattern == "hard-offset-shadow")
+        .collect();
+    assert_eq!(hits.len(), 4, "{hits:#?}");
+    for paint in [
+        "4px 4px red",
+        "gray -4px 4px",
+        "hwb(0 0% 0%/50%)",
+        "color-mix(",
+    ] {
+        assert!(
+            hits.iter().any(|f| f.snippet.contains(paint)),
+            "{paint}: {hits:#?}"
+        );
+    }
+}

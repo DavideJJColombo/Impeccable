@@ -7048,3 +7048,12 @@ individual fixture goldens changed. Three directory goldens were refreshed after
 confirming the only finding-array additions were the four new advisories, with
 no removals. The primary count remains 945; the advisory count is 164 → 168.
 Frozen function-level vectors were not regenerated.
+
+
+## PR #998 color parsing follow-up
+
+Adds `detect-hard-offset-shadow-colors-advisory` and
+`detect-hard-offset-shadow-colors-no-advisory`. The new fixture covers red and gray
+named colors, HWB alpha, and nested color-mix, plus five pass controls. Review the
+new goldens for exactly four advisory findings and exit 0, and no findings with
+`--no-advisory`. No frozen function vectors are changed.

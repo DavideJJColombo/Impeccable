@@ -11,6 +11,7 @@ const html = await fs.readFile('tests/fixtures/antipatterns/hard-offset-shadow.h
 const bundle = await fs.readFile('dist/detect-antipatterns-browser.js');
 const assets = new Map([
   ['/', ['text/html', html]],
+  ['/colors', ['text/html', await fs.readFile('tests/fixtures/hard-offset-shadow/colors.html')]],
   ['/detector.js', ['text/javascript', bundle]],
 ]);
 for (const file of ['devtools/panel.html', 'devtools/panel.js', 'devtools/panel.css', 'shared/kinpaku.css', 'detector/antipatterns.json']) {
@@ -53,6 +54,17 @@ for (const browserName of ['chrome', 'firefox']) {
     const restored = await page.evaluate(() => window.impeccableDetect());
     assert.equal(restored.flatMap(g => g.findings || []).filter(f => f.type === 'hard-offset-shadow').length, 4);
     await page.screenshot({path:`build/929/${browserName}-fixture.png`, fullPage:true});
+    const colorPage = await browser.newPage();
+    await colorPage.setViewport({width: 1280, height: 1100});
+    await colorPage.goto(base + '/colors');
+    await colorPage.evaluate(() => {document.documentElement.dataset.impeccableExtension = 'true';});
+    await colorPage.addScriptTag({url:base+'/detector.js'});
+    await colorPage.waitForFunction(() => typeof window.impeccableDetect === 'function');
+    const colorRows = await colorPage.evaluate(() => window.impeccableDetect());
+    const colorHits = colorRows.filter(row => row.findings.some(f => f.type === 'hard-offset-shadow'));
+    assert.equal(colorHits.length, 4);
+    assert.deepEqual(colorHits.map(row => row.selector).sort(), ['#flag-0', '#flag-1', '#flag-2', '#flag-3']);
+    await colorPage.screenshot({path:`build/929/${browserName}-shadow-colors.png`, fullPage:true});
     // Render the shipped DevTools page with real WASM findings. The Chrome
     // extension APIs are stubbed here, so this complements packaged E2E checks.
     const panel = await browser.newPage();
@@ -101,7 +113,7 @@ for (const browserName of ['chrome', 'firefox']) {
       return header ? header.nextElementSibling.textContent : '';
     });
     assert.match(advisoryRules, /Hard offset shadow/i);
-    results.push({browser: await browser.version(), hardOffsetFindings:hits.length, disabledFindings:0, devtoolsGroup: 'Advisories', report, hits});
+    results.push({browser: await browser.version(), hardOffsetFindings:hits.length, colorFindings:colorHits.length, disabledFindings:0, devtoolsGroup: 'Advisories', report, hits});
   } finally {await browser.close();}
 }
 await fs.writeFile('build/929/browser-results.json', JSON.stringify(results,null,2));

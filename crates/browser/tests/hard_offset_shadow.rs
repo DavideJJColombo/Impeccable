@@ -7,7 +7,7 @@ use impeccable_browser::BrowserEngine;
 use impeccable_detect::engines::{ScanOptions, UrlEngine};
 
 fn fixtures_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/antipatterns")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures")
 }
 
 fn serve() -> u16 {
@@ -83,7 +83,26 @@ fn scan(fixture: &str) -> Option<Vec<(String, String, String, String)>> {
 
 #[test]
 fn hard_offset_shadow_matches_static_fixture_in_browser() {
-    let Some(rows) = scan("hard-offset-shadow.html") else {
+    let Some(rows) = scan("antipatterns/hard-offset-shadow.html") else {
+        return;
+    };
+    let hits: Vec<_> = rows
+        .iter()
+        .filter(|f| f.0 == "hard-offset-shadow")
+        .collect();
+    assert_eq!(hits.len(), 4, "{hits:#?}");
+    for i in 0..4 {
+        assert!(
+            hits.iter()
+                .any(|f| f.2.contains(&format!("#flag-{i}")) && f.3 == "advisory"),
+            "{hits:#?}"
+        );
+    }
+}
+
+#[test]
+fn named_and_functional_colors_match_static_findings_in_browser() {
+    let Some(rows) = scan("hard-offset-shadow/colors.html") else {
         return;
     };
     let hits: Vec<_> = rows

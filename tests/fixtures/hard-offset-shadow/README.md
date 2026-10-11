@@ -6,11 +6,14 @@ panels and eight should-pass panels, with explicit sizes and distinct headings.
 ## Visual verification for reviewers
 
 Open [the PR verification site](https://impeccable-radar.vercel.app/pr/998/).
-No extension installation is needed. The page identifies detector commit
-`a9fb66ad6`; the subsequent readiness update changes documentation only.
+No extension installation is needed. The page identifies the detector revision
+for the color-parsing follow-up; earlier prxps and packaged-extension captures
+remain labeled with their original detector revision.
 
 1. Open the live fixture: expect four hard-offset advisories in the should-flag
-   column and none for this rule among the eight should-pass controls.
+   column and none for this rule among the eight should-pass controls. Also open
+   the color regression fixture: red, gray, HWB and nested color-mix should each
+   produce one advisory; its five controls should produce none.
 2. Compare the regular and upset prxps cards at rest and on hover. Use keyboard
    focus or "Keep hover state visible" on touch screens. These are captured
    screenshots; recorded scans show 0 → 1 → 0 as the pointer enters and leaves.
@@ -28,11 +31,13 @@ geometric match is unwanted. Intentional choices can use the existing waivers.
 - `cargo test -p impeccable-core checks::hard_offset_shadow`: positive/negative
   offsets, omitted blur/currentColor, multiple layers, 4px boundary, soft/inset
   shadows, focus rings, transparent/faint paint, negative spread, unresolved
-  lengths and invalid colors.
+  lengths and invalid colors. Named colors, HWB alpha, nested color-mix,
+  compact CSS serialization, duplicate paint and sub-4px precision are covered.
 - `cargo test -p impeccable-html --test hard_offset_shadow`: exactly four
-  advisory findings; scoped/ancestor and comment waivers, hidden ancestors.
+  advisory findings in each fixture; named/functional colors through the static
+  cascade, scoped/ancestor and comment waivers, hidden ancestors.
 - `cargo test -p impeccable-browser --test hard_offset_shadow`: the same four
-  selectors through the installed Chromium browser and native rule core.
+  selectors in both fixtures through installed Chromium and the native rule core.
 - `cargo xtask bundle`, then `cargo build --release -p impeccable`.
 - `IMPECCABLE_BIN=target/release/impeccable node tests/oracle/run.mjs detect-hard-offset-shadow`:
   advisory-only CLI output exits 0; `--no-advisory` produces no finding and exits 0.
@@ -44,7 +49,8 @@ geometric match is unwanted. Intentional choices can use the existing waivers.
 `node tests/fixtures/hard-offset-shadow/browser-check.mjs` runs the in-page WASM
 bundle in Puppeteer Chrome and installed Firefox (set `FIREFOX_PATH` outside the
 macOS default). It asserts advisory metadata, repeated scans, and rule disabling
-and re-enabling. JSON evidence and fixture screenshots land in `build/929/`.
+and re-enabling. The additional `colors.html` fixture checks named and functional
+colors against four positive and five negative controls in both browsers. JSON evidence and fixture screenshots land in `build/929/`.
 It also renders the shipped DevTools panel in both browsers, feeds it those real
 WASM findings through a stubbed extension port, and checks the **Advisories**
 heading, four findings, rule settings, and the actual single/copy-all buttons.
@@ -147,7 +153,7 @@ This also establishes a limit: a scan at rest does not discover a hover-only
 shadow. Exercise the relevant interaction before scanning; the detector does not
 automatically walk interaction states.
 
-## Latest validation and baseline disposition (2026-10-10)
+## Earlier validation and baseline disposition (2026-10-10)
 
 Built this branch from scratch with a dedicated `CARGO_TARGET_DIR`, then set
 `IMPECCABLE_BIN` to that directory's release binary for the JS tests. This rules
@@ -196,6 +202,42 @@ These results establish baseline/timing problems, not a green broad suite.
 The affected live-server sources, cleanup sources, and live-target tests have
 no diff from the base; this PR does not change their behavior or relax assertions.
 Do not run two copies of the live-target suite concurrently: it binds port 8497.
+
+## Color-parsing review follow-up (2026-10-11)
+
+Both review bots identified the same static false negative for named shadow
+colors. Before the fix, new core and static integration regressions failed on
+`4px 4px red` (zero findings instead of one). The rule now tokenizes CSS with
+`cssparser` and delegates paint to the shared `parse_any_color` function. This
+also preserves compact static serialization such as `0#333`, handles HWB and
+nested color-mix, rejects unknown/duplicate paint and unresolved lengths, and
+keeps f64 precision at the 4px threshold. Other shadow checks are unchanged.
+
+Validation on the follow-up source:
+
+- Core + static HTML crate suites: **805 passed, 0 failed**.
+- Native Chromium integration: both fixtures pass (four advisory selectors each).
+- Rebuilt WASM in Chrome 154 and Firefox 157.0.1: original fixture **4 / 4**
+  across repeated scans, disable/restore **0 / 4**, color fixture **4** matches
+  and **0** on five controls. DevTools grouping, settings and copy checks pass.
+- Two new CLI goldens reviewed: color fixture emits exactly four advisories and
+  exits 0; `--no-advisory` emits `[]` and exits 0. Full oracle replay passes;
+  no existing goldens or frozen vectors changed.
+- JS core: **179 passed / 1 skip**; detector: **7 passed**; framework:
+  **191 passed**; plugin: **4 passed**. Bundle, release build and source build pass.
+- `cargo test --workspace` again stops at the known cleanup assertion above
+  (`stale evidence: regions/retired.png`). The affected core/HTML suites were
+  also run separately to completion rather than relying on that partial run.
+- Full JS run again stops in live mode: **221 passed / 6 failed / 2 skipped**.
+  Every failing case is present in the previously recorded clean-base run,
+  including the already-answered-target/session case this time. No live or
+  cleanup code changed. Broad-suite success is **not** claimed.
+
+The preview includes `colors.html`; its browser results complement the static
+Rust regressions and CLI oracle, since browsers normalize named colors before
+passing computed styles to the detector. New Chrome/Firefox color screenshots
+are in the hosted verification page. Earlier packaged-extension and prxps
+captures above remain historical evidence at their stated revision.
 
 ## Limits and calibration
 

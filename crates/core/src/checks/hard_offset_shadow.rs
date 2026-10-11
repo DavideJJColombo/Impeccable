@@ -1,42 +1,19 @@
 //! Advisory geometry check, shared by static HTML and rendered DOM scans.
-use crate::checks::measures::CSS_COLOR_TOKEN_RE;
 use crate::checks::rules::RuleHit;
-use crate::color::parse_any_color;
-use crate::js_ext_a::split_commas_outside_parens;
+use crate::color::{parse_any_color, split_top_level_commas, Rgba, COLOR_FUNCTION_NAMES};
+use cssparser::{Parser, ParserInput, Token};
 
 /// Four CSS pixels separates the fixture's deliberate displaced slabs from
 /// its small offset accents. This is a review threshold, not a design standard.
 /// Negative spread and unresolved lengths/colors stay outside this first rule.
 pub fn check_hard_offset_shadow(shadow: &str, current_color: &str, opacity: f64) -> Vec<RuleHit> {
-    for layer in split_commas_outside_parens(shadow) {
-        let token = CSS_COLOR_TOKEN_RE.find(layer);
-        let color_text = token.as_ref().map(|m| m.as_str()).unwrap_or(current_color);
-        let color_text = if color_text.eq_ignore_ascii_case("currentcolor") {
-            current_color
-        } else {
-            color_text
-        };
-        let Some(color) = parse_any_color(Some(color_text)) else {
+    for layer in split_top_level_commas(shadow) {
+        let Some((v, color)) = parse_layer(&layer, current_color) else {
             continue;
         };
         if !opacity.is_finite() || color.alpha_or_one() * opacity <= 0.1 {
             continue;
         }
-        let lengths = CSS_COLOR_TOKEN_RE.replace_all(layer, " ");
-        let values: Option<Vec<f64>> = lengths
-            .split_whitespace()
-            .map(|s| {
-                // Computed pixels, plus CSS's unitless zero. Never read 4em as 4px
-                // or the numeric fallback inside an unresolved var()/calc().
-                let (number, pixels) = s
-                    .strip_suffix("px")
-                    .map(|n| (n, true))
-                    .unwrap_or((s, false));
-                let n = number.parse::<f64>().ok()?;
-                (n.is_finite() && (pixels || n == 0.0)).then_some(n)
-            })
-            .collect();
-        let Some(v) = values else { continue };
         if !(2..=4).contains(&v.len()) {
             continue;
         }
@@ -51,9 +28,109 @@ pub fn check_hard_offset_shadow(shadow: &str, current_color: &str, opacity: f64)
     Vec::new()
 }
 
+// The static CSS serializer can omit whitespace between tokens (0#333 or
+// rgb(0,0,0)4px). Tokenize CSS rather than splitting on spaces, keeping nested
+// color functions whole and rejecting unresolved lengths and unknown paint.
+fn parse_layer(layer: &str, current_color: &str) -> Option<(Vec<f64>, Rgba)> {
+    let mut input = ParserInput::new(layer);
+    let mut parser = Parser::new(&mut input);
+    let mut lengths = Vec::new();
+    let mut color = None;
+    while !parser.is_exhausted() {
+        parser.skip_whitespace();
+        let start = parser.position();
+        let token = parser.next().ok()?.clone();
+        let paint = match token {
+            Token::Dimension { value, unit, .. }
+                if unit.eq_ignore_ascii_case("px") && value.is_finite() =>
+            {
+                // Keep the f64 threshold precision used by this check; the
+                // tokenizer stores numeric values as f32.
+                let raw = parser.slice_from(start);
+                let value = raw[..raw.len() - unit.len()].parse::<f64>().ok()?;
+                if !value.is_finite() {
+                    return None;
+                }
+                lengths.push(value);
+                continue;
+            }
+            Token::Number { .. } if parser.slice_from(start).parse::<f64>().ok()? == 0.0 => {
+                lengths.push(0.0);
+                continue;
+            }
+            Token::Ident(ref name) if name.eq_ignore_ascii_case("currentcolor") => current_color,
+            Token::Ident(_) | Token::Hash(_) | Token::IDHash(_) => parser.slice_from(start),
+            Token::Function(ref name)
+                if COLOR_FUNCTION_NAMES
+                    .iter()
+                    .any(|f| name.eq_ignore_ascii_case(f)) =>
+            {
+                parser
+                    .parse_nested_block(|nested| {
+                        while nested.next_including_whitespace_and_comments().is_ok() {}
+                        Ok::<_, cssparser::ParseError<'_, ()>>(())
+                    })
+                    .ok()?;
+                parser.slice_from(start)
+            }
+            _ => return None,
+        };
+        // A shadow has at most one paint; transparent/unknown paint stays out.
+        let parsed = parse_any_color(Some(paint))?;
+        if color.replace(parsed).is_some() {
+            return None;
+        }
+    }
+    Some((
+        lengths,
+        color.or_else(|| parse_any_color(Some(current_color)))?,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn named_and_functional_shadow_colors() {
+        for shadow in [
+            "4px 4px red",
+            "4px 4px 0#333",
+            "rgb(255,0,0)4px 4px",
+            "gray -4px 4px",
+            "4px 4px ReBeccAPurple",
+            "4px 4px hwb(0 0% 0%)",
+            "hwb(0 0% 0% / 50%) 4px 4px",
+            "4px 4px color(srgb 1 0 0)",
+            "4px 4px color-mix(in srgb, rgb(255, 0, 0) 50%, blue)",
+            "4px 4px currentColor",
+            "4px 4px",
+        ] {
+            assert_eq!(
+                check_hard_offset_shadow(shadow, "red", 1.0).len(),
+                1,
+                "{shadow}"
+            );
+        }
+        for shadow in [
+            "4px 4px hwb(0 0% 0% / 10%)",
+            "4px 4px TRANSPARENT",
+            "4px 4px red blue",
+            "red 4px blue 4px",
+            "4px 4px notacolor",
+            "4px 4px var(--color, red)",
+            "4px 4px var(--color, rgb(255,0,0))",
+            "4px 4px red)",
+            "4px 4px hwb(0 0% 0%",
+            "inset 4px 4px red",
+        ] {
+            assert!(
+                check_hard_offset_shadow(shadow, "red", 1.0).is_empty(),
+                "{shadow}"
+            );
+        }
+        assert!(check_hard_offset_shadow("4px 4px hwb(0 0% 0% / 50%)", "red", 0.2).is_empty());
+    }
+
     #[test]
     fn resolved_layers_and_boundaries() {
         for s in [
@@ -68,6 +145,7 @@ mod tests {
         }
         for s in [
             "3.99px 3.99px #333",
+            "3.99999999px 3.99999999px red",
             "4px 4px 0.1px #333",
             "inset 4px 4px 0 #333",
             "0 0 0 4px #333",
