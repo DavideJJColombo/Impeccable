@@ -391,6 +391,8 @@ The block is wrapped in `# impeccable-ignore-start` / `# impeccable-ignore-end` 
 - `.impeccable/surfaces/*.md` (route- or artifact-specific strategy and direction contracts)
 - `.impeccable/critique/*.md` (review reports)
 
+Impeccable also keeps its own `.gitignore` in the folders that hold decision-round state: `.impeccable/questions/` and `.impeccable/mocks/worlds/` ignore everything in them, and `.impeccable/build/` ignores `state.json`. Those files record the roll key and dealt hand, so they stay out of commits even in a project without the block above.
+
 If an ephemeral file (a screenshot, `config.local.json`) was committed before you added the block, `.gitignore` will not untrack it automatically. Run `git rm --cached <path>` to stop tracking it without deleting your local copy.
 
 ## Design hook

@@ -324,6 +324,76 @@ fn missing_comps_message(round: CompRound, missing: &[String], rerun: &str, outc
     )
 }
 
+/// Every option on a decision page (a payload carrying `buildPath`: a
+/// direction or surface round) declares its identity: `kind`, one of
+/// `telemetry::CARD_KINDS`, at most one `assigned` and one `pick`, and on a
+/// challenger the `catalogId` concept-seed printed as its SOURCE ID, which
+/// must be one the roll dealt when a fresh roll record names them. A
+/// `canonCard` that declares a kind declares `canon`. Returns the problems,
+/// one per card, in card order; empty for any other payload.
+fn card_identity_problems(roll: Option<&str>, payload: &Value) -> (Vec<String>, Vec<String>) {
+    if !payload.get("buildPath").is_some_and(|b| !b.is_null()) {
+        return (vec![], vec![]);
+    }
+    let record = roll.and_then(|t| serde_json::from_str::<Value>(t).ok()).filter(|r| r.get("at").and_then(Value::as_f64).is_some_and(|at| now_ms() - at < ROLL_WINDOW_MS));
+    let dealt: Option<Vec<String>> = record.map(|r| r.get("worlds").and_then(Value::as_array).map(|a| a.iter().filter_map(|w| w.get("id").and_then(Value::as_str)).map(str::to_string).collect()).unwrap_or_default());
+    let options = payload.get("options").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
+    let mut problems = Vec::new();
+    let mut seen: Vec<&str> = Vec::new();
+    for (i, o) in options.iter().enumerate() {
+        let name = o.get("id").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string).unwrap_or_else(|| format!("options[{}]", i));
+        match o.get("kind").and_then(Value::as_str) {
+            None => problems.push(format!("{} declares no kind", name)),
+            Some(k) if !crate::telemetry::CARD_KINDS.contains(&k) => problems.push(format!("{} declares kind \"{}\"", name, k)),
+            Some(k) => {
+                if (k == "assigned" || k == "pick") && seen.contains(&k) {
+                    problems.push(format!("{} is a second {} card", name, k));
+                }
+                seen.push(k);
+                if k == "challenger" {
+                    match o.get("catalogId").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                        None => problems.push(format!("{} is a challenger with no catalogId", name)),
+                        Some(id) if dealt.as_ref().is_some_and(|d| !d.iter().any(|x| x == id)) => problems.push(format!("{} names catalogId \"{}\", which this roll did not deal", name, id)),
+                        Some(_) => {}
+                    }
+                }
+            }
+        }
+    }
+    if let Some(k) = payload.get("canonCard").and_then(|c| c.get("kind")).and_then(Value::as_str).filter(|k| *k != "canon") {
+        problems.push(format!("canonCard declares kind \"{}\"", k));
+    }
+    (problems, dealt.unwrap_or_default())
+}
+
+fn card_identity_message(problems: &[String], dealt: &[String], rerun: &str, outcome: &str) -> String {
+    let dealt_note = if dealt.is_empty() { String::new() } else { format!(" (dealt this roll: {})", dealt.join(", ")) };
+    format!(
+        "serve-question: every card on a direction or surface page declares its identity, and these do not: {}. Set \"kind\" on every option: \"assigned\" on the assigned direction (a surface round's dealt lead), \"pick\" on the IMPECCABLE’S PICK card, \"challenger\" on each dealt challenger, or \"dealt\" on a surface round's other dealt structures; and on every challenger set \"catalogId\" to the SOURCE ID concept-seed printed for it{}, never the card's own id. Fix the payload and {}; {}.\n",
+        problems.join("; "),
+        dealt_note,
+        rerun,
+        outcome
+    )
+}
+
+/// Everything under `.impeccable/questions/` is local runtime state: roll
+/// records, hands, answers, server state, the seed ledger. A roll record
+/// holds the seed key and dealt hand the roll API saw, so a committed one
+/// ties telemetry to a repository. Every write here keeps a self-ignoring
+/// `.impeccable/questions/.gitignore` (`*`) in place, which also covers
+/// projects that predate it.
+pub fn ignore_questions_dir(qdir: &str) {
+    impeccable_common::git::ensure_dir_ignored(qdir, &["*"]);
+}
+
+/// A roll record's `at`, floored to the minute: precise enough for
+/// `ROLL_WINDOW_MS`, too coarse to match a telemetry row to the second.
+fn coarse_now_ms() -> u64 {
+    let now = now_ms() as u64;
+    now - now % 60_000
+}
+
 /// How long a roll stays bound to the next decision page. A roll is
 /// presented within minutes; an older record belongs to work long gone.
 const ROLL_WINDOW_MS: f64 = 60.0 * 60.0 * 1000.0;
@@ -353,7 +423,7 @@ pub struct ApiRoll<'a> {
 /// picker can send the choice ping itself.
 pub fn record_roll(cwd: &str, scope: &str, key: &str, reroll: usize, worlds: &[Value], api: Option<&ApiRoll>) {
     let qdir = jsp::join(&[cwd, ".impeccable", "questions"]);
-    let mut record = json!({ "scope": scope, "key": key, "reroll": reroll, "at": now_ms() as u64 });
+    let mut record = json!({ "scope": scope, "key": key, "reroll": reroll, "at": coarse_now_ms() });
     if !worlds.is_empty() {
         record["worlds"] = Value::Array(worlds.to_vec());
     }
@@ -370,6 +440,7 @@ pub fn record_roll(cwd: &str, scope: &str, key: &str, reroll: usize, worlds: &[V
         }
     }
     let _ = std::fs::create_dir_all(&qdir).and_then(|_| write_atomic(&roll_file(&qdir), &json_compact(&record)));
+    ignore_questions_dir(&qdir);
 }
 
 /// The roll record as `--start` / `--update` read it once, before the gate:
@@ -477,6 +548,9 @@ fn fetch_world_cards(env: &Env, cwd: &str, worlds: &[Value]) -> Vec<(String, Str
         let abs = jsp::resolve(cwd, &[rel.as_str()]);
         // Temp file then rename: a parallel session never reads half an image.
         let temp = format!("{}.tmp-{}", abs, std::process::id());
+        // The kept cards name the dealt hand in their file names: runtime
+        // reference copies, so the directory ignores itself like questions/.
+        impeccable_common::git::ensure_dir_ignored(&jsp::resolve(cwd, &[WORLD_CARDS_DIR]), &["*"]);
         let written = std::fs::create_dir_all(jsp::resolve(cwd, &[WORLD_CARDS_DIR])).and_then(|_| std::fs::write(&temp, &bytes)).and_then(|_| std::fs::rename(&temp, &abs));
         if written.is_err() {
             let _ = std::fs::remove_file(&temp);
@@ -698,6 +772,7 @@ pub fn record_generated(cwd: &str, out: &str) -> Result<Vec<String>, String> {
                 continue;
             }
             let dir = generated_dir(&qdir, &key);
+            ignore_questions_dir(&qdir);
             let marker = jsp::join(&[&dir, &marker_name(&slot, &marker_tag(&id))]);
             std::fs::create_dir_all(&dir)
                 .and_then(|_| write_atomic(&marker, &json_compact(&json!({ "slot": slot, "hand": id }))))
@@ -761,6 +836,7 @@ fn new_hand_dealt(cwd: &str, payload: &Value, worlds: &[Value], seed: Option<Val
 /// this engine never writes that name again, so no new marker can land there.
 /// The error names the file.
 fn write_hand(qdir: &str, key: &str, hand: &Map<String, Value>) -> Result<(), String> {
+    ignore_questions_dir(qdir);
     let target = hand_file(qdir, key);
     write_atomic(&target, &json_compact(&Value::Object(hand.clone()))).map_err(|e| format!("{}: {}", target, e))?;
     let id = hand_marker_id(hand);
@@ -991,20 +1067,20 @@ fn schema_json() -> Value {
       "title": "Choose the visual world",
       "question": "The roll assigned Fillmore Handbill. Keep it, take an alternate, or re-roll.",
       "options": [
-        { "id": "assigned", "label": "Fillmore Handbill", "kicker": "THE ROLL", "lineage": "1966-71 Fillmore psychedelic handbills", "thesis": "The gig poster that treats every release like a one-night stand.", "palette": ["#e8452c", "#f5d64c", "#1b2a52", "#f3ead8"], "materials": ["letterpress", "split-fountain ink"], "viewport": "A full-bleed dated bill with the product name in warped display type.", "risk": "Reads nostalgic when the type is set timidly.", "raised": [{ "from": "challenger-microfiche", "raise": "The bill now owns its whole viewport as one continuous printed sheet." }], "comp": ".impeccable/mocks/decision/assigned.webp", "hero": "https://impeccable.style/worlds/cards/posters-covers-sleeves-fillmore-handbill-hero.webp", "board": "https://impeccable.style/worlds/cards/posters-covers-sleeves-fillmore-handbill.webp" },
-        { "id": "model-pick", "label": "The Broadside Ballad", "kicker": "IMPECCABLE’S PICK", "lineage": "street-sold ballad sheets", "thesis": "Every release printed as the day’s ballad sheet.", "palette": ["#1f1c18", "#efe5d0", "#a33327"], "materials": ["woodcut", "rag paper"], "viewport": "One tall sheet, the newest release as today’s ballad.", "risk": "Also the direction most runs in this category land on.", "comp": ".impeccable/mocks/decision/model-pick.webp" },
-        { "id": "challenger-teletext", "label": "Teletext Service", "verdict": "competitive", "lineage": "broadcast teletext magazines", "thesis": "The catalog as a broadcast index: pages, not sections.", "palette": ["#0000c0", "#ffff00", "#00c000", "#ffffff"], "materials": ["block mosaic", "phosphor glow"], "viewport": "P100 index page, releases as numbered rows.", "case": "Fuses cleanly: releases map to numbered pages; loses narrowly on clarity.", "risk": "Reads retro-novelty when the grid is not strict.", "comp": ".impeccable/mocks/decision/challenger-teletext.webp", "hero": "https://impeccable.style/worlds/cards/broadcast-programming-teletext-service-hero.webp" },
-        { "id": "challenger-microfiche", "label": "Microfiche Reader", "verdict": "declined", "lineage": "library microfiche stations", "palette": ["#101418", "#9fb4c0"], "materials": ["film grain", "backlit glass"], "case": "Fuses poorly: listeners do not identify with archival retrieval.", "kept": "Total environmental commitment.", "hero": "https://impeccable.style/worlds/cards/archives-microfiche-reader-hero.webp" }
+        { "id": "assigned", "kind": "assigned", "label": "Fillmore Handbill", "kicker": "THE ROLL", "lineage": "1966-71 Fillmore psychedelic handbills", "thesis": "The gig poster that treats every release like a one-night stand.", "palette": ["#e8452c", "#f5d64c", "#1b2a52", "#f3ead8"], "materials": ["letterpress", "split-fountain ink"], "viewport": "A full-bleed dated bill with the product name in warped display type.", "risk": "Reads nostalgic when the type is set timidly.", "raised": [{ "from": "challenger-microfiche", "raise": "The bill now owns its whole viewport as one continuous printed sheet." }], "comp": ".impeccable/mocks/decision/assigned.webp", "hero": "https://impeccable.style/worlds/cards/posters-covers-sleeves-fillmore-handbill-hero.webp", "board": "https://impeccable.style/worlds/cards/posters-covers-sleeves-fillmore-handbill.webp" },
+        { "id": "model-pick", "kind": "pick", "label": "The Broadside Ballad", "kicker": "IMPECCABLE’S PICK", "lineage": "street-sold ballad sheets", "thesis": "Every release printed as the day’s ballad sheet.", "palette": ["#1f1c18", "#efe5d0", "#a33327"], "materials": ["woodcut", "rag paper"], "viewport": "One tall sheet, the newest release as today’s ballad.", "risk": "Also the direction most runs in this category land on.", "comp": ".impeccable/mocks/decision/model-pick.webp" },
+        { "id": "challenger-teletext", "kind": "challenger", "catalogId": "broadcast-programming-teletext-service", "label": "Teletext Service", "verdict": "competitive", "lineage": "broadcast teletext magazines", "thesis": "The catalog as a broadcast index: pages, not sections.", "palette": ["#0000c0", "#ffff00", "#00c000", "#ffffff"], "materials": ["block mosaic", "phosphor glow"], "viewport": "P100 index page, releases as numbered rows.", "case": "Fuses cleanly: releases map to numbered pages; loses narrowly on clarity.", "risk": "Reads retro-novelty when the grid is not strict.", "comp": ".impeccable/mocks/decision/challenger-teletext.webp", "hero": "https://impeccable.style/worlds/cards/broadcast-programming-teletext-service-hero.webp" },
+        { "id": "challenger-microfiche", "kind": "challenger", "catalogId": "archives-microfiche-reader", "label": "Microfiche Reader", "verdict": "declined", "lineage": "library microfiche stations", "palette": ["#101418", "#9fb4c0"], "materials": ["film grain", "backlit glass"], "case": "Fuses poorly: listeners do not identify with archival retrieval.", "kept": "Total environmental commitment.", "hero": "https://impeccable.style/worlds/cards/archives-microfiche-reader-hero.webp" }
       ],
       "reroll": { "registers": ["safer", "bolder"] },
       "buildPath": { "value": "comp", "toggle": true },
       "canon": true,
-      "canonCard": { "label": "The category standard", "thesis": "What this category ships, executed impeccably.", "palette": ["#ffffff", "#111827", "#2563eb"], "materials": ["clean grid", "product photography"], "viewport": "The arrangement a visitor expects, at full craft.", "risk": "Indistinguishable from the competition by design.", "comp": ".impeccable/mocks/decision/canon.webp" },
+      "canonCard": { "kind": "canon", "label": "The category standard", "thesis": "What this category ships, executed impeccably.", "palette": ["#ffffff", "#111827", "#2563eb"], "materials": ["clean grid", "product photography"], "viewport": "The arrangement a visitor expects, at full craft.", "risk": "Indistinguishable from the competition by design.", "comp": ".impeccable/mocks/decision/canon.webp" },
       "steer": true
     })
 }
 
-const SCHEMA_NOTE: &str = "\nOption ids return verbatim in ANSWER; \"reroll\" and \"canon\" are reserved. hero/board/comp accept URLs or local paths; comp slots may point at files that do not exist yet (serve first, generate after; the page polls until they land, so never block serving on generation). hero on a challenger is the inspiration it draws from and renders picture-in-picture beside the comp, never as the promise of the build. verdict routes rendering: \"wins\" and \"competitive\" challengers keep full cards, \"declined\" ones render demoted after them (narrow, quiet, art as a labeled thumb, \"Adopt anyway\"), with their kept line on the front; the page reorders declined cards to the end on its own. raised on the assigned card renders each donation as a named raise line. Salience parity: when the assigned card declares no comp (no image generation this round), catalog art on every card demotes to a labeled thumb, so what looks important is the verdict’s call, never rendering luck. canonCard renders the standing exit as a subordinate card with the same anatomy; without it, canon stays a quiet footer action. Include canon only for visual-direction rounds; never present it as your own recommendation. The pick card is a kicker convention, not a field: kicker \"IMPECCABLE’S PICK\" on your top-ranked grounded candidate, one at most, never in the lead slot. Every card gets the full anatomy, challengers, canon, and declined included: thesis, palette, materials, viewport, risk; the seed already hands you each challenger’s system rules, so a card with no palette chips is an authoring gap, not a data gap. Keep thesis and each fact to one short sentence: the card front shows thesis, identity, and a two-line risk, while first viewport and the case read on the card back behind the Details chip, so long facts cost the reader a flip, not the page its scanability. A card with no imagery at all has no back; its full read renders on the front, so a text-only round loses nothing. A card may declare \"html\", a local path to one self-contained HTML file of the first viewport (1440 x 900 by default; \"htmlFrame\": \"390x844\" names a phone or native surface's first screen): the page draws it in the media slot as a skeleton (text under 22px becomes bars, so composition, palette and display type read and the copy does not) once the file lands, polling until it does, counts only a file written after the round was served, and opens the file as written from the expand chip; code-led and image-less rounds use it, a comp face wins over it, and ANSWER carries the picked card's html. A card with neither may declare \"wireframe\" ({\"cols\":12,\"rows\":10,\"regions\":[{\"label\":\"nav rail\",\"x\":0,\"y\":0,\"w\":3,\"h\":10,\"accent\":true}]}): the page draws it as a layout schematic in the media slot; surface-scope rounds use it on code-led builds, it never counts toward salience, and the card keeps its full read on the front. The comp slot carries the card’s full-fidelity direction comp (the legacy key \"sketch\" is accepted as an alias). Comp aspect follows the surface: portrait at device viewport for native or mobile-first surfaces, landscape otherwise; the page adapts its cards to either. reroll accepts true or { \"registers\": [\"safer\", \"bolder\"] }: the register buttons steer the next hand along the familiar-to-bold axis, the answer carries \"register\", and you re-run concept-seed with --register <value> for the next round; offer the registers on direction rounds, and never pre-select one. buildPath rides the payload as { \"value\": \"comp\"|\"code\", \"toggle\": true }: the value is the recorded default (.impeccable/config.json buildPath, or .impeccable/config.local.json where one machine differs) and the toggle renders a footer switch whose flip binds that session only; the ANSWER then carries buildPath plus buildPathFlipped. On a code-led round each card still declares its comp path as a flip reserve: wireframes render, and a flip to comp makes --wait return once with BUILD PATH FLIPPED so you generate the comps into the declared slots while the round stays open; a flip back to code is free, and a comp that already landed stays as the critique reference. The toggle may only be offered when image generation exists: a harness with no image tool and no API key never sets toggle: true, so the choice never renders where comps cannot be made, and code-led simply rides as the untoggleable value. followup: true keeps the table open after a pick for a second round via --update; send the next payload immediately, the page is waiting on it.";
+const SCHEMA_NOTE: &str = "\nOption ids return verbatim in ANSWER; \"reroll\" and \"canon\" are reserved. On a direction or surface round (a payload carrying buildPath) every option declares kind, and --start and --update refuse the payload until it does: \"assigned\" on the assigned direction or a surface round\u{2019}s dealt lead, \"pick\" on the IMPECCABLE\u{2019}S PICK card, \"challenger\" on each dealt challenger, \"dealt\" on a surface round\u{2019}s other dealt structures; every challenger also carries catalogId, the SOURCE ID concept-seed printed for that world (never the card\u{2019}s own id), checked against the worlds the roll dealt; canonCard may carry kind \"canon\". The page sends the choice ping from these fields. hero/board/comp accept URLs or local paths; comp slots may point at files that do not exist yet (serve first, generate after; the page polls until they land, so never block serving on generation). hero on a challenger is the inspiration it draws from and renders picture-in-picture beside the comp, never as the promise of the build. verdict routes rendering: \"wins\" and \"competitive\" challengers keep full cards, \"declined\" ones render demoted after them (narrow, quiet, art as a labeled thumb, \"Adopt anyway\"), with their kept line on the front; the page reorders declined cards to the end on its own. raised on the assigned card renders each donation as a named raise line. Salience parity: when the assigned card declares no comp (no image generation this round), catalog art on every card demotes to a labeled thumb, so what looks important is the verdict’s call, never rendering luck. canonCard renders the standing exit as a subordinate card with the same anatomy; without it, canon stays a quiet footer action. Include canon only for visual-direction rounds; never present it as your own recommendation. The pick card is a kicker convention, not a field: kicker \"IMPECCABLE’S PICK\" on your top-ranked grounded candidate, one at most, never in the lead slot. Every card gets the full anatomy, challengers, canon, and declined included: thesis, palette, materials, viewport, risk; the seed already hands you each challenger’s system rules, so a card with no palette chips is an authoring gap, not a data gap. Keep thesis and each fact to one short sentence: the card front shows thesis, identity, and a two-line risk, while first viewport and the case read on the card back behind the Details chip, so long facts cost the reader a flip, not the page its scanability. A card with no imagery at all has no back; its full read renders on the front, so a text-only round loses nothing. A card may declare \"html\", a local path to one self-contained HTML file of the first viewport (1440 x 900 by default; \"htmlFrame\": \"390x844\" names a phone or native surface's first screen): the page draws it in the media slot as a skeleton (text under 22px becomes bars, so composition, palette and display type read and the copy does not) once the file lands, polling until it does, counts only a file written after the round was served, and opens the file as written from the expand chip; code-led and image-less rounds use it, a comp face wins over it, and ANSWER carries the picked card's html. A card with neither may declare \"wireframe\" ({\"cols\":12,\"rows\":10,\"regions\":[{\"label\":\"nav rail\",\"x\":0,\"y\":0,\"w\":3,\"h\":10,\"accent\":true}]}): the page draws it as a layout schematic in the media slot; surface-scope rounds use it on code-led builds, it never counts toward salience, and the card keeps its full read on the front. The comp slot carries the card’s full-fidelity direction comp (the legacy key \"sketch\" is accepted as an alias). Comp aspect follows the surface: portrait at device viewport for native or mobile-first surfaces, landscape otherwise; the page adapts its cards to either. reroll accepts true or { \"registers\": [\"safer\", \"bolder\"] }: the register buttons steer the next hand along the familiar-to-bold axis, the answer carries \"register\", and you re-run concept-seed with --register <value> for the next round; offer the registers on direction rounds, and never pre-select one. buildPath rides the payload as { \"value\": \"comp\"|\"code\", \"toggle\": true }: the value is the recorded default (.impeccable/config.json buildPath, or .impeccable/config.local.json where one machine differs) and the toggle renders a footer switch whose flip binds that session only; the ANSWER then carries buildPath plus buildPathFlipped. On a code-led round each card still declares its comp path as a flip reserve: wireframes render, and a flip to comp makes --wait return once with BUILD PATH FLIPPED so you generate the comps into the declared slots while the round stays open; a flip back to code is free, and a comp that already landed stays as the critique reference. The toggle may only be offered when image generation exists: a harness with no image tool and no API key never sets toggle: true, so the choice never renders where comps cannot be made, and code-led simply rides as the untoggleable value. followup: true keeps the table open after a pick for a second round via --update; send the next payload immediately, the page is waiting on it.";
 
 /// JS: Number(arg('timeout','900')) etc.
 fn js_number_arg(a: &Args, name: &str, fallback: &str) -> f64 {
@@ -1189,6 +1265,11 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
             return 1;
         }
         let roll = read_roll(&qdir);
+        let (problems, dealt) = card_identity_problems(roll.as_deref(), &next_round);
+        if !problems.is_empty() {
+            io.err(&card_identity_message(&problems, &dealt, "rerun --update on the same key", "nothing was delivered"));
+            return 1;
+        }
         if let Some((round, missing)) = missing_comps(roll.as_deref(), &next_round) {
             io.err(&missing_comps_message(round, &missing, "rerun --update on the same key", "nothing was delivered"));
             return 1;
@@ -1229,11 +1310,17 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
             }
         };
         let roll = read_roll(&qdir);
+        let (problems, dealt) = card_identity_problems(roll.as_deref(), &start_payload);
+        if !problems.is_empty() {
+            io.err(&card_identity_message(&problems, &dealt, "rerun --start", "the page was not served"));
+            return 1;
+        }
         if let Some((round, missing)) = missing_comps(roll.as_deref(), &start_payload) {
             io.err(&missing_comps_message(round, &missing, "rerun --start", "the page was not served"));
             return 1;
         }
         let _ = std::fs::create_dir_all(&qdir);
+        ignore_questions_dir(&qdir);
         let key = a.arg("key").unwrap_or_else(random_key);
         let hand = match start_hand(&qdir, &key, &cwd, &start_payload, &dealt_worlds(roll.as_deref(), &start_payload), roll_seed(roll.as_deref(), &start_payload)) {
             Ok(h) => h,
@@ -1347,6 +1434,7 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
     let url = format!("http://127.0.0.1:{}/", actual_port);
     if a.has("detached-serve") {
         let _ = std::fs::create_dir_all(&qdir);
+        ignore_questions_dir(&qdir);
         let key = a.arg("key").unwrap_or_default();
         let mut st = json!({ "pid": std::process::id(), "port": actual_port, "url": url });
         let comps = declared_comps(&state.lock().unwrap().payload);
@@ -1547,6 +1635,7 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
                     if let Some(k) = st.detached_key.clone() {
                         if value == "comp" && !was_comp {
                             let _ = std::fs::create_dir_all(&st.qdir);
+                            ignore_questions_dir(&st.qdir);
                             let _ = std::fs::write(flip_file(&st.qdir, &k), "{\"buildPath\":\"comp\"}\n");
                         }
                     }
@@ -1605,13 +1694,14 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
                     ans.insert("buildPathFlipped".into(), Value::Bool(Some(lbp.as_str()) != st.build_path_default.as_ref().map(|b| b.0.as_str())));
                 }
             }
-            let answer = json_compact(&Value::Object(ans));
+            let answer = json_compact(&Value::Object(ans.clone()));
             // The choice ping, sent by the page itself when the hand took an
-            // API-dealt roll and the card's kind is certain (`picker_choice`).
+            // API-dealt roll (`picker_choice`): the chosen card, or the hand
+            // rejected by a re-roll.
             // The round is marked sent before the answer is written, so the
             // agent's `--kind` rerun, which only runs once it has the answer,
             // finds the mark and sends nothing.
-            let picker_ping = if is_reroll || crate::telemetry::telemetry_disabled(&env) {
+            let picker_ping = if crate::telemetry::telemetry_disabled(&env) {
                 None
             } else {
                 st.detached_key
@@ -1619,7 +1709,7 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
                     .and_then(|k| read_hand(&st.qdir, k))
                     .filter(|h| h.get("digest").and_then(Value::as_str) == Some(hand_digest(&st.payload).as_str()))
                     .and_then(|h| h.get("seed").cloned())
-                    .and_then(|seed| crate::telemetry::picker_choice(&seed, &st.payload, option_id.as_str().unwrap_or("")))
+                    .and_then(|seed| crate::telemetry::picker_choice(&seed, &st.payload, option_id.as_str().unwrap_or(""), ans.get("register").and_then(Value::as_str)))
                     .filter(|p| crate::telemetry::mark_recorded(&st.cwd, p.key.as_deref().unwrap_or(""), p.reroll.unwrap_or(0), "picker"))
             };
             let was_awaiting = st.awaiting_next;
@@ -1629,6 +1719,7 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
             }
             if let Some(k) = st.detached_key.clone() {
                 let _ = std::fs::create_dir_all(&st.qdir);
+                ignore_questions_dir(&st.qdir);
                 let _ = std::fs::write(answer_file(&st.qdir, &k), format!("{}\n", answer));
             } else {
                 print_answer(io, &answer, &declared_comps(&st.payload));
@@ -2665,15 +2756,15 @@ mod tests {
         let mut p = json!({
             "title": "Choose the visual world",
             "options": [
-                { "id": "assigned", "kicker": "THE ROLL", "thesis": "One." },
-                { "id": "model-pick", "kicker": "IMPECCABLE’S PICK", "thesis": "Two." },
-                { "id": "challenger-a", "verdict": "competitive", "thesis": "Three.", "hero": "https://x/a-hero.webp" },
-                { "id": "challenger-b", "verdict": "declined", "thesis": "Four.", "hero": "https://x/b-hero.webp" }
+                { "id": "assigned", "kind": "assigned", "kicker": "THE ROLL", "thesis": "One." },
+                { "id": "model-pick", "kind": "pick", "kicker": "IMPECCABLE’S PICK", "thesis": "Two." },
+                { "id": "challenger-a", "kind": "challenger", "catalogId": "print-fillmore-handbill", "verdict": "competitive", "thesis": "Three.", "hero": "https://x/a-hero.webp" },
+                { "id": "challenger-b", "kind": "challenger", "catalogId": "broadcast-teletext", "verdict": "declined", "thesis": "Four.", "hero": "https://x/b-hero.webp" }
             ],
             "reroll": { "registers": ["safer", "bolder"] },
             "buildPath": { "value": "comp", "toggle": true },
             "canon": true,
-            "canonCard": { "label": "The category standard", "thesis": "Five." }
+            "canonCard": { "kind": "canon", "label": "The category standard", "thesis": "Five." }
         });
         if comps {
             for (i, id) in ["assigned", "model-pick", "challenger-a"].iter().enumerate() {
@@ -2778,9 +2869,9 @@ mod tests {
         let mut p = json!({
             "title": "Choose the structure",
             "options": [
-                { "id": "ledger", "kicker": "THE ROLL", "thesis": "One." },
-                { "id": "rail", "thesis": "Two." },
-                { "id": "field", "thesis": "Three." }
+                { "id": "ledger", "kind": "assigned", "kicker": "THE ROLL", "thesis": "One." },
+                { "id": "rail", "kind": "dealt", "thesis": "Two." },
+                { "id": "field", "kind": "dealt", "thesis": "Three." }
             ],
             "reroll": true,
             "buildPath": { "value": "comp", "toggle": true }
@@ -3306,7 +3397,10 @@ mod tests {
         let handle = card_server(server, stop.clone());
         let dir = temp_project("world-cards-fail");
         write_state(&dir, &json!({ "pid": std::process::id(), "port": 1, "url": "http://127.0.0.1:1/" }));
-        std::fs::write(dir.join("p.json"), direction_round(true).to_string()).unwrap();
+        let mut round = direction_round(true);
+        round["options"][2]["catalogId"] = json!("a");
+        round["options"][3]["catalogId"] = json!("b");
+        std::fs::write(dir.join("p.json"), round.to_string()).unwrap();
         // One image 404s, one URL sits outside the card base on a loopback
         // host (never requested), one answers 200 with a sign-in page, an
         // extensionless one is a webp, and one is served.
@@ -3325,9 +3419,11 @@ mod tests {
         assert!(line.ends_with(&format!("WORLD CARDS: a board .impeccable/mocks/worlds/a-board.webp hero {base}/cards/missing-hero.webp | b board {base}/elsewhere/b.webp hero .impeccable/mocks/worlds/b-hero.webp | c board {base}/cards/wall.webp hero .impeccable/mocks/worlds/c-hero.webp\n")), "{line}");
         // Nothing but the three real images is kept: no page saved as a card.
         let cards = dir.join(".impeccable/mocks/worlds");
-        let mut kept: Vec<String> = std::fs::read_dir(&cards).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        let mut kept: Vec<String> = std::fs::read_dir(&cards).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n != ".gitignore").collect();
         kept.sort();
         assert_eq!(kept, vec!["a-board.webp", "b-hero.webp", "c-hero.webp"]);
+        // The kept copies name the dealt hand, so their directory ignores itself.
+        assert!(std::fs::read_to_string(cards.join(".gitignore")).unwrap().ends_with("\n*\n"));
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         let seen = handle.join().unwrap();
         assert!(!seen.iter().any(|p| p.contains("elsewhere")), "{seen:?}");
@@ -3670,6 +3766,9 @@ mod tests {
 
     /// Serves `payload` as a detached page on key `pk` in-process, answers it
     /// with `option`, and returns the server's exit code once it exits.
+    /// A re-roll answer keeps the page open, so its server thread is left
+    /// running (`--timeout 0`, no heartbeat: it never exits the test process)
+    /// and this returns 0 once the answer is accepted.
     fn answer_on_page(dir: &std::path::Path, payload: &Value, option: &str, extra_env: &[(&str, &str)]) -> i32 {
         let qdir = dir.join(".impeccable/questions");
         let _ = std::fs::remove_file(qdir.join("pk.state.json"));
@@ -3694,6 +3793,9 @@ mod tests {
             sleep_ms(20);
         };
         ureq::post(&format!("http://127.0.0.1:{}/answer?key=pk", port)).send_string(&json!({ "optionId": option }).to_string()).unwrap();
+        if option == "reroll" {
+            return 0;
+        }
         server.join().unwrap()
     }
 
@@ -3708,8 +3810,8 @@ mod tests {
         ]);
         let payload = json!({
             "options": [
-                { "id": "assigned", "label": "Fillmore", "kicker": "THE ROLL" },
-                { "id": "challenger-teletext", "label": "Teletext", "verdict": "competitive", "hero": "https://cards.test/teletext-service-hero.webp" }
+                { "id": "assigned", "kind": "assigned", "label": "Fillmore", "kicker": "THE ROLL" },
+                { "id": "challenger-teletext", "kind": "challenger", "catalogId": "teletext-service", "label": "Teletext", "verdict": "competitive", "hero": "https://cards.test/teletext-service-hero.webp" }
             ],
             "buildPath": { "value": "code", "toggle": true }, "canon": true
         });
@@ -3731,7 +3833,7 @@ mod tests {
         let got = seen.lock().unwrap().clone();
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0].0, format!("impeccable/{}+engine test", env!("CARGO_PKG_VERSION")));
-        assert_eq!(got[0].1, r#"{"chosenId":"teletext-service","key":"seed-1","scope":"direction","mode":"persuade","kind":"challenger","reroll":0,"poolRevision":"0123456789ab","source":"picker"}"#);
+        assert_eq!(got[0].1, r#"{"chosenId":"teletext-service","key":"seed-1","scope":"direction","mode":"persuade","kind":"challenger","option":1,"reroll":0,"poolRevision":"0123456789ab","kindSource":"explicit","source":"picker"}"#);
         assert_eq!(crate::telemetry::read_seed_round(&cwd, "seed-1", Some(0)).unwrap().recorded.as_deref(), Some("picker"));
         // The agent's rerun for the same round sends nothing.
         let ping_env = Env::from([("IMPECCABLE_API_URL".to_string(), base.clone())]);
@@ -3746,6 +3848,16 @@ mod tests {
         answer_on_page(&dir, &payload, "assigned", &[("IMPECCABLE_API_URL", &base), ("DO_NOT_TRACK", "1")]);
         assert_eq!(seen.lock().unwrap().len(), 1);
         assert_eq!(crate::telemetry::read_seed_round(&cwd, "seed-1", Some(1)).unwrap().recorded, None);
+
+        // A re-roll on the page is the hand rejected, sent once for that round.
+        deal(3);
+        answer_on_page(&dir, &payload, "reroll", &[("IMPECCABLE_API_URL", &base)]);
+        let deadline = now_ms() + 5000.0;
+        while seen.lock().unwrap().len() < 2 && now_ms() < deadline {
+            sleep_ms(20);
+        }
+        assert_eq!(seen.lock().unwrap().last().unwrap().1, r#"{"key":"seed-1","scope":"direction","mode":"persuade","kind":"reroll","reroll":3,"poolRevision":"0123456789ab","kindSource":"explicit","source":"picker"}"#);
+        assert_eq!(crate::telemetry::read_seed_round(&cwd, "seed-1", Some(3)).unwrap().recorded.as_deref(), Some("picker"));
 
         // A ping that cannot leave the machine clears its mark for the agent's rerun.
         deal(2);
@@ -3768,5 +3880,85 @@ mod tests {
         assert_eq!(roll_seed(Some(&api), &json!({ "options": [{ "id": "a" }] })), None, "a page that takes no roll");
         let stale = json!({ "scope": "direction", "key": "k", "reroll": 0, "at": (now_ms() - ROLL_WINDOW_MS - 1000.0) as u64, "source": "api" }).to_string();
         assert_eq!(roll_seed(Some(&stale), &page), None);
+    }
+
+    #[test]
+    fn start_and_update_refuse_a_decision_page_whose_cards_do_not_declare_their_identity() {
+        let dir = temp_project("card-identity");
+        let worlds = two_worlds("https://cards.test");
+        write_dealt_roll(&dir, "direction", now_ms(), &worlds);
+        let mut round = direction_round(false);
+        round["buildPath"] = json!({ "value": "code", "toggle": true });
+        let start = |p: &Value| {
+            std::fs::write(dir.join("p.json"), p.to_string()).unwrap();
+            run_captured(&dir, &["--start", "--payload", "p.json", "--no-open"]).0
+        };
+        let problems = |p: &Value| card_identity_problems(read_roll(&dir.join(".impeccable/questions").to_string_lossy()).as_deref(), p).0;
+        assert!(problems(&round).is_empty(), "{:?}", problems(&round));
+        let mut bad = round.clone();
+        bad["options"][0].as_object_mut().unwrap().remove("kind");
+        bad["options"][1]["kind"] = json!("favourite");
+        bad["options"][2]["catalogId"] = json!("challenger-a");
+        bad["options"][3].as_object_mut().unwrap().remove("catalogId");
+        bad["canonCard"]["kind"] = json!("assigned");
+        assert_eq!(
+            problems(&bad),
+            vec![
+                "assigned declares no kind",
+                "model-pick declares kind \"favourite\"",
+                "challenger-a names catalogId \"challenger-a\", which this roll did not deal",
+                "challenger-b is a challenger with no catalogId",
+                "canonCard declares kind \"assigned\""
+            ]
+        );
+        let mut twice = round.clone();
+        twice["options"][1]["kind"] = json!("assigned");
+        assert_eq!(problems(&twice), vec!["model-pick is a second assigned card"]);
+        // Refused before anything is served, the roll record left in place for the rerun.
+        assert_eq!(start(&bad), 1);
+        assert!(dir.join(".impeccable/questions/roll.json").exists());
+        let msg = card_identity_message(&problems(&bad), &["print-fillmore-handbill".into(), "broadcast-teletext".into()], "rerun --start", "the page was not served");
+        assert!(msg.contains("(dealt this roll: print-fillmore-handbill, broadcast-teletext), never the card's own id. Fix the payload and rerun --start; the page was not served.\n"), "{msg}");
+        // Pages that are not direction or surface rounds declare nothing.
+        let mut plain = bad.clone();
+        plain.as_object_mut().unwrap().remove("buildPath");
+        assert!(problems(&plain).is_empty());
+        // With no fresh roll record, any catalogId stands: there is nothing to check it against.
+        std::fs::remove_file(dir.join(".impeccable/questions/roll.json")).unwrap();
+        let mut other = round.clone();
+        other["options"][2]["catalogId"] = json!("anything");
+        assert!(problems(&other).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_questions_directory_ignores_itself_on_every_write() {
+        let dir = temp_project("questions-ignored");
+        let cwd = dir.to_string_lossy().to_string();
+        let qdir = dir.join(".impeccable/questions");
+        let ignore = qdir.join(".gitignore");
+        let expected = format!("{}\n*\n", impeccable_common::git::RUNTIME_IGNORE_HEADER);
+        // A project from before the ignore file: the next roll record writes it.
+        std::fs::write(qdir.join("roll.json"), "{}").unwrap();
+        assert!(!ignore.exists());
+        record_roll(&cwd, "direction", "seed-1", 0, &[], None);
+        assert_eq!(std::fs::read_to_string(&ignore).unwrap(), expected);
+        // The roll record's time is floored to the minute.
+        let at = serde_json::from_str::<Value>(&std::fs::read_to_string(qdir.join("roll.json")).unwrap()).unwrap()["at"].as_u64().unwrap();
+        assert_eq!(at % 60_000, 0);
+        // A hand write restores it too, and leaves an existing one byte-equal.
+        std::fs::remove_file(&ignore).unwrap();
+        write_hand(&qdir.to_string_lossy(), "k1", &new_hand(&cwd, &json!({ "options": [{ "id": "a" }] }))).unwrap();
+        assert_eq!(std::fs::read_to_string(&ignore).unwrap(), expected);
+        record_roll(&cwd, "direction", "seed-1", 0, &[], None);
+        assert_eq!(std::fs::read_to_string(&ignore).unwrap(), expected);
+        // Git agrees: nothing under questions/ is offered for a commit.
+        let git = |args: &[&str]| std::process::Command::new("git").args(args).current_dir(&dir).output();
+        if git(&["init", "-q"]).is_ok_and(|o| o.status.success()) {
+            let out = git(&["status", "--porcelain", "--untracked-files=all"]).unwrap();
+            let listed = String::from_utf8_lossy(&out.stdout).to_string();
+            assert!(!listed.contains(".impeccable/questions"), "{listed}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

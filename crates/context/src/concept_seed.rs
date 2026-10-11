@@ -181,6 +181,9 @@ struct PingArgs<'a> {
     register: Option<&'a str>,
     /// `--reroll <n>` when it was a valid round (0 to 8).
     reroll: Option<usize>,
+    /// `--option <n>` when it was a valid card position (0 to 15): the chosen
+    /// card's zero-based position, for a card with no ping kind.
+    option: Option<usize>,
 }
 
 enum PingOutcome {
@@ -212,10 +215,14 @@ fn ping_chosen(env: &Env, cwd: &str, budget: &mut ApiBudget, a: &PingArgs) -> Pi
             return PingOutcome::Skipped;
         }
     }
-    if chosen_id.is_none() && kind.is_none() {
+    // A rejected hand names no card.
+    if kind == Some("reroll") {
+        chosen_id = None;
+    }
+    if chosen_id.is_none() && kind.is_none() && a.option.is_none() {
         return PingOutcome::Skipped;
     }
-    if (kind == Some("challenger") || kind.is_none()) && chosen_id.is_none() {
+    if kind == Some("challenger") && chosen_id.is_none() {
         return PingOutcome::Skipped;
     }
     let round = a.key.filter(|k| !k.is_empty()).and_then(|k| telemetry::read_seed_round(cwd, k, a.reroll));
@@ -227,7 +234,7 @@ fn ping_chosen(env: &Env, cwd: &str, budget: &mut ApiBudget, a: &PingArgs) -> Pi
             // Not a catalog id from this round's hand: a grounded direction's
             // name never leaves the machine. Without a kind there is nothing left.
             chosen_id = None;
-            if kind.is_none() {
+            if kind.is_none() && a.option.is_none() {
                 return PingOutcome::Skipped;
             }
         }
@@ -239,8 +246,10 @@ fn ping_chosen(env: &Env, cwd: &str, budget: &mut ApiBudget, a: &PingArgs) -> Pi
         mode: a.mode.map(str::to_string),
         kind: kind.map(str::to_string),
         register: register.map(str::to_string),
+        option: a.option,
         reroll: Some(round.as_ref().map(|r| r.reroll).or(a.reroll).unwrap_or(0)),
         pool_revision: round.as_ref().and_then(|r| r.pool_revision.clone()),
+        kind_source: None,
         source: "agent",
     };
     if !telemetry::send_choice(env, cwd, &ping, budget.remaining()) {
@@ -576,7 +585,13 @@ fn render_roll(env: &Env, cwd: &str, budget: &mut ApiBudget, a: &SeedArgs) -> Re
     } else {
         String::new()
     };
-    let telemetry_block = if data.source == "api" { fill(t::TELEMETRY_BLOCK, &common) } else { String::new() };
+    let telemetry_block = if data.source == "api" {
+        let mut pairs = common.clone();
+        pairs.push(("TELEMETRY_CHOICE", if scope == "direction" { t::TELEMETRY_CHOICE_DIRECTION } else { t::TELEMETRY_CHOICE_SURFACE }));
+        fill(t::TELEMETRY_BLOCK, &pairs)
+    } else {
+        String::new()
+    };
     let assigned_block = match register {
         None => fill(t::ASSIGNED_BLOCK, &[("ASSIGNED_OR_DEALT", &assigned_or_dealt), ("PROMOTEDINSTRUCTION", &promoted)]),
         Some("safer") => t::SAFER_BLOCK.to_string(),
@@ -642,13 +657,14 @@ pub fn run(args: &[String], io: &mut Io) -> i32 {
     let mut budget = ApiBudget::new(&env);
     let chosen = val("--chosen");
     let kind = val("--kind");
-    if chosen.is_some() || kind.is_some() {
+    if chosen.is_some() || kind.is_some() || idx("--option").is_some() {
         let flat = |v: Option<Option<String>>| -> Option<String> { v.flatten() };
         let (chosen, from, scope, mode, kind, register) = (flat(chosen), flat(val("--from")), flat(val("--scope")), flat(val("--mode")), flat(kind), flat(val("--register")));
         // `--reroll <n>`: the round the choice resolved on, 0 to 8; anything
         // else is ignored rather than sent.
         let reroll = flat(val("--reroll")).map(|s| crate::critique_storage::js_number(&s)).filter(|n| n.is_finite() && n.fract() == 0.0 && *n >= 0.0 && *n <= telemetry::MAX_REROLL as f64).map(|n| n as usize);
-        let args = PingArgs { chosen_id: chosen.as_deref(), key: from.as_deref(), scope: scope.as_deref(), mode: mode.as_deref(), kind: kind.as_deref(), register: register.as_deref(), reroll };
+        let option = flat(val("--option")).map(|s| crate::critique_storage::js_number(&s)).filter(|n| n.is_finite() && n.fract() == 0.0 && *n >= 0.0 && *n <= telemetry::MAX_OPTION as f64).map(|n| n as usize);
+        let args = PingArgs { chosen_id: chosen.as_deref(), key: from.as_deref(), scope: scope.as_deref(), mode: mode.as_deref(), kind: kind.as_deref(), register: register.as_deref(), reroll, option };
         io.out(match ping_chosen(&env, &cwd, &mut budget, &args) {
             PingOutcome::Sent => "choice recorded\n",
             PingOutcome::Skipped => "choice ping skipped\n",
@@ -1096,7 +1112,7 @@ mod tests {
         let engine = format!("impeccable/{}+engine test", env!("CARGO_PKG_VERSION"));
         let out = seed_api(&proj, &skill, &base, &["--scope", "direction", "--mode", "persuade", "--from", "k1"]);
         assert!(out.contains("source: api; approved pool: 0123456789ab"), "{out}");
-        assert!(out.contains("--kind <assigned|pick|challenger|canon> --from k1 --scope direction --mode persuade,\n"), "round 0 carries no --reroll: {out}");
+        assert!(out.contains("--from k1 --scope direction --mode persuade plus what the user did:\n"), "round 0 carries no --reroll: {out}");
         let roll = seen.lock().unwrap()[0].clone();
         assert_eq!((roll.0.as_str(), roll.2.as_str()), ("GET", engine.as_str()));
         let record: Value = serde_json::from_str(&std::fs::read_to_string(proj.join(".impeccable/questions/roll.json")).unwrap()).unwrap();
@@ -1109,7 +1125,7 @@ mod tests {
 
         // A re-roll's TELEMETRY line names its round.
         let out = seed_api(&proj, &skill, &base, &["--scope", "direction", "--mode", "persuade", "--from", "k1", "--reroll", "2"]);
-        assert!(out.contains("--from k1 --scope direction --mode persuade --reroll 2,\n"), "{out}");
+        assert!(out.contains("--from k1 --scope direction --mode persuade --reroll 2 plus what the user did:\n"), "{out}");
     }
 
     #[test]
@@ -1139,5 +1155,26 @@ mod tests {
         // An out-of-range --reroll is ignored rather than sent.
         seed_api(&proj, &skill, &base, &["--kind", "pick", "--from", "k8", "--scope", "direction", "--reroll", "12"]);
         assert_eq!(chosen_bodies(&seen).last().unwrap(), r#"{"key":"k8","scope":"direction","kind":"pick","reroll":0,"source":"agent"}"#);
+    }
+
+    #[test]
+    fn agent_pings_report_rejected_hands_and_cards_by_position() {
+        let (proj, skill) = fixture("api-ping-reroll", &[("mode-persuade", MODE_FILE)]);
+        let (base, seen) = roll_api();
+        seed_api(&proj, &skill, &base, &["--scope", "surface", "--mode", "operate", "--from", "s1"]);
+        // A surface round's dealt structure other than the lead goes by position.
+        let out = seed_api(&proj, &skill, &base, &["--option", "2", "--from", "s1", "--scope", "surface", "--mode", "operate"]);
+        assert_eq!(out, "choice recorded\n");
+        assert_eq!(chosen_bodies(&seen).last().unwrap(), r#"{"key":"s1","scope":"surface","mode":"operate","option":2,"reroll":0,"poolRevision":"0123456789ab","source":"agent"}"#);
+        // A rejected hand: kind reroll, the steer as register, never a card id.
+        seed_api(&proj, &skill, &base, &["--scope", "direction", "--from", "d1"]);
+        let out = seed_api(&proj, &skill, &base, &["--kind", "reroll", "--chosen", "teletext-service", "--register", "bolder", "--from", "d1", "--scope", "direction"]);
+        assert_eq!(out, "choice recorded\n");
+        assert_eq!(chosen_bodies(&seen).last().unwrap(), r#"{"key":"d1","scope":"direction","kind":"reroll","register":"bolder","reroll":0,"poolRevision":"0123456789ab","source":"agent"}"#);
+        assert_eq!(seed_api(&proj, &skill, &base, &["--kind", "assigned", "--from", "d1", "--scope", "direction"]), "choice already recorded\n");
+        // The surface TELEMETRY line names the position flag and the re-roll report.
+        let out = seed_api(&proj, &skill, &base, &["--scope", "surface", "--mode", "operate", "--from", "s2"]);
+        assert!(out.contains("--option <n>"), "{out}");
+        assert!(out.contains("--kind reroll"), "{out}");
     }
 }

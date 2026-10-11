@@ -107,10 +107,15 @@ fn load_state(io: &Io) -> Option<Value> {
     serde_json::from_str(&raw).ok()
 }
 
+/// The build state records the direction's seed key, the key the roll API
+/// saw, and timestamps, so it is runtime state: its directory keeps a
+/// `.gitignore` naming `state.json` (and only that, the rest of
+/// `.impeccable/build/` being left to the project).
 fn save_state(io: &Io, state: &Value) {
     let p = abs(io, &state_path());
     if let Some(parent) = p.parent() {
         let _ = std::fs::create_dir_all(parent);
+        impeccable_common::git::ensure_dir_ignored(&parent.to_string_lossy(), &["state.json"]);
     }
     let _ = std::fs::write(p, util::json_pretty(state));
 }
@@ -2953,6 +2958,21 @@ fn next_instruction(io: &Io, state: &Value) -> String {
 #[cfg(test)]
 mod transparency_guidance_tests {
     use super::*;
+
+    #[test]
+    fn saving_the_state_keeps_it_out_of_git() {
+        let dir = std::env::temp_dir().join(format!("build-state-ignored-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (io, _) = Io::captured("", dir.clone(), Default::default());
+        save_state(&io, &new_state(None, None, None, Some("seed-1")));
+        let ignore = dir.join(".impeccable/build/.gitignore");
+        let expected = format!("{}\nstate.json\n", impeccable_common::git::RUNTIME_IGNORE_HEADER);
+        assert_eq!(std::fs::read_to_string(&ignore).unwrap(), expected);
+        save_state(&io, &new_state(None, None, None, Some("seed-1")));
+        assert_eq!(std::fs::read_to_string(&ignore).unwrap(), expected);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn candidate_check_never_replaces_selection_or_persists_gate_receipts() {

@@ -5,23 +5,35 @@
 //! - the request plumbing: API base, timeout, opt-outs, and the
 //!   `X-Impeccable-Client` header every `/api/roll` and `/api/chosen` request
 //!   carries;
-//! - the seed ledger, `.impeccable/questions/seeds/<tag>.json`: one file per
-//!   seed key, one entry per API-dealt round (`poolRevision`, the dealt catalog
-//!   ids), plus the marker that a round's choice was already sent. Unlike
-//!   `roll.json`, which a decision page removes when it takes the roll, the
-//!   ledger outlives the page, so the ping the agent sends after the round
-//!   still finds its round;
+//! - the seed ledger, `.impeccable/questions/seeds/<sha256(key)>.json`: one
+//!   file per seed key, named by the key's hash and holding neither the key
+//!   nor a timestamp, one entry per API-dealt round (`poolRevision`, the dealt
+//!   catalog ids), plus the marker that a round's choice was already sent.
+//!   Unlike `roll.json`, which a decision page removes when it takes the
+//!   roll, the ledger outlives the page, so the ping the agent sends after
+//!   the round still finds its round by hashing its `--from` value. It sits
+//!   in the self-ignoring questions directory, so it never reaches a commit;
 //! - the choice ping body and its send.
 
 use crate::jsp;
-use crate::util::{json_compact, now_ms, safe_read, Env};
+use crate::util::{json_compact, safe_read, Env};
 use serde_json::{json, Map, Value};
 use std::time::Duration;
 
-pub const KINDS: [&str; 4] = ["assigned", "pick", "challenger", "canon"];
+/// The kinds a choice ping may send. `reroll` means the hand was rejected:
+/// the user asked for another hand instead of choosing.
+pub const KINDS: [&str; 5] = ["assigned", "pick", "challenger", "canon", "reroll"];
+
+/// The kinds a decision-page option card declares. `dealt` is a surface
+/// round's dealt structure other than the lead; it has no ping kind, so its
+/// ping carries `option` alone. Canon is the `canonCard`, never an option.
+pub const CARD_KINDS: [&str; 4] = ["assigned", "pick", "challenger", "dealt"];
 
 /// The highest re-roll round the choice ping reports.
 pub const MAX_REROLL: usize = 8;
+
+/// The highest zero-based card position the choice ping reports.
+pub const MAX_OPTION: usize = 15;
 
 pub fn api_base(env: &Env) -> String {
     let base = env.get("IMPECCABLE_API_URL").filter(|v| !v.is_empty()).cloned().unwrap_or_else(|| "https://impeccable.style/api".to_string());
@@ -93,16 +105,12 @@ fn seeds_dir(cwd: &str) -> String {
     jsp::join(&[cwd, ".impeccable", "questions", "seeds"])
 }
 
-/// The key as a file name: itself when it is a short run of `[a-z0-9_-]`
-/// (every key the engine generates), else a hash, so a key can never name a
-/// path, and two keys differing only in case never share a file.
+/// The key as a file name: its SHA-256, so the ledger never stores the key
+/// the roll API saw, a key can never name a path, and a lookup by `--from`
+/// hashes the flag value.
 fn seed_tag(key: &str) -> String {
-    if !key.is_empty() && key.len() <= 64 && key.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-') {
-        key.to_string()
-    } else {
-        use sha2::{Digest, Sha256};
-        Sha256::digest(key.as_bytes()).iter().take(8).map(|b| format!("{:02x}", b)).collect()
-    }
+    use sha2::{Digest, Sha256};
+    Sha256::digest(format!("impeccable-seed:{}", key).as_bytes()).iter().take(16).map(|b| format!("{:02x}", b)).collect()
 }
 
 fn seed_file(cwd: &str, key: &str) -> String {
@@ -113,9 +121,7 @@ fn seed_file(cwd: &str, key: &str) -> String {
 const SEED_TTL_MS: f64 = 30.0 * 24.0 * 60.0 * 60.0 * 1000.0;
 
 fn read_ledger(cwd: &str, key: &str) -> Option<Map<String, Value>> {
-    let m = safe_read(&seed_file(cwd, key)).and_then(|t| serde_json::from_str::<Value>(&t).ok()).and_then(|v| v.as_object().cloned())?;
-    // A hashed tag could in principle collide; the stored key settles it.
-    (m.get("key").and_then(Value::as_str) == Some(key)).then_some(m)
+    safe_read(&seed_file(cwd, key)).and_then(|t| serde_json::from_str::<Value>(&t).ok()).and_then(|v| v.as_object().cloned())
 }
 
 fn write_ledger(cwd: &str, key: &str, ledger: &Map<String, Value>) {
@@ -123,6 +129,7 @@ fn write_ledger(cwd: &str, key: &str, ledger: &Map<String, Value>) {
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
+    crate::serve_question::ignore_questions_dir(&jsp::join(&[cwd, ".impeccable", "questions"]));
     let target = seed_file(cwd, key);
     let temp = format!("{}.tmp-{}", target, std::process::id());
     if std::fs::write(&temp, json_compact(&Value::Object(ledger.clone()))).and_then(|_| std::fs::rename(&temp, &target)).is_err() {
@@ -148,7 +155,6 @@ fn round_from(v: &Value, reroll: usize) -> SeedRound {
 /// it is a new presentation). Best effort, like the roll record.
 pub fn record_seed_round(cwd: &str, key: &str, round: &SeedRound) {
     let mut ledger = read_ledger(cwd, key).unwrap_or_default();
-    ledger.insert("key".into(), Value::String(key.to_string()));
     let mut rounds = ledger.get("rounds").and_then(Value::as_object).cloned().unwrap_or_default();
     let mut r = Map::new();
     r.insert("scope".into(), Value::String(round.scope.clone()));
@@ -162,7 +168,6 @@ pub fn record_seed_round(cwd: &str, key: &str, round: &SeedRound) {
         r.insert("poolRevision".into(), Value::String(p.clone()));
     }
     r.insert("dealt".into(), json!(round.dealt));
-    r.insert("at".into(), Value::from(now_ms() as u64));
     rounds.insert(round.reroll.to_string(), Value::Object(r));
     ledger.insert("rounds".into(), Value::Object(rounds));
     write_ledger(cwd, key, &ledger);
@@ -220,7 +225,10 @@ pub fn unmark_recorded(cwd: &str, key: &str, reroll: usize, by: &str) {
 // ---- the choice ping ---------------------------------------------------------
 
 /// One `/api/chosen` body. `source` is `agent` for the agent-run `--kind`
-/// command and `picker` when the decision page's server sends it.
+/// command and `picker` when the decision page's server sends it;
+/// `kind_source` (picker only) says whether the card declared its kind
+/// (`explicit`) or the engine read it from older payload conventions
+/// (`inferred`).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ChoicePing {
     pub chosen_id: Option<String>,
@@ -229,8 +237,11 @@ pub struct ChoicePing {
     pub mode: Option<String>,
     pub kind: Option<String>,
     pub register: Option<String>,
+    /// The chosen card's zero-based position in the payload's options.
+    pub option: Option<usize>,
     pub reroll: Option<usize>,
     pub pool_revision: Option<String>,
+    pub kind_source: Option<&'static str>,
     pub source: &'static str,
 }
 
@@ -249,11 +260,17 @@ impl ChoicePing {
         put("mode", &self.mode);
         put("kind", &self.kind);
         put("register", &self.register);
+        if let Some(o) = self.option.filter(|o| *o <= MAX_OPTION) {
+            body.insert("option".into(), Value::from(o));
+        }
         if let Some(r) = self.reroll.filter(|r| *r <= MAX_REROLL) {
             body.insert("reroll".into(), Value::from(r));
         }
         if let Some(p) = self.pool_revision.as_ref().filter(|p| valid_pool_revision(p)) {
             body.insert("poolRevision".into(), Value::String(p.clone()));
+        }
+        if let Some(k) = self.kind_source {
+            body.insert("kindSource".into(), Value::String(k.to_string()));
         }
         body.insert("source".into(), Value::String(self.source.to_string()));
         Value::Object(body)
@@ -312,67 +329,83 @@ fn matched_world(card: &Value, dealt: &[Value]) -> Option<String> {
     (found.len() == 1).then(|| found.remove(0))
 }
 
-/// The choice ping for an answer on a decision page, when the engine can
-/// tell the card's kind without guessing. `seed` is the hand's `seed` record
-/// (an API-dealt direction roll the page took); `payload` is the round the
-/// page served; `option_id` the answer's.
+/// The choice ping for an answer on a decision page. `seed` is the hand's
+/// `seed` record (an API-dealt roll the page took, either scope); `payload`
+/// the round the page served; `option_id` the answer's; `steer` the
+/// register a re-roll answer carries.
 ///
-/// - `canon`: the reserved option id.
-/// - `challenger`: the card carries a `verdict`, which only challengers do,
-///   and its card images match exactly one world the roll dealt; that
-///   world's catalog id is the `chosenId`. A verdict card with no match is
-///   left to the agent.
-/// - `pick`: kicker `IMPECCABLE'S PICK`, the kicker convention new-work.md
-///   gives the pick card.
-/// - `assigned`: kicker `THE ROLL`, or the lead card (new-work.md puts the
-///   assigned direction first) with no verdict and no pick kicker.
+/// - A re-roll answer is the hand rejected: kind `reroll`, `register` the
+///   steer when there is one, `reroll` the round rejected.
+/// - `canon` (the reserved option id, direction rounds only): kind `canon`.
+/// - An option card sends its declared `kind` (`kindSource: explicit`):
+///   `assigned`, `pick`, `challenger` with its `catalogId` as `chosenId`
+///   only when that id was dealt this round, and `dealt` with no kind.
+/// - A card with no valid `kind` (a payload from older skill text) falls
+///   back to the old conventions (`kindSource: inferred`): a `verdict` card
+///   is a challenger, its `chosenId` the one dealt world its card images
+///   match; kicker `IMPECCABLE'S PICK` is the pick on a plain direction
+///   round; kicker `THE ROLL`, or the lead card, is the assigned card on a
+///   plain direction round and the dealt lead on a surface round. Anything
+///   else sends no kind.
 ///
-/// `pick` and `assigned` are only read on a plain round: a register round
-/// (safer or bolder) has no assigned card, so its lead means nothing. Every
-/// other answer (re-roll, surface rounds, a card none of these fit) gets
-/// `None`, and the agent's own ping stays the channel.
-pub fn picker_choice(seed: &Value, payload: &Value, option_id: &str) -> Option<ChoicePing> {
-    if seed.get("source").and_then(Value::as_str) != Some("api") || seed.get("scope").and_then(Value::as_str) != Some("direction") {
+/// Every option-card ping carries `option`, the card's zero-based position,
+/// so a choice with no kind is still recorded.
+pub fn picker_choice(seed: &Value, payload: &Value, option_id: &str, steer: Option<&str>) -> Option<ChoicePing> {
+    if seed.get("source").and_then(Value::as_str) != Some("api") {
         return None;
     }
+    let scope = seed.get("scope").and_then(Value::as_str).filter(|s| *s == "direction" || *s == "surface")?;
     let key = seed.get("key").and_then(Value::as_str).filter(|k| !k.is_empty())?;
     let reroll = seed.get("reroll").and_then(Value::as_u64).map(|r| r as usize).filter(|r| *r <= MAX_REROLL)?;
-    let register = seed.get("register").and_then(Value::as_str).filter(|r| *r == "safer" || *r == "bolder");
+    let valid_register = |r: &&str| *r == "safer" || *r == "bolder";
+    let register = seed.get("register").and_then(Value::as_str).filter(valid_register);
     let dealt: Vec<Value> = seed.get("dealt").and_then(Value::as_array).cloned().unwrap_or_default();
-    let options: Vec<Value> = payload.get("options").and_then(Value::as_array).cloned().unwrap_or_default();
-
-    let (kind, chosen_id) = if option_id == "canon" {
-        ("canon", None)
-    } else if option_id.is_empty() || option_id == "reroll" {
-        return None;
-    } else {
-        let (index, card) = options.iter().enumerate().find(|(_, o)| o.get("id").and_then(Value::as_str) == Some(option_id))?;
-        let verdict = card_text(card, "verdict");
-        let kicker = card_text(card, "kicker");
-        if verdict.is_some() {
-            ("challenger", Some(matched_world(card, &dealt)?))
-        } else if register.is_some() {
-            return None;
-        } else if kicker.is_some_and(is_pick_kicker) {
-            ("pick", None)
-        } else if kicker.is_some_and(|k| k.eq_ignore_ascii_case("THE ROLL")) || index == 0 {
-            ("assigned", None)
-        } else {
-            return None;
-        }
-    };
+    let dealt_id = |id: &str| dealt.iter().any(|w| w.get("id").and_then(Value::as_str) == Some(id));
     let s = |k: &str| seed.get(k).and_then(Value::as_str).map(str::to_string);
-    Some(ChoicePing {
-        chosen_id,
+    let base = ChoicePing {
         key: Some(key.to_string()),
-        scope: Some("direction".into()),
+        scope: Some(scope.to_string()),
         mode: s("mode"),
-        kind: Some(kind.into()),
         register: register.map(str::to_string),
         reroll: Some(reroll),
         pool_revision: s("poolRevision").filter(|p| valid_pool_revision(p)),
+        kind_source: Some("explicit"),
         source: "picker",
-    })
+        ..Default::default()
+    };
+    match option_id {
+        "" => return None,
+        "reroll" => return Some(ChoicePing { kind: Some("reroll".into()), register: steer.filter(valid_register).map(str::to_string), ..base }),
+        "canon" if scope == "direction" => return Some(ChoicePing { kind: Some("canon".into()), ..base }),
+        "canon" => return None,
+        _ => {}
+    }
+    let options: Vec<Value> = payload.get("options").and_then(Value::as_array).cloned().unwrap_or_default();
+    let (index, card) = options.iter().enumerate().find(|(_, o)| o.get("id").and_then(Value::as_str) == Some(option_id))?;
+    let option = Some(index).filter(|i| *i <= MAX_OPTION);
+    let declared = card_text(card, "kind").filter(|k| CARD_KINDS.contains(k));
+    if let Some(k) = declared {
+        let (kind, chosen_id) = match k {
+            "challenger" => (Some("challenger"), card_text(card, "catalogId").filter(|id| dealt_id(id)).map(str::to_string)),
+            "dealt" => (None, None),
+            other => (Some(other), None),
+        };
+        return Some(ChoicePing { kind: kind.map(str::to_string), chosen_id, option, ..base });
+    }
+    let kicker = card_text(card, "kicker");
+    let lead = kicker.is_some_and(|k| k.eq_ignore_ascii_case("THE ROLL")) || index == 0;
+    let (kind, chosen_id) = if card_text(card, "verdict").is_some() {
+        (Some("challenger"), matched_world(card, &dealt))
+    } else if scope == "surface" {
+        (lead.then_some("assigned"), None)
+    } else if register.is_some() {
+        (None, None)
+    } else if kicker.is_some_and(is_pick_kicker) {
+        (Some("pick"), None)
+    } else {
+        (lead.then_some("assigned"), None)
+    };
+    Some(ChoicePing { kind: kind.map(str::to_string), chosen_id, option, kind_source: Some("inferred"), ..base })
 }
 
 #[cfg(test)]
@@ -448,7 +481,15 @@ mod tests {
         // A key that is not a plain slug never names a path.
         record_seed_round(&cwd, "../Evil Key", &round(0, &["x"]));
         assert_eq!(read_seed_round(&cwd, "../Evil Key", None).unwrap().dealt, vec!["x"]);
-        assert!(std::fs::read_dir(format!("{}/.impeccable/questions/seeds", cwd)).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().contains("..")));
+        // Files are named by the key's hash and hold neither the key nor a time.
+        for e in std::fs::read_dir(format!("{}/.impeccable/questions/seeds", cwd)).unwrap().flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            assert!(name.len() == 37 && name.ends_with(".json") && !name.contains("k1") && !name.contains("Evil"), "{name}");
+            let text = std::fs::read_to_string(e.path()).unwrap();
+            assert!(!text.contains("Evil") && !text.contains("\"key\"") && !text.contains("\"at\""), "{text}");
+        }
+        // The questions directory ignores itself, ledger included.
+        assert_eq!(std::fs::read_to_string(format!("{}/.impeccable/questions/.gitignore", cwd)).unwrap(), format!("{}\n*\n", impeccable_common::git::RUNTIME_IGNORE_HEADER));
         // A malformed poolRevision is never recorded.
         let mut r = round(2, &[]);
         r.pool_revision = Some("NOT-HEX".into());
@@ -465,12 +506,14 @@ mod tests {
             mode: None,
             kind: Some("challenger".into()),
             register: Some("bolder".into()),
+            option: Some(3),
             reroll: Some(2),
             pool_revision: Some("0123456789ab".into()),
-            source: "agent",
+            kind_source: Some("explicit"),
+            source: "picker",
         };
-        assert_eq!(json_compact(&p.body()), r#"{"chosenId":"w1","key":"k","scope":"direction","kind":"challenger","register":"bolder","reroll":2,"poolRevision":"0123456789ab","source":"agent"}"#);
-        let p = ChoicePing { reroll: Some(9), pool_revision: Some("xyz".into()), source: "picker", ..Default::default() };
+        assert_eq!(json_compact(&p.body()), r#"{"chosenId":"w1","key":"k","scope":"direction","kind":"challenger","register":"bolder","option":3,"reroll":2,"poolRevision":"0123456789ab","kindSource":"explicit","source":"picker"}"#);
+        let p = ChoicePing { reroll: Some(9), option: Some(16), pool_revision: Some("xyz".into()), source: "picker", ..Default::default() };
         assert_eq!(json_compact(&p.body()), r#"{"source":"picker"}"#);
     }
 
@@ -488,7 +531,8 @@ mod tests {
         s
     }
 
-    fn page() -> Value {
+    /// A page from older skill text: no card declares a kind.
+    fn legacy_page() -> Value {
         json!({ "options": [
             { "id": "assigned", "label": "Fillmore", "hero": "https://cards.test/teletext-service-hero.webp" },
             { "id": "model-pick", "label": "Broadside", "kicker": "IMPECCABLE’S PICK" },
@@ -499,58 +543,99 @@ mod tests {
         ], "canon": true })
     }
 
-    fn kind_and_id(p: Option<ChoicePing>) -> Option<(String, Option<String>)> {
-        p.map(|p| (p.kind.unwrap(), p.chosen_id))
+    fn explicit_page() -> Value {
+        json!({ "options": [
+            { "id": "a", "kind": "assigned" },
+            { "id": "p", "kind": "pick", "kicker": "IMPECCABLE’S PICK" },
+            { "id": "c1", "kind": "challenger", "catalogId": "teletext-service", "verdict": "competitive" },
+            { "id": "c2", "kind": "challenger", "catalogId": "challenger-teletext", "verdict": "wins" },
+            { "id": "d", "kind": "dealt" }
+        ], "canon": true })
+    }
+
+    /// (kind, chosenId, option, kindSource) of a ping.
+    type Read = Option<(Option<String>, Option<String>, Option<usize>, Option<&'static str>)>;
+    fn read(p: Option<ChoicePing>) -> Read {
+        p.map(|p| (p.kind, p.chosen_id, p.option, p.kind_source))
+    }
+    fn r(kind: Option<&str>, id: Option<&str>, option: Option<usize>, src: &'static str) -> Read {
+        Some((kind.map(str::to_string), id.map(str::to_string), option, Some(src)))
     }
 
     #[test]
-    fn picker_reads_kinds_only_where_the_page_says_them() {
-        let s = seed(None);
-        let pg = page();
-        let k = |id: &str| kind_and_id(picker_choice(&s, &pg, id));
-        // The assigned card may wear a catalog image; it is still the assigned card, with no id.
-        assert_eq!(k("assigned"), Some(("assigned".into(), None)));
-        assert_eq!(k("model-pick"), Some(("pick".into(), None)));
-        assert_eq!(k("challenger-teletext"), Some(("challenger".into(), Some("teletext-service".into()))));
-        assert_eq!(k("challenger-microfiche"), Some(("challenger".into(), Some("microfiche-reader".into()))), "the workspace copy of a card image matches its world");
-        assert_eq!(k("canon"), Some(("canon".into(), None)));
-        // Never guessed: a challenger with no dealt world, an unlabeled card past the lead, a re-roll, an unknown id.
-        assert_eq!(k("challenger-own"), None);
-        assert_eq!(k("grounded-2"), None);
-        assert_eq!(k("reroll"), None);
-        assert_eq!(k("nope"), None);
-        let p = picker_choice(&s, &pg, "challenger-teletext").unwrap();
-        assert_eq!(json_compact(&p.body()), r#"{"chosenId":"teletext-service","key":"k1","scope":"direction","mode":"persuade","kind":"challenger","reroll":1,"poolRevision":"0123456789ab","source":"picker"}"#);
-    }
-
-    #[test]
-    fn picker_reads_only_canon_and_matched_challengers_on_register_rounds() {
-        let pg = page();
-        for r in ["safer", "bolder"] {
-            let s = seed(Some(r));
-            assert_eq!(kind_and_id(picker_choice(&s, &pg, "assigned")), None, "{r}");
-            assert_eq!(kind_and_id(picker_choice(&s, &pg, "model-pick")), None, "{r}");
-            assert_eq!(kind_and_id(picker_choice(&s, &pg, "canon")), Some(("canon".into(), None)), "{r}");
-            let p = picker_choice(&s, &pg, "challenger-teletext").unwrap();
-            assert_eq!(p.register.as_deref(), Some(r));
+    fn picker_sends_the_kind_each_card_declares() {
+        let pg = explicit_page();
+        for register in [None, Some("safer"), Some("bolder")] {
+            let s = seed(register);
+            let k = |id: &str| read(picker_choice(&s, &pg, id, None));
+            assert_eq!(k("a"), r(Some("assigned"), None, Some(0), "explicit"), "{register:?}");
+            assert_eq!(k("p"), r(Some("pick"), None, Some(1), "explicit"), "{register:?}");
+            assert_eq!(k("c1"), r(Some("challenger"), Some("teletext-service"), Some(2), "explicit"));
+            // An id that was not dealt never leaves the machine; the kind still goes.
+            assert_eq!(k("c2"), r(Some("challenger"), None, Some(3), "explicit"));
+            assert_eq!(k("canon"), r(Some("canon"), None, None, "explicit"));
+            assert_eq!(k("nope"), None);
+            assert_eq!(picker_choice(&s, &pg, "a", None).unwrap().register.as_deref(), register);
         }
+        let p = picker_choice(&seed(None), &pg, "c1", None).unwrap();
+        assert_eq!(json_compact(&p.body()), r#"{"chosenId":"teletext-service","key":"k1","scope":"direction","mode":"persuade","kind":"challenger","option":2,"reroll":1,"poolRevision":"0123456789ab","kindSource":"explicit","source":"picker"}"#);
     }
 
     #[test]
-    fn picker_stays_out_of_surface_and_non_api_rounds() {
-        let pg = page();
+    fn a_reroll_answer_is_the_hand_rejected() {
+        let s = seed(Some("safer"));
+        let p = picker_choice(&s, &explicit_page(), "reroll", Some("bolder")).unwrap();
+        assert_eq!(json_compact(&p.body()), r#"{"key":"k1","scope":"direction","mode":"persuade","kind":"reroll","register":"bolder","reroll":1,"poolRevision":"0123456789ab","kindSource":"explicit","source":"picker"}"#);
+        let p = picker_choice(&s, &explicit_page(), "reroll", None).unwrap();
+        assert_eq!(p.register, None, "a plain re-roll carries no register");
+    }
+
+    #[test]
+    fn surface_rounds_send_the_lead_as_assigned_and_other_dealt_cards_by_position() {
         let mut s = seed(None);
         s["scope"] = json!("surface");
-        assert_eq!(picker_choice(&s, &pg, "assigned"), None);
-        let mut s = seed(None);
-        s["source"] = json!("local");
-        assert_eq!(picker_choice(&s, &pg, "assigned"), None);
-        let mut s = seed(None);
-        s["reroll"] = json!(9);
-        assert_eq!(picker_choice(&s, &pg, "assigned"), None);
-        // A world two dealt entries share an image with is ambiguous, so no id and no ping.
+        let pg = json!({ "options": [{ "id": "s1", "kind": "assigned" }, { "id": "s2", "kind": "dealt" }, { "id": "s3", "kind": "challenger", "catalogId": "microfiche-reader" }] });
+        assert_eq!(read(picker_choice(&s, &pg, "s1", None)), r(Some("assigned"), None, Some(0), "explicit"));
+        assert_eq!(read(picker_choice(&s, &pg, "s2", None)), r(None, None, Some(1), "explicit"));
+        assert_eq!(read(picker_choice(&s, &pg, "s3", None)), r(Some("challenger"), Some("microfiche-reader"), Some(2), "explicit"));
+        assert_eq!(picker_choice(&s, &pg, "canon", None), None, "surface rounds have no canon");
+        assert_eq!(json_compact(&picker_choice(&s, &pg, "s2", None).unwrap().body()), r#"{"key":"k1","scope":"surface","mode":"persuade","option":1,"reroll":1,"poolRevision":"0123456789ab","kindSource":"explicit","source":"picker"}"#);
+        // Older surface payloads: the lead is inferred, the rest go by position.
+        let legacy = json!({ "options": [{ "id": "s1", "kicker": "THE ROLL" }, { "id": "s2" }] });
+        assert_eq!(read(picker_choice(&s, &legacy, "s1", None)), r(Some("assigned"), None, Some(0), "inferred"));
+        assert_eq!(read(picker_choice(&s, &legacy, "s2", None)), r(None, None, Some(1), "inferred"));
+    }
+
+    #[test]
+    fn older_payloads_fall_back_to_the_conventions_marked_inferred() {
+        let s = seed(None);
+        let pg = legacy_page();
+        let k = |id: &str| read(picker_choice(&s, &pg, id, None));
+        // The assigned card may wear a catalog image; it is still the assigned card, with no id.
+        assert_eq!(k("assigned"), r(Some("assigned"), None, Some(0), "inferred"));
+        assert_eq!(k("model-pick"), r(Some("pick"), None, Some(1), "inferred"));
+        assert_eq!(k("challenger-teletext"), r(Some("challenger"), Some("teletext-service"), Some(2), "inferred"));
+        assert_eq!(k("challenger-microfiche"), r(Some("challenger"), Some("microfiche-reader"), Some(3), "inferred"), "the workspace copy of a card image matches its world");
+        assert_eq!(k("challenger-own"), r(Some("challenger"), None, Some(4), "inferred"));
+        assert_eq!(k("grounded-2"), r(None, None, Some(5), "inferred"));
+        // On register rounds only verdict cards keep a kind.
+        let s = seed(Some("bolder"));
+        assert_eq!(read(picker_choice(&s, &pg, "assigned", None)), r(None, None, Some(0), "inferred"));
+        assert_eq!(read(picker_choice(&s, &pg, "challenger-teletext", None)), r(Some("challenger"), Some("teletext-service"), Some(2), "inferred"));
+        // A world two dealt entries share an image with is ambiguous: no id.
         let mut s = seed(None);
         s["dealt"][1]["hero"] = json!("https://cards.test/teletext-service-hero.webp");
-        assert_eq!(picker_choice(&s, &pg, "challenger-teletext"), None);
+        assert_eq!(read(picker_choice(&s, &pg, "challenger-teletext", None)), r(Some("challenger"), None, Some(2), "inferred"));
+    }
+
+    #[test]
+    fn picker_stays_out_of_non_api_rounds() {
+        let pg = explicit_page();
+        let mut s = seed(None);
+        s["source"] = json!("local");
+        assert_eq!(picker_choice(&s, &pg, "a", None), None);
+        let mut s = seed(None);
+        s["reroll"] = json!(9);
+        assert_eq!(picker_choice(&s, &pg, "a", None), None);
     }
 }
