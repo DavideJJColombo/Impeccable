@@ -391,7 +391,7 @@ The block is wrapped in `# impeccable-ignore-start` / `# impeccable-ignore-end` 
 - `.impeccable/surfaces/*.md` (route- or artifact-specific strategy and direction contracts)
 - `.impeccable/critique/*.md` (review reports)
 
-Impeccable also keeps its own `.gitignore` in the folders that hold decision-round state: `.impeccable/questions/` and `.impeccable/mocks/worlds/` ignore everything in them, and `.impeccable/build/` ignores `state.json`. Those files record the roll key and dealt hand, so they stay out of commits even in a project without the block above.
+Impeccable also keeps its own `.gitignore` in the folders that hold decision-round state: `.impeccable/questions/` and `.impeccable/mocks/worlds/` ignore everything in them, and `.impeccable/build/` ignores `state.json`. That keeps new runtime files out of commits even in a project without the block above. A `.gitignore` cannot untrack a file git already tracks, though: when one of these files was committed earlier, the next roll prints a one-time notice with the fix, `git rm -r --cached .impeccable/questions` (plus any other folder it names), and writes its roll record to an untracked file until then.
 
 If an ephemeral file (a screenshot, `config.local.json`) was committed before you added the block, `.gitignore` will not untrack it automatically. Run `git rm --cached <path>` to stop tracking it without deleting your local copy.
 
@@ -403,9 +403,9 @@ What is sent, on the roll request and on the choice that follows it:
 
 - the roll key (a random value per decision round), scope (direction or surface), visitor mode, and re-roll round
 - the catalog revision the hand came from, and on the choice the kind of card that won (assigned, pick, challenger, canon, or a re-roll), its catalog id when a catalog world won, and its position on the page
-- the client version and whether the choice came from the decision page or the agent
+- the client version, whether the choice came from the decision page or the agent, and a random id for that choice so a report sent twice is counted once
 
-Never sent: your project's name, files, code, PRODUCT.md, or the names of the directions your agent wrote. Committed files record only a one-way seed reference, never the roll key.
+Never sent: your project's name, files, code, PRODUCT.md, or the names of the directions your agent wrote. Committed files such as surface briefs record only a seed reference, a hash of the roll key under a random salt kept in `~/.impeccable/seed-salt`, never the key itself. Roll keys are 128 random bits. If you pass your own short key with `--from`, its reference is easy to guess, so do not rely on it to keep that key private.
 
 To turn it off, run `npx impeccable telemetry off` (stored in `~/.impeccable/config.json`), or set `DO_NOT_TRACK=1` or `IMPECCABLE_NO_TELEMETRY=1`. A project can opt everyone out with `"telemetry": false` in `.impeccable/config.json`. `npx impeccable telemetry status` shows the current state. Opted out, the roll still works and the API is told not to record it. Details: https://impeccable.style/privacy
 

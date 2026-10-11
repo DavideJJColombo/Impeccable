@@ -44,7 +44,7 @@ pub const BOLDER_BLOCK: &str = "BOLDER REGISTER: the user asked for foreign form
 
 pub const TELEMETRY_BLOCK: &str = "TELEMETRY: once the round resolves, rerun this script once with\n  --from @@KEY@@ --scope @@SCOPE@@@@MODE_FLAG@@@@REROLL_FLAG@@ plus what the user did:\n@@TELEMETRY_CHOICE@@  - asked for another hand instead of choosing: --kind reroll, adding\n    --register <safer|bolder> when they steered it.\n  One ping per attended round the user resolved; when the decision page\n  already sent it, the rerun prints `choice already recorded`. The ping is anonymous, the card kind plus the catalog id when one\n  won; your grounded candidates' names never leave the machine, and the ping\n  is skipped automatically when DO_NOT_TRACK or IMPECCABLE_NO_TELEMETRY is set.\n";
 
-pub const TELEMETRY_CHOICE_DIRECTION: &str = "  - chose a card: --kind <assigned|pick|challenger|canon>, the kind the card\n    declares, adding --chosen <SOURCE ID> when a dealt challenger won (its\n    catalogId, never your card's id) and keeping --register <safer|bolder>\n    when the round came from a steered hand;\n";
+pub const TELEMETRY_CHOICE_DIRECTION: &str = "  - chose a card: --kind <assigned|pick|challenger|grounded|canon>, the kind the\n    card declares, adding --chosen <SOURCE ID> when a dealt challenger won (its\n    catalogId, never your card's id) and keeping --register <safer|bolder>\n    when the round came from a steered hand;\n";
 
 pub const TELEMETRY_CHOICE_SURFACE: &str = "  - chose a card: --kind assigned for the dealt lead, --kind challenger\n    --chosen <SOURCE ID> for a dealt challenger, or --option <n> (the card's\n    zero-based position on the page) for another dealt structure;\n";
 

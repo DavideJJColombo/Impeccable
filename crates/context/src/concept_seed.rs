@@ -231,9 +231,29 @@ fn ping_chosen(env: &Env, cwd: &str, budget: &mut ApiBudget, a: &PingArgs) -> Pi
     if kind == Some("challenger") && chosen_id.is_none() {
         return PingOutcome::Skipped;
     }
-    let round = a.key.filter(|k| !k.is_empty()).and_then(|k| telemetry::read_seed_round(cwd, k, a.reroll));
+    let ledger = telemetry::Ledger::new(env, cwd);
+    let key = a.key.filter(|k| !k.is_empty());
+    let mut round = key.and_then(|k| ledger.round(k, a.reroll));
+    // The page may be sending this round right now. Wait for it, bounded by
+    // the page's own budget: a confirmed send makes this rerun a no-op; a
+    // failed one, or one still pending past the deadline, is sent from here
+    // under the same pingId, so the server can drop a double rather than
+    // the report be lost.
+    let pending = round.as_ref().filter(|r| r.recorded.as_deref() == Some("pending")).map(|r| (r.reroll, r.pending_at.unwrap_or(0.0)));
+    if let (Some(k), Some((n, since))) = (key, pending) {
+        {
+            let deadline = since + telemetry::api_timeout(env).as_millis() as f64 + 1_000.0;
+            while crate::util::now_ms() < deadline {
+                std::thread::sleep(Duration::from_millis(100));
+                round = ledger.round(k, Some(n));
+                if round.as_ref().is_none_or(|x| x.recorded.as_deref() != Some("pending")) {
+                    break;
+                }
+            }
+        }
+    }
     if let Some(r) = &round {
-        if r.recorded.is_some() {
+        if r.confirmed() {
             return PingOutcome::AlreadyRecorded;
         }
         if chosen_id.is_some_and(|c| !r.dealt.iter().any(|d| d == c)) {
@@ -256,14 +276,15 @@ fn ping_chosen(env: &Env, cwd: &str, budget: &mut ApiBudget, a: &PingArgs) -> Pi
         reroll: Some(round.as_ref().map(|r| r.reroll).or(a.reroll).unwrap_or(0)),
         pool_revision: round.as_ref().and_then(|r| r.pool_revision.clone()),
         hand_id: round.as_ref().and_then(|r| r.hand_id.clone()),
+        ping_id: round.as_ref().and_then(|r| r.ping_id.clone()),
         kind_source: None,
         source: "agent",
     };
     if !telemetry::send_choice(env, cwd, &ping, budget.remaining()) {
         return PingOutcome::Skipped;
     }
-    if let (Some(k), Some(r)) = (a.key, &round) {
-        telemetry::mark_recorded(cwd, k, r.reroll, "agent");
+    if let (Some(k), Some(r)) = (key, &round) {
+        ledger.confirm(k, r.reroll, "agent");
     }
     PingOutcome::Sent
 }
@@ -400,7 +421,7 @@ fn render_concept_seed(env: &Env, cwd: &str, budget: &mut ApiBudget, a: &SeedArg
     // PRESENTATION closes every roll, where a middle-truncated read still
     // reaches it, like the restated lines above it.
     let register = a.register.clone().flatten();
-    let reference = fill(t::SEED_REFERENCE, &[("REFERENCE", &telemetry::seed_reference(&a.key))]);
+    let reference = fill(t::SEED_REFERENCE, &[("REFERENCE", &telemetry::Ledger::new(env, cwd).reference(&a.key))]);
     Ok((roll + &reference + &presentation_block(env, cwd, scope, reroll, degraded, register.as_deref(), a.mode.clone().flatten().as_deref(), a.build_path.as_ref()), meta))
 }
 
@@ -653,14 +674,6 @@ fn render_roll(env: &Env, cwd: &str, budget: &mut ApiBudget, a: &SeedArgs) -> Re
     Ok((scope, reroll, fill(t::MAIN, &pairs), false, RollMeta { worlds, api, pool_revision, hand_id }))
 }
 
-fn random_hex8() -> String {
-    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
-    let mut x = (t as u64) ^ ((std::process::id() as u64) << 32) ^ 0x9E3779B97F4A7C15;
-    x ^= x >> 33;
-    x = x.wrapping_mul(0xff51afd7ed558ccd);
-    x ^= x >> 33;
-    format!("{:08x}", (x & 0xffffffff) as u32)
-}
 
 pub fn run(args: &[String], io: &mut Io) -> i32 {
     let cwd = io.cwd.to_string_lossy().into_owned();
@@ -680,7 +693,7 @@ pub fn run(args: &[String], io: &mut Io) -> i32 {
         let option = flat(val("--option")).map(|s| crate::critique_storage::js_number(&s)).filter(|n| n.is_finite() && n.fract() == 0.0 && *n >= 0.0 && *n <= telemetry::MAX_OPTION as f64).map(|n| n as usize);
         // A seed reference resolves to its key; one this machine never
         // recorded sends nothing, since the ping needs the key the roll used.
-        let from = match from.as_deref().map(|f| telemetry::resolve_seed(&cwd, f)) {
+        let from = match from.as_deref().map(|f| telemetry::Ledger::new(&env, &cwd).resolve(f)) {
             Some(Err(_)) => {
                 io.out("choice ping skipped\n");
                 return 0;
@@ -705,11 +718,12 @@ pub fn run(args: &[String], io: &mut Io) -> i32 {
     let given = match val("--from") {
         Some(Some(k)) => k,
         Some(None) => "undefined".to_string(),
-        None => env.get("IMPECCABLE_CONCEPT_SEED").filter(|v| !v.is_empty()).cloned().unwrap_or_else(random_hex8),
+        None => env.get("IMPECCABLE_CONCEPT_SEED").filter(|v| !v.is_empty()).cloned().unwrap_or_else(impeccable_common::seed::new_key),
     };
     // A seed reference (what the surface brief records) stands for the key
     // this machine rolled it from; the deal depends on the key itself.
-    let key = match telemetry::resolve_seed(&cwd, &given) {
+    let ledger = telemetry::Ledger::new(&env, &cwd);
+    let key = match ledger.resolve(&given) {
         Ok(k) => k,
         Err(r) => {
             io.err(&format!("concept-seed: {} is a seed reference this machine has no record of. A reference resolves only where its roll was made (in .impeccable/questions/seeds/, which is never committed). To reproduce that deal here, pass the original key with --from; otherwise roll anew without --from.\n", r));
@@ -743,14 +757,17 @@ pub fn run(args: &[String], io: &mut Io) -> i32 {
             // feature needs (worlds for serve-question, the key behind the
             // reference), none of the ping's fields.
             let tracked = meta.api && !telemetry::telemetry_disabled(&env, &cwd);
-            telemetry::record_seed_key(&cwd, &seed.key);
+            ledger.record_key(&seed.key);
             let api = tracked.then(|| crate::serve_question::ApiRoll { mode: mode.as_deref(), register: register.as_deref(), pool_revision: meta.pool_revision.as_deref(), hand_id: meta.hand_id.as_deref() });
-            crate::serve_question::record_roll(&cwd, scope, &seed.key, seed.reroll as usize, &meta.worlds, api.as_ref());
+            crate::serve_question::record_roll(&cwd, scope, &ledger.reference(&seed.key), seed.reroll as usize, &meta.worlds, api.as_ref());
             // An API-dealt round also enters the seed ledger, which outlives
             // the roll record, for the choice ping that follows the round.
             if tracked {
                 let dealt = meta.worlds.iter().filter_map(|w| w.get("id").and_then(Value::as_str)).map(str::to_string).collect();
-                telemetry::record_seed_round(&cwd, &seed.key, &telemetry::SeedRound { scope: scope.to_string(), reroll: seed.reroll as usize, mode, register, pool_revision: meta.pool_revision.clone(), hand_id: meta.hand_id.clone(), dealt, recorded: None });
+                ledger.record_round(&seed.key, &telemetry::SeedRound { scope: scope.to_string(), reroll: seed.reroll as usize, mode, register, pool_revision: meta.pool_revision.clone(), hand_id: meta.hand_id.clone(), dealt, ..Default::default() });
+            }
+            if let Some(notice) = crate::serve_question::tracked_runtime_notice(&cwd) {
+                io.out(&notice);
             }
             io.out(&text);
             0
@@ -767,6 +784,11 @@ mod tests {
     use super::*;
 
     const MODE_FILE: &str = "# Operate mode\n\nIntro the engine ignores.\n\n## Directions\n\n- Keep standard navigation.\n\n  Indented continuation.\n\n## Comps\n- Show a working state.\n### Sub heading stays\n\n";
+
+    /// The ledger the test runs see: the same pinned salt.
+    fn tl(p: &std::path::Path) -> telemetry::Ledger {
+        telemetry::Ledger::new(&Env::from([("IMPECCABLE_SEED_SALT".into(), "test-salt".into())]), &p.to_string_lossy())
+    }
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("impeccable-seed-{}-{}", name, std::process::id()));
@@ -801,6 +823,7 @@ mod tests {
             ("IMPECCABLE_API_URL".into(), "http://127.0.0.1:9/api".into()),
             ("IMPECCABLE_API_TIMEOUT".into(), "300".into()),
             ("IMPECCABLE_NO_TELEMETRY".into(), "1".into()),
+            ("IMPECCABLE_SEED_SALT".into(), "test-salt".into()),
             ("IMPECCABLE_NO_STALENESS_CHECK".into(), "1".into()),
             ("IMPECCABLE_SELF".into(), "impeccable".into()),
         ]);
@@ -913,7 +936,7 @@ mod tests {
         let (code, out) = seed(&proj, &skill, true, &["--scope", "direction", "--mode", "persuade", "--from", "k1"]);
         assert_eq!(code, 0, "{out}");
         let block = presentation(&out);
-        let reference = telemetry::seed_reference("k1");
+        let reference = tl(&proj).reference("k1");
         assert!(out.contains(&format!("seed key k1.\nSEED REFERENCE: {reference}. Write this, never the key, wherever the seed is recorded (the surface brief's FORM line, build-phase start --direction); on this machine --from accepts it in place of the key.\nPRESENTATION (the decision round, condensed from new-work.md;")), "the reference, then the block, follow the restated line: {out}");
         let lines: Vec<&str> = block.trim_end().split('\n').collect();
         assert_eq!(lines.len(), 6, "{block}");
@@ -1071,7 +1094,10 @@ mod tests {
         let (code, _) = seed(&proj, &skill, true, &["--scope", "surface", "--mode", "operate", "--from", "k1"]);
         assert_eq!(code, 0);
         let r = read();
-        assert_eq!((r["scope"].as_str(), r["key"].as_str(), r["reroll"].as_u64()), (Some("surface"), Some("k1"), Some(0)));
+        // The record names the roll by its seed reference, never its key, and holds no time.
+        let k1 = tl(&proj).reference("k1");
+        assert_eq!((r["scope"].as_str(), r["seed"].as_str(), r["reroll"].as_u64()), (Some("surface"), Some(k1.as_str()), Some(0)));
+        assert!(r.get("key").is_none() && r.get("at").is_none(), "{r}");
         // The record names every challenger the roll printed, with the same
         // board and hero URLs as its QUALITY BAR line.
         let (_, out) = seed(&proj, &skill, true, &["--scope", "surface", "--mode", "operate", "--from", "k1"]);
@@ -1086,11 +1112,11 @@ mod tests {
         // The safer register prints no challenger, so it records no world.
         seed(&proj, &skill, true, &["--scope", "direction", "--from", "k1", "--reroll", "1", "--register", "safer"]);
         assert!(read().get("worlds").is_none(), "{}", read());
-        assert!(r["at"].as_f64().is_some_and(|at| (crate::util::now_ms() - at).abs() < 60_000.0), "{r}");
         let (code, _) = seed(&proj, &skill, false, &["--scope", "direction", "--from", "k2", "--reroll", "1"]);
         assert_eq!(code, 0);
         let r = read();
-        assert_eq!((r["scope"].as_str(), r["key"].as_str(), r["reroll"].as_u64()), (Some("direction"), Some("k2"), Some(1)));
+        let k2 = tl(&proj).reference("k2");
+        assert_eq!((r["scope"].as_str(), r["seed"].as_str(), r["reroll"].as_u64()), (Some("direction"), Some(k2.as_str()), Some(1)));
         // A degraded roll dealt no world: the record keeps its old shape.
         assert!(r.get("worlds").is_none(), "{r}");
     }
@@ -1134,6 +1160,7 @@ mod tests {
             ("IMPECCABLE_TELEMETRY_CHANNEL".into(), "test".into()),
             ("HOME".into(), proj.join("home").to_string_lossy().into_owned()),
             ("USERPROFILE".into(), proj.join("home").to_string_lossy().into_owned()),
+            ("IMPECCABLE_SEED_SALT".into(), "test-salt".into()),
             ("IMPECCABLE_NO_STALENESS_CHECK".into(), "1".into()),
             ("IMPECCABLE_SELF".into(), "impeccable".into()),
         ]);
@@ -1144,8 +1171,10 @@ mod tests {
         out
     }
 
+    /// The bodies posted to /api/chosen, each round's random pingId masked.
     fn chosen_bodies(seen: &Seen) -> Vec<String> {
-        seen.lock().unwrap().iter().filter(|r| r.0 == "POST").map(|r| r.3.clone()).collect()
+        let ping = regex::Regex::new(r#","pingId":"[0-9a-f]{32}""#).unwrap();
+        seen.lock().unwrap().iter().filter(|r| r.0 == "POST").map(|r| ping.replace(&r.3, r#","pingId":"<PING>""#).into_owned()).collect()
     }
 
     #[test]
@@ -1162,7 +1191,7 @@ mod tests {
         assert_eq!(record["poolRevision"], "0123456789ab");
         assert_eq!(record["source"], "api");
         assert_eq!(record["mode"], "persuade");
-        let round = telemetry::read_seed_round(&proj.to_string_lossy(), "k1", Some(0)).unwrap();
+        let round = tl(&proj).round("k1", Some(0)).unwrap();
         assert_eq!(round.dealt, vec!["teletext-service", "microfiche-reader"]);
         assert_eq!(round.pool_revision.as_deref(), Some("0123456789ab"));
 
@@ -1180,7 +1209,7 @@ mod tests {
         // No --reroll: the latest round. An agent-invented id is dropped and the kind still goes.
         let out = seed_api(&proj, &skill, &base, &["--kind", "challenger", "--chosen", "challenger-teletext", "--from", "k1", "--scope", "direction", "--mode", "persuade"]);
         assert_eq!(out, "choice recorded\n");
-        assert_eq!(chosen_bodies(&seen).last().unwrap(), r#"{"key":"k1","scope":"direction","mode":"persuade","kind":"challenger","reroll":1,"poolRevision":"0123456789ab","handId":"00112233445566778899aabbccddeeff","source":"agent"}"#);
+        assert_eq!(chosen_bodies(&seen).last().unwrap(), r#"{"key":"k1","scope":"direction","mode":"persuade","kind":"challenger","reroll":1,"poolRevision":"0123456789ab","handId":"00112233445566778899aabbccddeeff","pingId":"<PING>","source":"agent"}"#);
         let post = seen.lock().unwrap().iter().rfind(|r| r.0 == "POST").cloned().unwrap();
         assert_eq!((post.1.as_str(), post.2.as_str()), ("/api/chosen", format!("impeccable/{}+engine test", env!("CARGO_PKG_VERSION")).as_str()));
         // The same round again: already sent.
@@ -1189,7 +1218,7 @@ mod tests {
         // Round 0 by --reroll: a dealt catalog id passes.
         let out = seed_api(&proj, &skill, &base, &["--kind", "challenger", "--chosen", "microfiche-reader", "--from", "k1", "--scope", "direction", "--reroll", "0"]);
         assert_eq!(out, "choice recorded\n");
-        assert_eq!(chosen_bodies(&seen).last().unwrap(), r#"{"chosenId":"microfiche-reader","key":"k1","scope":"direction","kind":"challenger","reroll":0,"poolRevision":"0123456789ab","handId":"00112233445566778899aabbccddeeff","source":"agent"}"#);
+        assert_eq!(chosen_bodies(&seen).last().unwrap(), r#"{"chosenId":"microfiche-reader","key":"k1","scope":"direction","kind":"challenger","reroll":0,"poolRevision":"0123456789ab","handId":"00112233445566778899aabbccddeeff","pingId":"<PING>","source":"agent"}"#);
         // No ledger for the key: sent as given, with the --reroll round.
         let n = chosen_bodies(&seen).len();
         let out = seed_api(&proj, &skill, &base, &["--kind", "challenger", "--chosen", "own-grounded-3", "--from", "k9", "--scope", "direction", "--reroll", "3"]);
@@ -1208,12 +1237,12 @@ mod tests {
         // A surface round's dealt structure other than the lead goes by position.
         let out = seed_api(&proj, &skill, &base, &["--option", "2", "--from", "s1", "--scope", "surface", "--mode", "operate"]);
         assert_eq!(out, "choice recorded\n");
-        assert_eq!(chosen_bodies(&seen).last().unwrap(), r#"{"key":"s1","scope":"surface","mode":"operate","option":2,"reroll":0,"poolRevision":"0123456789ab","handId":"00112233445566778899aabbccddeeff","source":"agent"}"#);
+        assert_eq!(chosen_bodies(&seen).last().unwrap(), r#"{"key":"s1","scope":"surface","mode":"operate","option":2,"reroll":0,"poolRevision":"0123456789ab","handId":"00112233445566778899aabbccddeeff","pingId":"<PING>","source":"agent"}"#);
         // A rejected hand: kind reroll, the steer as register, never a card id.
         seed_api(&proj, &skill, &base, &["--scope", "direction", "--from", "d1"]);
         let out = seed_api(&proj, &skill, &base, &["--kind", "reroll", "--chosen", "teletext-service", "--register", "bolder", "--from", "d1", "--scope", "direction"]);
         assert_eq!(out, "choice recorded\n");
-        assert_eq!(chosen_bodies(&seen).last().unwrap(), r#"{"key":"d1","scope":"direction","kind":"reroll","register":"bolder","reroll":0,"poolRevision":"0123456789ab","handId":"00112233445566778899aabbccddeeff","source":"agent"}"#);
+        assert_eq!(chosen_bodies(&seen).last().unwrap(), r#"{"key":"d1","scope":"direction","kind":"reroll","register":"bolder","reroll":0,"poolRevision":"0123456789ab","handId":"00112233445566778899aabbccddeeff","pingId":"<PING>","source":"agent"}"#);
         assert_eq!(seed_api(&proj, &skill, &base, &["--kind", "assigned", "--from", "d1", "--scope", "direction"]), "choice already recorded\n");
         // The surface TELEMETRY line names the position flag and the re-roll report.
         let out = seed_api(&proj, &skill, &base, &["--scope", "surface", "--mode", "operate", "--from", "s2"]);
@@ -1226,7 +1255,7 @@ mod tests {
         let (proj, skill) = fixture("seed-reference", &[("mode-persuade", MODE_FILE)]);
         let (base, seen) = roll_api();
         let first = seed_api(&proj, &skill, &base, &["--scope", "direction", "--mode", "persuade", "--from", "3f9a1c2e"]);
-        let reference = telemetry::seed_reference("3f9a1c2e");
+        let reference = tl(&proj).reference("3f9a1c2e");
         assert!(first.contains(&format!("SEED REFERENCE: {reference}.")), "{first}");
         // The reference reproduces the same deal and asks the API with the real key.
         let again = seed_api(&proj, &skill, &base, &["--scope", "direction", "--mode", "persuade", "--from", &reference]);
@@ -1239,10 +1268,11 @@ mod tests {
         let env = Env::from([
             ("IMPECCABLE_SKILL_DIR".into(), skill.to_string_lossy().into_owned()),
             ("IMPECCABLE_NO_STALENESS_CHECK".into(), "1".into()),
+            ("IMPECCABLE_SEED_SALT".into(), "test-salt".into()),
             ("HOME".into(), proj.join("home").to_string_lossy().into_owned()),
         ]);
         let (mut io, cap) = Io::captured("", proj.clone(), env);
-        let unknown = telemetry::seed_reference("elsewhere");
+        let unknown = tl(&proj).reference("elsewhere");
         let argv: Vec<String> = ["--scope", "direction", "--from", unknown.as_str()].iter().map(|s| s.to_string()).collect();
         assert_eq!(run(&argv, &mut io), 1);
         let err = String::from_utf8(cap.stderr.borrow().clone()).unwrap();
@@ -1267,8 +1297,8 @@ mod tests {
         // No telemetry fields are written, only the key behind the reference.
         let record: Value = serde_json::from_str(&std::fs::read_to_string(proj.join(".impeccable/questions/roll.json")).unwrap()).unwrap();
         assert!(record.get("poolRevision").is_none() && record.get("source").is_none(), "{record}");
-        assert_eq!(telemetry::read_seed_round(&proj.to_string_lossy(), "k1", None), None);
-        assert_eq!(telemetry::resolve_seed(&proj.to_string_lossy(), &telemetry::seed_reference("k1")).unwrap(), "k1");
+        assert_eq!(tl(&proj).round("k1", None), None);
+        assert_eq!(tl(&proj).resolve(&tl(&proj).reference("k1")).unwrap(), "k1");
         assert_eq!(seed_api(&proj, &skill, &base, &["--kind", "assigned", "--from", "k1", "--scope", "direction"]), "choice ping skipped\n");
         assert!(chosen_bodies(&seen).is_empty());
         // DO_NOT_TRACK=0 is not an opt-out.

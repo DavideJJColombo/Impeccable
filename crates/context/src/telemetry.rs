@@ -25,12 +25,14 @@ use std::time::Duration;
 
 /// The kinds a choice ping may send. `reroll` means the hand was rejected:
 /// the user asked for another hand instead of choosing.
-pub const KINDS: [&str; 5] = ["assigned", "pick", "challenger", "canon", "reroll"];
+pub const KINDS: [&str; 6] = ["assigned", "pick", "challenger", "canon", "reroll", "grounded"];
 
-/// The kinds a decision-page option card declares. `dealt` is a surface
+/// The kinds a decision-page option card declares. `grounded` is one of the
+/// agent's grounded directions that is neither the assigned card nor the
+/// pick (a safer round's lineup), any number of them. `dealt` is a surface
 /// round's dealt structure other than the lead; it has no ping kind, so its
 /// ping carries `option` alone. Canon is the `canonCard`, never an option.
-pub const CARD_KINDS: [&str; 4] = ["assigned", "pick", "challenger", "dealt"];
+pub const CARD_KINDS: [&str; 5] = ["assigned", "pick", "challenger", "grounded", "dealt"];
 
 /// The highest re-roll round the choice ping reports.
 pub const MAX_REROLL: usize = 8;
@@ -82,10 +84,26 @@ pub fn opt_out_reason(env: &Env, cwd: &str) -> Option<String> {
     if config_says_off(&user) {
         return Some(format!("\"telemetry\": false in {}", user));
     }
-    for name in ["config.local.json", "config.json"] {
-        let p = jsp::join(&[cwd, ".impeccable", name]);
-        if config_says_off(&p) {
-            return Some(format!("\"telemetry\": false in .impeccable/{}", name));
+    // The project config is read where `context` reads its defaults: the
+    // working directory, the resolved project root, then the repo root.
+    let project = crate::context::resolve_project(cwd, &crate::target_args::TargetOptions::default(), env);
+    let mut roots: Vec<String> = Vec::new();
+    for r in [cwd, project.project_root.as_str(), project.repo_root.as_str()] {
+        if r.is_empty() {
+            continue;
+        }
+        let a = jsp::resolve(r, &[]);
+        if !roots.contains(&a) {
+            roots.push(a);
+        }
+    }
+    for root in &roots {
+        for name in ["config.local.json", "config.json"] {
+            let p = jsp::join(&[root, ".impeccable", name]);
+            if config_says_off(&p) {
+                let shown = jsp::relative(cwd, cwd, &p);
+                return Some(format!("\"telemetry\": false in {}", if shown.is_empty() { p.clone() } else { shown }));
+            }
         }
     }
     None
@@ -152,81 +170,86 @@ pub struct SeedRound {
     pub hand_id: Option<String>,
     /// The catalog ids the round printed as challengers, in print order.
     pub dealt: Vec<String>,
-    /// `picker` or `agent` once that round's choice was sent.
+    /// The round's choice state: `pending` while the page's send is in
+    /// flight, `picker` or `agent` once a send was confirmed.
     pub recorded: Option<String>,
+    /// When the pending send began (epoch ms), while `recorded` is `pending`.
+    pub pending_at: Option<f64>,
+    /// 32 random hex naming this round's choice report, the same for the
+    /// page's and the agent's send, so the server can drop a duplicate.
+    pub ping_id: Option<String>,
 }
 
-fn seeds_dir(cwd: &str) -> String {
-    jsp::join(&[cwd, ".impeccable", "questions", "seeds"])
-}
-
-/// The 16 hex of a key's reference: the first 8 bytes of
-/// SHA-256(`impeccable-seed:` + key). Not reversible, and a key can never
-/// name a path.
-fn seed_tag(key: &str) -> String {
-    use sha2::{Digest, Sha256};
-    Sha256::digest(format!("impeccable-seed:{}", key).as_bytes()).iter().take(8).map(|b| format!("{:02x}", b)).collect()
-}
-
-/// The seed reference committed files record instead of the key.
-pub fn seed_reference(key: &str) -> String {
-    format!("seed:{}", seed_tag(key))
-}
-
-/// The 16 hex of a `seed:<16 lowercase hex>` reference, else `None`.
-pub fn parse_seed_reference(v: &str) -> Option<&str> {
-    v.strip_prefix("seed:").filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
-}
-
-fn seed_file_for_tag(cwd: &str, tag: &str) -> String {
-    jsp::join(&[&seeds_dir(cwd), &format!("{}.json", tag)])
-}
-
-fn seed_file(cwd: &str, key: &str) -> String {
-    seed_file_for_tag(cwd, &seed_tag(key))
-}
-
-/// A seed value as given to `--from`: a key stands as itself; a reference
-/// resolves to the key this machine recorded for it. `Err` names a
-/// reference this machine has no record of.
-pub fn resolve_seed(cwd: &str, v: &str) -> Result<String, String> {
-    let Some(tag) = parse_seed_reference(v) else { return Ok(v.to_string()) };
-    safe_read(&seed_file_for_tag(cwd, tag))
-        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-        .and_then(|l| l.get("key").and_then(Value::as_str).map(str::to_string))
-        .filter(|k| seed_tag(k) == tag)
-        .ok_or_else(|| v.to_string())
-}
-
-/// Records the key behind a reference so `resolve_seed` finds it on this
-/// machine. Written for every roll; telemetry plays no part.
-pub fn record_seed_key(cwd: &str, key: &str) {
-    let mut ledger = read_ledger(cwd, key).unwrap_or_default();
-    if ledger.get("key").and_then(Value::as_str) == Some(key) {
-        return;
+impl SeedRound {
+    /// A confirmed send: the agent's rerun for this round is a no-op.
+    pub fn confirmed(&self) -> bool {
+        matches!(self.recorded.as_deref(), Some("picker") | Some("agent"))
     }
-    ledger.insert("key".into(), Value::String(key.to_string()));
-    write_ledger(cwd, key, &ledger);
-    prune_ledgers(cwd);
 }
 
-/// Ledger files older than this are pruned when a new one is written.
+/// The salt seed references are computed under (`impeccable_common::seed`).
+pub fn seed_salt(env: &Env) -> String {
+    impeccable_common::seed::salt(&crate::util::homedir(env), env.get("IMPECCABLE_SEED_SALT").map(String::as_str))
+}
+
+/// The seed ledger of one project directory: `.impeccable/questions/seeds/
+/// <reference hex>.json`, `{"key", "rounds"?: {"<reroll>": {...}}}`. The key
+/// entry is what lets a reference stand for its key on this machine and is
+/// never pruned; rounds exist only while telemetry is on and are pruned after
+/// 30 days. Every update is a read-modify-write under a per-file lock, so the
+/// page's send and a concurrent roll of the next round never lose each
+/// other's writes.
+pub struct Ledger {
+    cwd: String,
+    salt: String,
+}
+
+/// Ledger rounds older than this are pruned when a ledger is written; the
+/// key behind the reference stays.
 const SEED_TTL_MS: f64 = 30.0 * 24.0 * 60.0 * 60.0 * 1000.0;
 
-fn read_ledger(cwd: &str, key: &str) -> Option<Map<String, Value>> {
-    safe_read(&seed_file(cwd, key)).and_then(|t| serde_json::from_str::<Value>(&t).ok()).and_then(|v| v.as_object().cloned())
+/// A lock older than this belongs to a process that died holding it.
+const LOCK_STALE_MS: u128 = 10_000;
+
+/// How long a ledger update waits for the lock before giving up (best
+/// effort: the feature never fails on its ledger).
+const LOCK_WAIT_MS: u128 = 3_000;
+
+fn unique_suffix() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    format!("{}-{}-{}", std::process::id(), n, t)
 }
 
-fn write_ledger(cwd: &str, key: &str, ledger: &Map<String, Value>) {
-    let dir = seeds_dir(cwd);
-    if std::fs::create_dir_all(&dir).is_err() {
-        return;
+struct LockGuard(String);
+
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
-    crate::serve_question::ignore_questions_dir(&jsp::join(&[cwd, ".impeccable", "questions"]));
-    let target = seed_file(cwd, key);
-    let temp = format!("{}.tmp-{}", target, std::process::id());
-    if std::fs::write(&temp, json_compact(&Value::Object(ledger.clone()))).and_then(|_| std::fs::rename(&temp, &target)).is_err() {
-        let _ = std::fs::remove_file(&temp);
+}
+
+fn lock(path: &str) -> Option<LockGuard> {
+    let lock = format!("{}.lock", path);
+    let start = std::time::Instant::now();
+    loop {
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&lock) {
+            Ok(_) => return Some(LockGuard(lock)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = std::fs::metadata(&lock).ok().and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok()).is_some_and(|age| age.as_millis() > LOCK_STALE_MS);
+                if stale {
+                    let _ = std::fs::remove_file(&lock);
+                    continue;
+                }
+                if start.elapsed().as_millis() > LOCK_WAIT_MS {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(15));
+            }
+            Err(_) => return None,
+        }
     }
 }
 
@@ -241,82 +264,190 @@ fn round_from(v: &Value, reroll: usize) -> SeedRound {
         hand_id: s("handId").filter(|h| valid_hand_id(h)),
         dealt: v.get("dealt").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default(),
         recorded: s("recorded"),
+        pending_at: v.get("pendingAt").and_then(Value::as_f64),
+        ping_id: s("pingId").filter(|p| valid_hand_id(p)),
     }
 }
 
-/// Records an API-dealt round under its seed key, replacing an earlier
-/// record of the same round (a reproduced roll clears its sent marker, since
-/// it is a new presentation). Best effort, like the roll record.
-pub fn record_seed_round(cwd: &str, key: &str, round: &SeedRound) {
-    let mut ledger = read_ledger(cwd, key).unwrap_or_default();
-    ledger.insert("key".into(), Value::String(key.to_string()));
-    let mut rounds = ledger.get("rounds").and_then(Value::as_object).cloned().unwrap_or_default();
-    let mut r = Map::new();
-    r.insert("scope".into(), Value::String(round.scope.clone()));
-    if let Some(m) = &round.mode {
-        r.insert("mode".into(), Value::String(m.clone()));
+impl Ledger {
+    pub fn new(env: &Env, cwd: &str) -> Ledger {
+        Ledger { cwd: cwd.to_string(), salt: seed_salt(env) }
     }
-    if let Some(reg) = &round.register {
-        r.insert("register".into(), Value::String(reg.clone()));
-    }
-    if let Some(p) = round.pool_revision.as_ref().filter(|p| valid_pool_revision(p)) {
-        r.insert("poolRevision".into(), Value::String(p.clone()));
-    }
-    if let Some(h) = round.hand_id.as_ref().filter(|h| valid_hand_id(h)) {
-        r.insert("handId".into(), Value::String(h.clone()));
-    }
-    r.insert("dealt".into(), json!(round.dealt));
-    rounds.insert(round.reroll.to_string(), Value::Object(r));
-    ledger.insert("rounds".into(), Value::Object(rounds));
-    write_ledger(cwd, key, &ledger);
-    prune_ledgers(cwd);
-}
 
-fn prune_ledgers(cwd: &str) {
-    let Ok(entries) = std::fs::read_dir(seeds_dir(cwd)) else { return };
-    for e in entries.flatten() {
-        let old = e.metadata().ok().and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok()).is_some_and(|age| age.as_millis() as f64 > SEED_TTL_MS);
-        if old {
-            let _ = std::fs::remove_file(e.path());
+    fn dir(&self) -> String {
+        jsp::join(&[&self.cwd, ".impeccable", "questions", "seeds"])
+    }
+
+    fn file_for_tag(&self, tag: &str) -> String {
+        jsp::join(&[&self.dir(), &format!("{}.json", tag)])
+    }
+
+    fn file(&self, key: &str) -> String {
+        self.file_for_tag(&impeccable_common::seed::tag(&self.salt, key))
+    }
+
+    /// The seed reference committed files record instead of `key`.
+    pub fn reference(&self, key: &str) -> String {
+        impeccable_common::seed::reference(&self.salt, key)
+    }
+
+    fn read_file(path: &str) -> Option<Map<String, Value>> {
+        safe_read(path).and_then(|t| serde_json::from_str::<Value>(&t).ok()).and_then(|v| v.as_object().cloned())
+    }
+
+    fn write_file(&self, path: &str, ledger: &Map<String, Value>) {
+        let temp = format!("{}.tmp-{}", path, unique_suffix());
+        if std::fs::write(&temp, json_compact(&Value::Object(ledger.clone()))).and_then(|_| std::fs::rename(&temp, path)).is_err() {
+            let _ = std::fs::remove_file(&temp);
         }
     }
-}
 
-/// The recorded round `reroll` for `key`, or the latest recorded round when
-/// `reroll` is `None` (a choice resolves on the round last dealt).
-pub fn read_seed_round(cwd: &str, key: &str, reroll: Option<usize>) -> Option<SeedRound> {
-    let ledger = read_ledger(cwd, key)?;
-    let rounds = ledger.get("rounds")?.as_object()?;
-    let n = match reroll {
-        Some(n) => n,
-        None => rounds.keys().filter_map(|k| k.parse::<usize>().ok()).max()?,
-    };
-    rounds.get(&n.to_string()).map(|v| round_from(v, n))
-}
-
-/// Marks a round's choice as sent by `by`. Returns false when the round is
-/// not recorded or was already marked (by anyone).
-pub fn mark_recorded(cwd: &str, key: &str, reroll: usize, by: &str) -> bool {
-    let Some(mut ledger) = read_ledger(cwd, key) else { return false };
-    let Some(Value::Object(rounds)) = ledger.get_mut("rounds") else { return false };
-    let Some(Value::Object(r)) = rounds.get_mut(&reroll.to_string()) else { return false };
-    if r.contains_key("recorded") {
-        return false;
+    /// Read, change, write `key`'s ledger under its lock. The questions
+    /// directory's ignore file goes in before anything is written.
+    fn update<R>(&self, key: &str, f: impl FnOnce(&mut Map<String, Value>) -> R) -> Option<R> {
+        if std::fs::create_dir_all(self.dir()).is_err() {
+            return None;
+        }
+        crate::serve_question::ignore_questions_dir(&jsp::join(&[&self.cwd, ".impeccable", "questions"]));
+        let path = self.file(key);
+        let _guard = lock(&path)?;
+        let mut ledger = Self::read_file(&path).unwrap_or_default();
+        let before = ledger.clone();
+        let out = f(&mut ledger);
+        if ledger != before {
+            self.write_file(&path, &ledger);
+        }
+        Some(out)
     }
-    r.insert("recorded".into(), Value::String(by.to_string()));
-    write_ledger(cwd, key, &ledger);
-    true
-}
 
-/// Clears a round's sent marker when `by` set it: a ping that failed to
-/// leave the machine, so the agent's own ping may still send it.
-pub fn unmark_recorded(cwd: &str, key: &str, reroll: usize, by: &str) {
-    let Some(mut ledger) = read_ledger(cwd, key) else { return };
-    let Some(Value::Object(rounds)) = ledger.get_mut("rounds") else { return };
-    let Some(Value::Object(r)) = rounds.get_mut(&reroll.to_string()) else { return };
-    if r.get("recorded").and_then(Value::as_str) == Some(by) {
-        r.remove("recorded");
-        write_ledger(cwd, key, &ledger);
+    /// A seed value as given to `--from`: a key stands as itself; a
+    /// reference resolves to the key this machine recorded for it. `Err`
+    /// names a reference this machine has no record of.
+    pub fn resolve(&self, v: &str) -> Result<String, String> {
+        let Some(tag) = impeccable_common::seed::parse_reference(v) else { return Ok(v.to_string()) };
+        Self::read_file(&self.file_for_tag(tag))
+            .and_then(|l| l.get("key").and_then(Value::as_str).map(str::to_string))
+            .filter(|k| impeccable_common::seed::tag(&self.salt, k) == tag)
+            .ok_or_else(|| v.to_string())
+    }
+
+    /// Records the key behind a reference, for every roll whatever the
+    /// telemetry setting: it is what makes the reference usable.
+    pub fn record_key(&self, key: &str) {
+        self.update(key, |l| {
+            l.insert("key".into(), Value::String(key.to_string()));
+        });
+        self.prune();
+    }
+
+    /// Records an API-dealt round, replacing an earlier record of the same
+    /// round (a reproduced roll is a new presentation, so it gets a fresh
+    /// `pingId` and no sent state). Telemetry only.
+    pub fn record_round(&self, key: &str, round: &SeedRound) {
+        let ping_id = impeccable_common::seed::random_hex32();
+        self.update(key, |l| {
+            l.insert("key".into(), Value::String(key.to_string()));
+            let rounds = l.entry("rounds").or_insert_with(|| Value::Object(Map::new()));
+            if !rounds.is_object() {
+                *rounds = Value::Object(Map::new());
+            }
+            let mut r = Map::new();
+            r.insert("scope".into(), Value::String(round.scope.clone()));
+            if let Some(m) = &round.mode {
+                r.insert("mode".into(), Value::String(m.clone()));
+            }
+            if let Some(reg) = &round.register {
+                r.insert("register".into(), Value::String(reg.clone()));
+            }
+            if let Some(p) = round.pool_revision.as_ref().filter(|p| valid_pool_revision(p)) {
+                r.insert("poolRevision".into(), Value::String(p.clone()));
+            }
+            if let Some(h) = round.hand_id.as_ref().filter(|h| valid_hand_id(h)) {
+                r.insert("handId".into(), Value::String(h.clone()));
+            }
+            r.insert("dealt".into(), json!(round.dealt));
+            if let Some(p) = &ping_id {
+                r.insert("pingId".into(), Value::String(p.clone()));
+            }
+            rounds.as_object_mut().unwrap().insert(round.reroll.to_string(), Value::Object(r));
+        });
+        self.prune();
+    }
+
+    /// The recorded round `reroll` for `key`, or the latest recorded round
+    /// when `reroll` is `None` (a choice resolves on the round last dealt).
+    pub fn round(&self, key: &str, reroll: Option<usize>) -> Option<SeedRound> {
+        let ledger = Self::read_file(&self.file(key))?;
+        let rounds = ledger.get("rounds")?.as_object()?;
+        let n = match reroll {
+            Some(n) => n,
+            None => rounds.keys().filter_map(|k| k.parse::<usize>().ok()).max()?,
+        };
+        rounds.get(&n.to_string()).map(|v| round_from(v, n))
+    }
+
+    fn with_round<R>(&self, key: &str, reroll: usize, f: impl FnOnce(&mut Map<String, Value>) -> R) -> Option<R> {
+        self.update(key, |l| {
+            let r = l.get_mut("rounds").and_then(Value::as_object_mut).and_then(|rs| rs.get_mut(&reroll.to_string())).and_then(Value::as_object_mut)?;
+            Some(f(r))
+        })
+        .flatten()
+    }
+
+    /// The page's claim on a round before it sends: a round with no choice
+    /// state becomes `pending`. Returns the round (with its `pingId`) when
+    /// the claim took; `None` when the round is unknown or already claimed.
+    pub fn claim(&self, key: &str, reroll: usize) -> Option<SeedRound> {
+        self.with_round(key, reroll, |r| {
+            if r.contains_key("recorded") {
+                return None;
+            }
+            r.insert("recorded".into(), Value::String("pending".into()));
+            r.insert("pendingAt".into(), Value::from(crate::util::now_ms() as u64));
+            Some(round_from(&Value::Object(r.clone()), reroll))
+        })
+        .flatten()
+    }
+
+    /// A confirmed send by `by`: the round's later reruns are no-ops.
+    pub fn confirm(&self, key: &str, reroll: usize, by: &str) {
+        self.with_round(key, reroll, |r| {
+            r.insert("recorded".into(), Value::String(by.to_string()));
+            r.remove("pendingAt");
+        });
+    }
+
+    /// A send that failed: a still-pending round goes back to no state, so
+    /// the agent's rerun sends it.
+    pub fn release(&self, key: &str, reroll: usize) {
+        self.with_round(key, reroll, |r| {
+            if r.get("recorded").and_then(Value::as_str) == Some("pending") {
+                r.remove("recorded");
+                r.remove("pendingAt");
+            }
+        });
+    }
+
+    /// Drops the rounds of ledgers untouched for `SEED_TTL_MS`, keeping the
+    /// key so their references keep resolving.
+    fn prune(&self) {
+        let Ok(entries) = std::fs::read_dir(self.dir()) else { return };
+        for e in entries.flatten() {
+            let path = e.path().to_string_lossy().into_owned();
+            if !path.ends_with(".json") {
+                continue;
+            }
+            let old = e.metadata().ok().and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok()).is_some_and(|age| age.as_millis() as f64 > SEED_TTL_MS);
+            if !old || !Self::read_file(&path).is_some_and(|l| l.contains_key("rounds")) {
+                continue;
+            }
+            if let Some(_guard) = lock(&path) {
+                if let Some(mut l) = Self::read_file(&path) {
+                    l.remove("rounds");
+                    self.write_file(&path, &l);
+                }
+            }
+        }
     }
 }
 
@@ -340,6 +471,7 @@ pub struct ChoicePing {
     pub reroll: Option<usize>,
     pub pool_revision: Option<String>,
     pub hand_id: Option<String>,
+    pub ping_id: Option<String>,
     pub kind_source: Option<&'static str>,
     pub source: &'static str,
 }
@@ -370,6 +502,9 @@ impl ChoicePing {
         }
         if let Some(h) = self.hand_id.as_ref().filter(|h| valid_hand_id(h)) {
             body.insert("handId".into(), Value::String(h.clone()));
+        }
+        if let Some(p) = self.ping_id.as_ref().filter(|p| valid_hand_id(p)) {
+            body.insert("pingId".into(), Value::String(p.clone()));
         }
         if let Some(k) = self.kind_source {
             body.insert("kindSource".into(), Value::String(k.to_string()));
@@ -530,7 +665,16 @@ pub fn run(args: &[String], io: &mut impeccable_common::Io) -> i32 {
     let env = io.env.clone();
     let cwd = io.cwd.to_string_lossy().into_owned();
     let path = user_config_path(&env);
-    let read = || -> Map<String, Value> { safe_read(&path).and_then(|t| serde_json::from_str::<Value>(&t).ok()).and_then(|v| v.as_object().cloned()).unwrap_or_default() };
+    // A missing file is an empty config; one that does not parse to an
+    // object is the user's to fix, never overwritten.
+    let read = || -> Result<Map<String, Value>, String> {
+        let Some(text) = safe_read(&path) else { return Ok(Map::new()) };
+        match serde_json::from_str::<Value>(&text) {
+            Ok(Value::Object(m)) => Ok(m),
+            Ok(_) => Err(format!("{} is not a JSON object", path)),
+            Err(e) => Err(format!("{} is not valid JSON ({})", path, e)),
+        }
+    };
     let write = |m: &Map<String, Value>| -> Result<(), String> {
         let dir = jsp::join(&[&crate::util::homedir(&env), ".impeccable"]);
         std::fs::create_dir_all(&dir)
@@ -543,7 +687,13 @@ pub fn run(args: &[String], io: &mut impeccable_common::Io) -> i32 {
             0
         }
         Some(cmd @ ("off" | "on")) => {
-            let mut m = read();
+            let mut m = match read() {
+                Ok(m) => m,
+                Err(e) => {
+                    io.err(&format!("telemetry: {}; fix or remove it, then run `impeccable telemetry {}` again. Nothing was changed.\n", e, cmd));
+                    return 1;
+                }
+            };
             if cmd == "off" {
                 m.insert("telemetry".into(), Value::Bool(false));
             } else {
@@ -608,53 +758,122 @@ mod tests {
         assert!(client_header(&env(&[("IMPECCABLE_SKILL_DIR", &skill)]), &dir).ends_with("+engine"));
     }
 
-    #[test]
-    fn ledger_records_rounds_marks_once_and_unmarks_only_its_own() {
-        let cwd = temp_dir("ledger");
-        let round = |n: usize, dealt: &[&str]| SeedRound {
+    pub(crate) fn test_ledger(cwd: &str) -> Ledger {
+        Ledger::new(&env(&[("IMPECCABLE_SEED_SALT", "test-salt")]), cwd)
+    }
+
+    fn round(n: usize, dealt: &[&str]) -> SeedRound {
+        SeedRound {
             scope: "direction".into(),
             reroll: n,
             mode: Some("persuade".into()),
-            register: None,
             pool_revision: Some("0123456789ab".into()),
             hand_id: Some("00112233445566778899aabbccddeeff".into()),
             dealt: dealt.iter().map(|s| s.to_string()).collect(),
-            recorded: None,
-        };
-        assert_eq!(read_seed_round(&cwd, "k1", None), None);
-        record_seed_round(&cwd, "k1", &round(0, &["a", "b"]));
-        record_seed_round(&cwd, "k1", &round(1, &["c"]));
-        assert_eq!(read_seed_round(&cwd, "k1", None).unwrap().dealt, vec!["c"]);
-        assert_eq!(read_seed_round(&cwd, "k1", Some(0)).unwrap(), round(0, &["a", "b"]));
-        assert_eq!(read_seed_round(&cwd, "k1", Some(5)), None);
-        assert!(mark_recorded(&cwd, "k1", 0, "picker"));
-        assert!(!mark_recorded(&cwd, "k1", 0, "agent"));
-        assert_eq!(read_seed_round(&cwd, "k1", Some(0)).unwrap().recorded.as_deref(), Some("picker"));
-        unmark_recorded(&cwd, "k1", 0, "agent");
-        assert!(read_seed_round(&cwd, "k1", Some(0)).unwrap().recorded.is_some());
-        unmark_recorded(&cwd, "k1", 0, "picker");
-        assert!(read_seed_round(&cwd, "k1", Some(0)).unwrap().recorded.is_none());
-        // A key that is not a plain slug never names a path.
-        record_seed_round(&cwd, "../Evil Key", &round(0, &["x"]));
-        assert_eq!(read_seed_round(&cwd, "../Evil Key", None).unwrap().dealt, vec!["x"]);
-        // Files are named by the reference's hex, hold no time, and resolve the reference.
-        for e in std::fs::read_dir(format!("{}/.impeccable/questions/seeds", cwd)).unwrap().flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            assert!(name.len() == 21 && name.ends_with(".json") && !name.contains("k1") && !name.contains("Evil"), "{name}");
-            let text = std::fs::read_to_string(e.path()).unwrap();
-            assert!(!text.contains("\"at\""), "{text}");
+            ..Default::default()
         }
-        assert_eq!(resolve_seed(&cwd, &seed_reference("../Evil Key")).unwrap(), "../Evil Key");
-        // The questions directory ignores itself, ledger included.
-        assert_eq!(std::fs::read_to_string(format!("{}/.impeccable/questions/.gitignore", cwd)).unwrap(), format!("{}\n*\n", impeccable_common::git::RUNTIME_IGNORE_HEADER));
-        // A malformed poolRevision is never recorded.
+    }
+
+    #[test]
+    fn ledger_rounds_carry_a_ping_id_and_move_through_pending_to_confirmed() {
+        let cwd = temp_dir("ledger");
+        let l = test_ledger(&cwd);
+        assert_eq!(l.round("k1", None), None);
+        l.record_round("k1", &round(0, &["a", "b"]));
+        l.record_round("k1", &round(1, &["c"]));
+        assert_eq!(l.round("k1", None).unwrap().dealt, vec!["c"]);
+        let r0 = l.round("k1", Some(0)).unwrap();
+        assert_eq!((r0.dealt.clone(), r0.recorded.clone()), (vec!["a".to_string(), "b".to_string()], None));
+        let ping_id = r0.ping_id.clone().unwrap();
+        assert!(valid_hand_id(&ping_id), "{ping_id}");
+        assert_ne!(l.round("k1", Some(1)).unwrap().ping_id.unwrap(), ping_id, "one id per round");
+        assert_eq!(l.round("k1", Some(5)), None);
+        // The page claims, the claim is exclusive, a failure releases it.
+        let claimed = l.claim("k1", 0).unwrap();
+        assert_eq!(claimed.ping_id.as_deref(), Some(ping_id.as_str()));
+        assert_eq!(l.claim("k1", 0), None);
+        let pending = l.round("k1", Some(0)).unwrap();
+        assert!(pending.recorded.as_deref() == Some("pending") && pending.pending_at.is_some() && !pending.confirmed());
+        l.release("k1", 0);
+        assert_eq!(l.round("k1", Some(0)).unwrap().recorded, None);
+        // A confirmed send is final; release never undoes it.
+        l.claim("k1", 0).unwrap();
+        l.confirm("k1", 0, "picker");
+        l.release("k1", 0);
+        let done = l.round("k1", Some(0)).unwrap();
+        assert!(done.confirmed() && done.pending_at.is_none(), "{done:?}");
+        assert_eq!(l.round("k1", Some(0)).unwrap().ping_id.as_deref(), Some(ping_id.as_str()));
+        // Malformed values are never stored.
         let mut r = round(2, &[]);
         r.pool_revision = Some("NOT-HEX".into());
         r.hand_id = Some("00112233445566778899AABBCCDDEEFF".into());
-        record_seed_round(&cwd, "k1", &r);
-        let back = read_seed_round(&cwd, "k1", Some(2)).unwrap();
-        assert_eq!((back.pool_revision, back.hand_id), (None, None), "malformed values are never stored");
-        assert_eq!(read_seed_round(&cwd, "k1", Some(0)).unwrap().hand_id.as_deref(), Some("00112233445566778899aabbccddeeff"));
+        l.record_round("k1", &r);
+        let back = l.round("k1", Some(2)).unwrap();
+        assert_eq!((back.pool_revision, back.hand_id), (None, None));
+        // Files are named by the reference's hex and hold no time but a pending send's.
+        l.record_round("../Evil Key", &round(0, &["x"]));
+        for e in std::fs::read_dir(format!("{}/.impeccable/questions/seeds", cwd)).unwrap().flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            assert!(name.len() == 21 && name.ends_with(".json") && !name.contains("k1") && !name.contains("Evil"), "{name}");
+            assert!(!std::fs::read_to_string(e.path()).unwrap().contains("\"at\""));
+        }
+        assert_eq!(l.resolve(&l.reference("../Evil Key")).unwrap(), "../Evil Key");
+        assert_eq!(std::fs::read_to_string(format!("{}/.impeccable/questions/.gitignore", cwd)).unwrap(), format!("{}\n*\n", impeccable_common::git::RUNTIME_IGNORE_HEADER));
+    }
+
+    #[test]
+    fn concurrent_ledger_updates_lose_nothing() {
+        let cwd = temp_dir("ledger-race");
+        let l = test_ledger(&cwd);
+        for n in 0..8 {
+            l.record_round("k1", &round(n, &["a"]));
+        }
+        // Eight threads, each claiming and confirming its own round of the
+        // same file at once: every write survives the others.
+        let handles: Vec<_> = (0..8)
+            .map(|n| {
+                let cwd = cwd.clone();
+                std::thread::spawn(move || {
+                    let l = test_ledger(&cwd);
+                    l.claim("k1", n).unwrap();
+                    l.confirm("k1", n, "picker");
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        for n in 0..8 {
+            assert!(l.round("k1", Some(n)).unwrap().confirmed(), "round {n}");
+        }
+        let leftovers: Vec<String> = std::fs::read_dir(format!("{}/.impeccable/questions/seeds", cwd)).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.contains(".tmp-") || n.ends_with(".lock")).collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[test]
+    fn a_stale_lock_is_taken_over() {
+        let cwd = temp_dir("ledger-stale");
+        let l = test_ledger(&cwd);
+        l.record_key("k1");
+        let lock_path = format!("{}.lock", l.file("k1"));
+        std::fs::write(&lock_path, "").unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(60);
+        std::fs::File::options().write(true).open(&lock_path).unwrap().set_modified(old).unwrap();
+        l.record_round("k1", &round(0, &[]));
+        assert!(l.round("k1", Some(0)).is_some(), "a lock left by a dead process does not block");
+    }
+
+    #[test]
+    fn pruning_keeps_the_key_behind_a_reference() {
+        let cwd = temp_dir("ledger-prune");
+        let l = test_ledger(&cwd);
+        l.record_round("k1", &round(0, &["a"]));
+        let path = l.file("k1");
+        let old = std::time::SystemTime::now() - Duration::from_secs(40 * 24 * 3600);
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(old).unwrap();
+        l.record_key("other");
+        assert_eq!(l.round("k1", None), None, "old rounds go");
+        assert_eq!(l.resolve(&l.reference("k1")).unwrap(), "k1", "the reference still resolves");
     }
 
     #[test]
@@ -670,10 +889,11 @@ mod tests {
             reroll: Some(2),
             pool_revision: Some("0123456789ab".into()),
             hand_id: Some("00112233445566778899aabbccddeeff".into()),
+            ping_id: Some("ffeeddccbbaa99887766554433221100".into()),
             kind_source: Some("explicit"),
             source: "picker",
         };
-        assert_eq!(json_compact(&p.body()), r#"{"chosenId":"w1","key":"k","scope":"direction","kind":"challenger","register":"bolder","option":3,"reroll":2,"poolRevision":"0123456789ab","handId":"00112233445566778899aabbccddeeff","kindSource":"explicit","source":"picker"}"#);
+        assert_eq!(json_compact(&p.body()), r#"{"chosenId":"w1","key":"k","scope":"direction","kind":"challenger","register":"bolder","option":3,"reroll":2,"poolRevision":"0123456789ab","handId":"00112233445566778899aabbccddeeff","pingId":"ffeeddccbbaa99887766554433221100","kindSource":"explicit","source":"picker"}"#);
         // A handId in any other shape (an older or odd server) is never sent.
         for bad in ["00112233445566778899AABBCCDDEEFF", "0011", "00112233445566778899aabbccddeeffaa", "zz112233445566778899aabbccddeeff"] {
             assert!(!valid_hand_id(bad), "{bad}");
@@ -714,7 +934,8 @@ mod tests {
             { "id": "p", "kind": "pick", "kicker": "IMPECCABLE’S PICK" },
             { "id": "c1", "kind": "challenger", "catalogId": "teletext-service", "verdict": "competitive" },
             { "id": "c2", "kind": "challenger", "catalogId": "challenger-teletext", "verdict": "wins" },
-            { "id": "d", "kind": "dealt" }
+            { "id": "d", "kind": "dealt" },
+            { "id": "g", "kind": "grounded" }
         ], "canon": true })
     }
 
@@ -739,6 +960,7 @@ mod tests {
             // An id that was not dealt never leaves the machine; the kind still goes.
             assert_eq!(k("c2"), r(Some("challenger"), None, Some(3), "explicit"));
             assert_eq!(k("canon"), r(Some("canon"), None, None, "explicit"));
+            assert_eq!(k("g"), r(Some("grounded"), None, Some(5), "explicit"), "a safer lineup card");
             assert_eq!(k("nope"), None);
             assert_eq!(picker_choice(&s, &pg, "a", None).unwrap().register.as_deref(), register);
         }
@@ -805,21 +1027,20 @@ mod tests {
     }
 
     #[test]
-    fn seed_references_are_stable_hashes_that_resolve_only_where_recorded() {
+    fn seed_references_are_salted_hashes_that_resolve_only_where_recorded() {
         let cwd = temp_dir("reference");
-        let r = seed_reference("3f9a1c2e");
-        assert!(parse_seed_reference(&r).is_some() && r.len() == 21 && !r.contains("3f9a1c2e"), "{r}");
-        assert_eq!(seed_reference("3f9a1c2e"), r, "stable");
-        for bad in ["seed:XYZ", "seed:0123", "seed:0123456789ABCDEF", "k1"] {
-            assert_eq!(parse_seed_reference(bad), None, "{bad}");
-        }
+        let l = test_ledger(&cwd);
+        let r = l.reference("3f9a1c2e");
+        assert!(impeccable_common::seed::parse_reference(&r).is_some() && r.len() == 21 && !r.contains("3f9a1c2e"), "{r}");
+        assert_eq!(l.reference("3f9a1c2e"), r, "stable");
+        assert_ne!(Ledger::new(&env(&[("IMPECCABLE_SEED_SALT", "another")]), &cwd).reference("3f9a1c2e"), r, "salted");
         // A key resolves to itself; a reference only once this machine recorded its key.
-        assert_eq!(resolve_seed(&cwd, "k1").unwrap(), "k1");
-        assert_eq!(resolve_seed(&cwd, &r), Err(r.clone()));
-        record_seed_key(&cwd, "3f9a1c2e");
-        assert_eq!(resolve_seed(&cwd, &r).unwrap(), "3f9a1c2e");
+        assert_eq!(l.resolve("k1").unwrap(), "k1");
+        assert_eq!(l.resolve(&r), Err(r.clone()));
+        l.record_key("3f9a1c2e");
+        assert_eq!(l.resolve(&r).unwrap(), "3f9a1c2e");
         // The key record carries no telemetry round.
-        assert_eq!(read_seed_round(&cwd, "3f9a1c2e", None), None);
+        assert_eq!(l.round("3f9a1c2e", None), None);
     }
 
     #[test]
@@ -876,5 +1097,40 @@ mod tests {
         let cfg: Value = serde_json::from_str(&std::fs::read_to_string(format!("{}/.impeccable/config.json", home)).unwrap()).unwrap();
         assert_eq!(cfg, json!({ "other": 1 }));
         assert_eq!(call(&["maybe"]).0, 1);
+    }
+
+    #[test]
+    fn a_project_opt_out_counts_from_a_subdirectory() {
+        let root = temp_dir("optout-root");
+        std::fs::create_dir_all(format!("{}/.git", root)).unwrap();
+        std::fs::create_dir_all(format!("{}/.impeccable", root)).unwrap();
+        std::fs::write(format!("{}/.impeccable/config.json", root), r#"{"telemetry": false}"#).unwrap();
+        // A workspace monorepo, run from a package: the same roots `context`
+        // reads its config defaults from.
+        std::fs::write(format!("{}/package.json", root), r#"{"private": true, "workspaces": ["packages/*"]}"#).unwrap();
+        let sub = format!("{}/packages/web", root);
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(format!("{}/package.json", sub), r#"{"name": "web"}"#).unwrap();
+        let e = env(&[("HOME", &format!("{}/home", root)), ("USERPROFILE", &format!("{}/home", root))]);
+        let reason = opt_out_reason(&e, &sub).expect("the project root's config counts");
+        assert!(reason.contains("\"telemetry\": false in") && reason.contains(".impeccable/config.json"), "{reason}");
+    }
+
+    #[test]
+    fn telemetry_off_and_on_refuse_to_overwrite_a_malformed_user_config() {
+        let cwd = temp_dir("verb-malformed");
+        let home = format!("{}/home", cwd);
+        std::fs::create_dir_all(format!("{}/.impeccable", home)).unwrap();
+        for (body, why) in [("{not json", "is not valid JSON"), ("[1, 2]", "is not a JSON object")] {
+            std::fs::write(format!("{}/.impeccable/config.json", home), body).unwrap();
+            for cmd in ["off", "on"] {
+                let e = env(&[("HOME", home.as_str()), ("USERPROFILE", home.as_str())]);
+                let (mut io, cap) = impeccable_common::Io::captured("", std::path::PathBuf::from(&cwd), e);
+                assert_eq!(run(&[cmd.to_string()], &mut io), 1);
+                let err = String::from_utf8(cap.stderr.borrow().clone()).unwrap();
+                assert!(err.contains(why) && err.contains("Nothing was changed"), "{err}");
+                assert_eq!(std::fs::read_to_string(format!("{}/.impeccable/config.json", home)).unwrap(), body, "untouched");
+            }
+        }
     }
 }

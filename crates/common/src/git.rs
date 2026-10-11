@@ -23,8 +23,9 @@ pub const RUNTIME_IGNORE_HEADER: &str = "# Written by Impeccable: local runtime 
 /// directory and the file when missing and appending only the patterns it
 /// lacks, so it is cheap to call on every write and leaves the user's own
 /// lines alone. A directory whose files are all runtime state passes `*`,
-/// which also ignores the `.gitignore` itself, so nothing in it, the ignore
-/// file included, can reach a commit without touching the root `.gitignore`.
+/// which also ignores the `.gitignore` itself, so no new file in it, the
+/// ignore file included, reaches a commit. Files git already tracks stay
+/// tracked: see `serve_question::tracked_runtime_notice`.
 /// Best effort: a failure never fails the write it guards.
 pub fn ensure_dir_ignored(dir: &str, patterns: &[&str]) {
     let file = jsp::join(&[dir, ".gitignore"]);

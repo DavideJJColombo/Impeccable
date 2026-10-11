@@ -326,6 +326,8 @@ function buildInvocation(c, { impl, bin, ws, isolatedHome }) {
     IMPECCABLE_NO_TELEMETRY: '1',
     DO_NOT_TRACK: '1',
     IMPECCABLE_TELEMETRY_CHANNEL: 'test',
+    // Seed references are salted per user; a pinned salt keeps goldens stable.
+    IMPECCABLE_SEED_SALT: 'oracle',
     ...(c.isolateHome === false ? {} : { HOME: isolatedHome, USERPROFILE: isolatedHome }),
     // What the launcher exports for the binary (see launcher/impeccable in the engine repo).
     ...(impl === 'bin' ? { IMPECCABLE_SKILL_DIR: path.join(REPO_ROOT, 'skill'), IMPECCABLE_SELF: bin } : {}),

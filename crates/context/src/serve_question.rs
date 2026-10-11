@@ -369,7 +369,7 @@ fn card_identity_problems(roll: Option<&str>, payload: &Value) -> (Vec<String>, 
 fn card_identity_message(problems: &[String], dealt: &[String], rerun: &str, outcome: &str) -> String {
     let dealt_note = if dealt.is_empty() { String::new() } else { format!(" (dealt this roll: {})", dealt.join(", ")) };
     format!(
-        "serve-question: every card on a direction or surface page declares its identity, and these do not: {}. Set \"kind\" on every option: \"assigned\" on the assigned direction (a surface round's dealt lead), \"pick\" on the IMPECCABLE’S PICK card, \"challenger\" on each dealt challenger, or \"dealt\" on a surface round's other dealt structures; and on every challenger set \"catalogId\" to the SOURCE ID concept-seed printed for it{}, never the card's own id. Fix the payload and {}; {}.\n",
+        "serve-question: every card on a direction or surface page declares its identity, and these do not: {}. Set \"kind\" on every option: \"assigned\" on the assigned direction (a surface round's dealt lead), \"pick\" on the IMPECCABLE’S PICK card, \"challenger\" on each dealt challenger, \"grounded\" on any other direction of your own (a safer round's lineup), or \"dealt\" on a surface round's other dealt structures; and on every challenger set \"catalogId\" to the SOURCE ID concept-seed printed for it{}, never the card's own id. Fix the payload and {}; {}.\n",
         problems.join("; "),
         dealt_note,
         rerun,
@@ -387,25 +387,75 @@ pub fn ignore_questions_dir(qdir: &str) {
     impeccable_common::git::ensure_dir_ignored(qdir, &["*"]);
 }
 
-/// A roll record's `at`, floored to the minute: precise enough for
-/// `ROLL_WINDOW_MS`, too coarse to match a telemetry row to the second.
-fn coarse_now_ms() -> u64 {
-    let now = now_ms() as u64;
-    now - now % 60_000
-}
 
 /// How long a roll stays bound to the next decision page. A roll is
 /// presented within minutes; an older record belongs to work long gone.
 const ROLL_WINDOW_MS: f64 = 60.0 * 60.0 * 1000.0;
 
 /// `.impeccable/questions/roll.json`: concept-seed's latest roll in this
-/// project, `{"scope", "key", "reroll", "at"}` (`at` in epoch ms) plus
-/// `"worlds"`, the catalog worlds it printed as challengers, when it printed
-/// any. Every roll replaces it; a decision page (a payload carrying `buildPath`) that
-/// `--start` serves or `--update` delivers removes it, so a roll binds to
-/// the one page that presents it.
+/// project, `{"scope", "seed", "reroll"}` (`seed` is the roll's seed
+/// reference, never its key) plus `"worlds"`, the catalog worlds it printed
+/// as challengers, when it printed any. The file holds no time: its age is
+/// its mtime, which git never records. Every roll replaces it; a decision
+/// page (a payload carrying `buildPath`) that `--start` serves or `--update`
+/// delivers removes it, so a roll binds to the one page that presents it.
 fn roll_file(qdir: &str) -> String {
     jsp::join(&[qdir, "roll.json"])
+}
+
+/// Where the record goes when git already tracks `roll.json` (a project
+/// that committed it before the questions directory ignored itself): a
+/// name git has never seen, which the directory's `.gitignore` covers, so
+/// the dealt hand never lands in a tracked file. `read_roll` prefers it.
+fn roll_local_file(qdir: &str) -> String {
+    jsp::join(&[qdir, "roll.local.json"])
+}
+
+/// The project-relative paths git tracks among `paths`, when `cwd` is in a
+/// git work tree; empty otherwise or on any failure. One `git ls-files`.
+pub fn git_tracked(cwd: &str, paths: &[&str]) -> Vec<String> {
+    let in_repo = std::path::Path::new(cwd).ancestors().any(|d| d.join(".git").exists());
+    if !in_repo {
+        return vec![];
+    }
+    let out = std::process::Command::new("git").arg("-C").arg(cwd).args(["ls-files", "-z", "--"]).args(paths).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).output();
+    match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).split('\0').filter(|p| !p.is_empty()).map(str::to_string).collect(),
+        _ => vec![],
+    }
+}
+
+/// The runtime paths whose tracked files hold a seed key, a dealt hand, or
+/// a choice: a `.gitignore` covers new files only.
+const RUNTIME_PATHS: [&str; 3] = [".impeccable/questions", ".impeccable/mocks/worlds", ".impeccable/build/state.json"];
+
+/// A one-time notice when git already tracks runtime files: printed once
+/// per distinct tracked set (a marker in the ignored questions directory
+/// remembers it), never fatal, nothing when there is no repository.
+pub fn tracked_runtime_notice(cwd: &str) -> Option<String> {
+    let tracked = git_tracked(cwd, &RUNTIME_PATHS);
+    if tracked.is_empty() {
+        return None;
+    }
+    use sha2::{Digest, Sha256};
+    let digest: String = Sha256::digest(tracked.join("\n").as_bytes()).iter().take(8).map(|b| format!("{:02x}", b)).collect();
+    let qdir = jsp::join(&[cwd, ".impeccable", "questions"]);
+    let marker = jsp::join(&[&qdir, ".tracked-notice"]);
+    if safe_read(&marker).is_some_and(|m| m.trim() == digest) {
+        return None;
+    }
+    let _ = std::fs::create_dir_all(&qdir);
+    ignore_questions_dir(&qdir);
+    let _ = std::fs::write(&marker, format!("{}\n", digest));
+    let roots: Vec<&str> = RUNTIME_PATHS.iter().copied().filter(|r| tracked.iter().any(|t| t == r || t.starts_with(&format!("{}/", r)))).collect();
+    let shown: Vec<&str> = tracked.iter().take(5).map(String::as_str).collect();
+    Some(format!(
+        "TRACKED RUNTIME FILES: git already tracks {} file(s) under .impeccable/ that hold local runtime state (seed keys, dealt hands, choices): {}{}. A .gitignore does not untrack files already committed, so the next commit can still publish them. Tell the user once, and suggest they run `git rm -r --cached {}` and commit; it keeps the files on disk. Until then the engine writes the roll record to .impeccable/questions/roll.local.json instead.\n",
+        tracked.len(),
+        shown.join(", "),
+        if tracked.len() > shown.len() { ", ..." } else { "" },
+        roots.join(" ")
+    ))
 }
 
 /// What a roll the API dealt adds to its record: the seed's mode and
@@ -417,14 +467,16 @@ pub struct ApiRoll<'a> {
     pub hand_id: Option<&'a str>,
 }
 
-/// Records a concept-seed roll for the next decision page. Best effort: a
-/// roll never fails because its record could not be written. A roll the API
-/// dealt (`api`) also records `"source": "api"`, its `poolRevision`, `mode`
-/// and `register`, which the page carries into its hand (`roll_seed`) so the
-/// picker can send the choice ping itself.
-pub fn record_roll(cwd: &str, scope: &str, key: &str, reroll: usize, worlds: &[Value], api: Option<&ApiRoll>) {
+/// Records a concept-seed roll for the next decision page under its seed
+/// `reference`. Best effort: a roll never fails because its record could
+/// not be written. A roll the API dealt (`api`) also records `"source":
+/// "api"`, its `poolRevision`, `handId`, `mode` and `register`, which the
+/// page carries into its hand (`roll_seed`) so the picker can send the
+/// choice ping itself. The questions directory ignores itself before the
+/// record is written.
+pub fn record_roll(cwd: &str, scope: &str, reference: &str, reroll: usize, worlds: &[Value], api: Option<&ApiRoll>) {
     let qdir = jsp::join(&[cwd, ".impeccable", "questions"]);
-    let mut record = json!({ "scope": scope, "key": key, "reroll": reroll, "at": coarse_now_ms() });
+    let mut record = json!({ "scope": scope, "seed": reference, "reroll": reroll });
     if !worlds.is_empty() {
         record["worlds"] = Value::Array(worlds.to_vec());
     }
@@ -443,15 +495,51 @@ pub fn record_roll(cwd: &str, scope: &str, key: &str, reroll: usize, worlds: &[V
             record["register"] = json!(r);
         }
     }
-    let _ = std::fs::create_dir_all(&qdir).and_then(|_| write_atomic(&roll_file(&qdir), &json_compact(&record)));
+    if std::fs::create_dir_all(&qdir).is_err() {
+        return;
+    }
     ignore_questions_dir(&qdir);
+    let tracked = !git_tracked(cwd, &[".impeccable/questions/roll.json"]).is_empty();
+    let (target, other) = if tracked { (roll_local_file(&qdir), None) } else { (roll_file(&qdir), Some(roll_local_file(&qdir))) };
+    if write_atomic(&target, &json_compact(&record)).is_ok() {
+        if let Some(o) = other {
+            let _ = std::fs::remove_file(o);
+        }
+    }
+}
+
+/// One roll record file's text, with `at` (epoch ms) filled from its mtime
+/// when the record carries none, so every freshness check reads one field.
+fn read_roll_at(path: &str) -> Option<String> {
+    let text = safe_read(path)?;
+    let Ok(Value::Object(mut m)) = serde_json::from_str::<Value>(&text) else { return Some(text) };
+    if m.get("at").is_none() {
+        if let Some(mt) = mtime_ms(path) {
+            m.insert("at".into(), Value::from(mt as u64));
+        }
+    }
+    Some(json_compact(&Value::Object(m)))
 }
 
 /// The roll record as `--start` / `--update` read it once, before the gate:
 /// the same text decides the gate and names the record `take_roll` may
-/// remove.
+/// remove. `roll.local.json` wins over `roll.json`.
 fn read_roll(qdir: &str) -> Option<String> {
-    safe_read(&roll_file(qdir))
+    read_roll_at(&roll_local_file(qdir)).or_else(|| read_roll_at(&roll_file(qdir)))
+}
+
+/// The hand's `seed` (`roll_seed`) with the roll's key: the record names
+/// only its reference, and the ping needs the key, which the seed ledger
+/// resolves on this machine. A seed whose key cannot be resolved is dropped,
+/// since a ping without its key cannot be joined.
+fn seed_with_key(seed: Option<Value>, env: &Env, cwd: &str) -> Option<Value> {
+    let mut seed = seed?;
+    if seed.get("key").and_then(Value::as_str).is_none() {
+        let reference = seed.get("seed").and_then(Value::as_str)?.to_string();
+        let key = crate::telemetry::Ledger::new(env, cwd).resolve(&reference).ok()?;
+        seed["key"] = Value::String(key);
+    }
+    Some(seed)
 }
 
 /// Whether a roll record (as `read_roll` returned it) is a surface roll made
@@ -609,7 +697,7 @@ fn roll_seed(roll: Option<&str>, payload: &Value) -> Option<Value> {
         return None;
     }
     let mut seed = Map::new();
-    for k in ["key", "scope", "reroll", "mode", "register", "poolRevision", "handId", "source"] {
+    for k in ["key", "seed", "scope", "reroll", "mode", "register", "poolRevision", "handId", "source"] {
         if let Some(v) = record.get(k).filter(|v| !v.is_null()) {
             seed.insert(k.into(), v.clone());
         }
@@ -626,8 +714,12 @@ fn roll_seed(roll: Option<&str>, payload: &Value) -> Option<Value> {
 /// stays bound to its own page.
 fn take_roll(qdir: &str, read: Option<&str>, payload: &Value) {
     let Some(read) = read else { return };
-    if payload.get("buildPath").is_some_and(|b| !b.is_null()) && read_roll(qdir).as_deref() == Some(read) {
-        let _ = std::fs::remove_file(roll_file(qdir));
+    if payload.get("buildPath").is_some_and(|b| !b.is_null()) {
+        for path in [roll_local_file(qdir), roll_file(qdir)] {
+            if read_roll_at(&path).as_deref() == Some(read) {
+                let _ = std::fs::remove_file(path);
+            }
+        }
     }
 }
 
@@ -1084,7 +1176,7 @@ fn schema_json() -> Value {
     })
 }
 
-const SCHEMA_NOTE: &str = "\nOption ids return verbatim in ANSWER; \"reroll\" and \"canon\" are reserved. On a direction or surface round (a payload carrying buildPath) every option declares kind, and --start and --update refuse the payload until it does: \"assigned\" on the assigned direction or a surface round\u{2019}s dealt lead, \"pick\" on the IMPECCABLE\u{2019}S PICK card, \"challenger\" on each dealt challenger, \"dealt\" on a surface round\u{2019}s other dealt structures; every challenger also carries catalogId, the SOURCE ID concept-seed printed for that world (never the card\u{2019}s own id), checked against the worlds the roll dealt; canonCard may carry kind \"canon\". The page sends the choice ping from these fields. hero/board/comp accept URLs or local paths; comp slots may point at files that do not exist yet (serve first, generate after; the page polls until they land, so never block serving on generation). hero on a challenger is the inspiration it draws from and renders picture-in-picture beside the comp, never as the promise of the build. verdict routes rendering: \"wins\" and \"competitive\" challengers keep full cards, \"declined\" ones render demoted after them (narrow, quiet, art as a labeled thumb, \"Adopt anyway\"), with their kept line on the front; the page reorders declined cards to the end on its own. raised on the assigned card renders each donation as a named raise line. Salience parity: when the assigned card declares no comp (no image generation this round), catalog art on every card demotes to a labeled thumb, so what looks important is the verdict’s call, never rendering luck. canonCard renders the standing exit as a subordinate card with the same anatomy; without it, canon stays a quiet footer action. Include canon only for visual-direction rounds; never present it as your own recommendation. The pick card is a kicker convention, not a field: kicker \"IMPECCABLE’S PICK\" on your top-ranked grounded candidate, one at most, never in the lead slot. Every card gets the full anatomy, challengers, canon, and declined included: thesis, palette, materials, viewport, risk; the seed already hands you each challenger’s system rules, so a card with no palette chips is an authoring gap, not a data gap. Keep thesis and each fact to one short sentence: the card front shows thesis, identity, and a two-line risk, while first viewport and the case read on the card back behind the Details chip, so long facts cost the reader a flip, not the page its scanability. A card with no imagery at all has no back; its full read renders on the front, so a text-only round loses nothing. A card may declare \"html\", a local path to one self-contained HTML file of the first viewport (1440 x 900 by default; \"htmlFrame\": \"390x844\" names a phone or native surface's first screen): the page draws it in the media slot as a skeleton (text under 22px becomes bars, so composition, palette and display type read and the copy does not) once the file lands, polling until it does, counts only a file written after the round was served, and opens the file as written from the expand chip; code-led and image-less rounds use it, a comp face wins over it, and ANSWER carries the picked card's html. A card with neither may declare \"wireframe\" ({\"cols\":12,\"rows\":10,\"regions\":[{\"label\":\"nav rail\",\"x\":0,\"y\":0,\"w\":3,\"h\":10,\"accent\":true}]}): the page draws it as a layout schematic in the media slot; surface-scope rounds use it on code-led builds, it never counts toward salience, and the card keeps its full read on the front. The comp slot carries the card’s full-fidelity direction comp (the legacy key \"sketch\" is accepted as an alias). Comp aspect follows the surface: portrait at device viewport for native or mobile-first surfaces, landscape otherwise; the page adapts its cards to either. reroll accepts true or { \"registers\": [\"safer\", \"bolder\"] }: the register buttons steer the next hand along the familiar-to-bold axis, the answer carries \"register\", and you re-run concept-seed with --register <value> for the next round; offer the registers on direction rounds, and never pre-select one. buildPath rides the payload as { \"value\": \"comp\"|\"code\", \"toggle\": true }: the value is the recorded default (.impeccable/config.json buildPath, or .impeccable/config.local.json where one machine differs) and the toggle renders a footer switch whose flip binds that session only; the ANSWER then carries buildPath plus buildPathFlipped. On a code-led round each card still declares its comp path as a flip reserve: wireframes render, and a flip to comp makes --wait return once with BUILD PATH FLIPPED so you generate the comps into the declared slots while the round stays open; a flip back to code is free, and a comp that already landed stays as the critique reference. The toggle may only be offered when image generation exists: a harness with no image tool and no API key never sets toggle: true, so the choice never renders where comps cannot be made, and code-led simply rides as the untoggleable value. followup: true keeps the table open after a pick for a second round via --update; send the next payload immediately, the page is waiting on it.";
+const SCHEMA_NOTE: &str = "\nOption ids return verbatim in ANSWER; \"reroll\" and \"canon\" are reserved. On a direction or surface round (a payload carrying buildPath) every option declares kind, and --start and --update refuse the payload until it does: \"assigned\" on the assigned direction or a surface round\u{2019}s dealt lead, \"pick\" on the IMPECCABLE\u{2019}S PICK card, \"challenger\" on each dealt challenger, \"grounded\" on any other direction of your own (a safer round\u{2019}s lineup, any number), \"dealt\" on a surface round\u{2019}s other dealt structures; every challenger also carries catalogId, the SOURCE ID concept-seed printed for that world (never the card\u{2019}s own id), checked against the worlds the roll dealt; canonCard may carry kind \"canon\". The page sends the choice ping from these fields. hero/board/comp accept URLs or local paths; comp slots may point at files that do not exist yet (serve first, generate after; the page polls until they land, so never block serving on generation). hero on a challenger is the inspiration it draws from and renders picture-in-picture beside the comp, never as the promise of the build. verdict routes rendering: \"wins\" and \"competitive\" challengers keep full cards, \"declined\" ones render demoted after them (narrow, quiet, art as a labeled thumb, \"Adopt anyway\"), with their kept line on the front; the page reorders declined cards to the end on its own. raised on the assigned card renders each donation as a named raise line. Salience parity: when the assigned card declares no comp (no image generation this round), catalog art on every card demotes to a labeled thumb, so what looks important is the verdict’s call, never rendering luck. canonCard renders the standing exit as a subordinate card with the same anatomy; without it, canon stays a quiet footer action. Include canon only for visual-direction rounds; never present it as your own recommendation. The pick card is a kicker convention, not a field: kicker \"IMPECCABLE’S PICK\" on your top-ranked grounded candidate, one at most, never in the lead slot. Every card gets the full anatomy, challengers, canon, and declined included: thesis, palette, materials, viewport, risk; the seed already hands you each challenger’s system rules, so a card with no palette chips is an authoring gap, not a data gap. Keep thesis and each fact to one short sentence: the card front shows thesis, identity, and a two-line risk, while first viewport and the case read on the card back behind the Details chip, so long facts cost the reader a flip, not the page its scanability. A card with no imagery at all has no back; its full read renders on the front, so a text-only round loses nothing. A card may declare \"html\", a local path to one self-contained HTML file of the first viewport (1440 x 900 by default; \"htmlFrame\": \"390x844\" names a phone or native surface's first screen): the page draws it in the media slot as a skeleton (text under 22px becomes bars, so composition, palette and display type read and the copy does not) once the file lands, polling until it does, counts only a file written after the round was served, and opens the file as written from the expand chip; code-led and image-less rounds use it, a comp face wins over it, and ANSWER carries the picked card's html. A card with neither may declare \"wireframe\" ({\"cols\":12,\"rows\":10,\"regions\":[{\"label\":\"nav rail\",\"x\":0,\"y\":0,\"w\":3,\"h\":10,\"accent\":true}]}): the page draws it as a layout schematic in the media slot; surface-scope rounds use it on code-led builds, it never counts toward salience, and the card keeps its full read on the front. The comp slot carries the card’s full-fidelity direction comp (the legacy key \"sketch\" is accepted as an alias). Comp aspect follows the surface: portrait at device viewport for native or mobile-first surfaces, landscape otherwise; the page adapts its cards to either. reroll accepts true or { \"registers\": [\"safer\", \"bolder\"] }: the register buttons steer the next hand along the familiar-to-bold axis, the answer carries \"register\", and you re-run concept-seed with --register <value> for the next round; offer the registers on direction rounds, and never pre-select one. buildPath rides the payload as { \"value\": \"comp\"|\"code\", \"toggle\": true }: the value is the recorded default (.impeccable/config.json buildPath, or .impeccable/config.local.json where one machine differs) and the toggle renders a footer switch whose flip binds that session only; the ANSWER then carries buildPath plus buildPathFlipped. On a code-led round each card still declares its comp path as a flip reserve: wireframes render, and a flip to comp makes --wait return once with BUILD PATH FLIPPED so you generate the comps into the declared slots while the round stays open; a flip back to code is free, and a comp that already landed stays as the critique reference. The toggle may only be offered when image generation exists: a harness with no image tool and no API key never sets toggle: true, so the choice never renders where comps cannot be made, and code-led simply rides as the untoggleable value. followup: true keeps the table open after a pick for a second round via --update; send the next payload immediately, the page is waiting on it.";
 
 /// JS: Number(arg('timeout','900')) etc.
 fn js_number_arg(a: &Args, name: &str, fallback: &str) -> f64 {
@@ -1285,7 +1377,7 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
         // A delivered round is always a new hand. Recorded before delivery:
         // on failure the page keeps the previous round, whose hand file is
         // untouched, so nothing is served without its provenance.
-        let hand = new_hand_dealt(&cwd, &next_round, &dealt_worlds(roll.as_deref(), &next_round), roll_seed(roll.as_deref(), &next_round));
+        let hand = new_hand_dealt(&cwd, &next_round, &dealt_worlds(roll.as_deref(), &next_round), seed_with_key(roll_seed(roll.as_deref(), &next_round), &env, &cwd));
         if let Err(e) = write_hand(&qdir, &key, &hand) {
             io.err(&format!("serve-question: could not record the hand ({}); nothing was delivered. Make .impeccable/questions/ writable and rerun --update on the same key.\n", e));
             return 1;
@@ -1326,7 +1418,7 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
         let _ = std::fs::create_dir_all(&qdir);
         ignore_questions_dir(&qdir);
         let key = a.arg("key").unwrap_or_else(random_key);
-        let hand = match start_hand(&qdir, &key, &cwd, &start_payload, &dealt_worlds(roll.as_deref(), &start_payload), roll_seed(roll.as_deref(), &start_payload)) {
+        let hand = match start_hand(&qdir, &key, &cwd, &start_payload, &dealt_worlds(roll.as_deref(), &start_payload), seed_with_key(roll_seed(roll.as_deref(), &start_payload), &env, &cwd)) {
             Ok(h) => h,
             Err(e) => {
                 io.err(&format!("serve-question: could not record the hand ({}); the page was not served. Make .impeccable/questions/ writable and rerun --start.\n", e));
@@ -1396,6 +1488,9 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
             return 1;
         }
         let state = read_state(&qdir, &key).unwrap_or_default();
+        if let Some(notice) = tracked_runtime_notice(&cwd) {
+            io.out(&notice);
+        }
         io.out(&format!("QUESTION URL: {}\n", state.get("url").map(js_str).unwrap_or_default()));
         io.out(&format!("QUESTION KEY: {}\n", key));
         io.out("Open the URL for the user now: in-app browser when the harness has one, otherwise the system opener (macOS `open`, Linux `xdg-open`), otherwise show the URL.\n");
@@ -1702,9 +1797,9 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
             // The choice ping, sent by the page itself when the hand took an
             // API-dealt roll (`picker_choice`): the chosen card, or the hand
             // rejected by a re-roll.
-            // The round is marked sent before the answer is written, so the
-            // agent's `--kind` rerun, which only runs once it has the answer,
-            // finds the mark and sends nothing.
+            // The round is claimed (pending) before the answer is written, so
+            // the agent's `--kind` rerun, which only runs once it has the
+            // answer, waits for this send and sends itself only if it fails.
             let picker_ping = if crate::telemetry::telemetry_disabled(&env, &st.cwd) {
                 None
             } else {
@@ -1714,7 +1809,11 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
                     .filter(|h| h.get("digest").and_then(Value::as_str) == Some(hand_digest(&st.payload).as_str()))
                     .and_then(|h| h.get("seed").cloned())
                     .and_then(|seed| crate::telemetry::picker_choice(&seed, &st.payload, option_id.as_str().unwrap_or(""), ans.get("register").and_then(Value::as_str)))
-                    .filter(|p| crate::telemetry::mark_recorded(&st.cwd, p.key.as_deref().unwrap_or(""), p.reroll.unwrap_or(0), "picker"))
+                    .and_then(|mut p| {
+                        let round = crate::telemetry::Ledger::new(&env, &st.cwd).claim(p.key.as_deref().unwrap_or(""), p.reroll.unwrap_or(0))?;
+                        p.ping_id = round.ping_id;
+                        Some(p)
+                    })
             };
             let was_awaiting = st.awaiting_next;
             st.awaiting_next = (is_reroll || followup_open) && st.detached_key.is_some();
@@ -1735,8 +1834,12 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
             let ping_thread = picker_ping.map(|ping| {
                 let (env, cwd) = (env.clone(), st.cwd.clone());
                 std::thread::spawn(move || {
-                    if !crate::telemetry::send_choice(&env, &cwd, &ping, crate::telemetry::api_timeout(&env)) {
-                        crate::telemetry::unmark_recorded(&cwd, ping.key.as_deref().unwrap_or(""), ping.reroll.unwrap_or(0), "picker");
+                    let ledger = crate::telemetry::Ledger::new(&env, &cwd);
+                    let (key, reroll) = (ping.key.clone().unwrap_or_default(), ping.reroll.unwrap_or(0));
+                    if crate::telemetry::send_choice(&env, &cwd, &ping, crate::telemetry::api_timeout(&env)) {
+                        ledger.confirm(&key, reroll, "picker");
+                    } else {
+                        ledger.release(&key, reroll);
                     }
                 })
             });
@@ -3778,7 +3881,7 @@ mod tests {
         let _ = std::fs::remove_file(qdir.join("pk.state.json"));
         std::fs::write(dir.join("payload.json"), payload.to_string()).unwrap();
         let home = dir.join("home").to_string_lossy().into_owned();
-        let mut env = Env::from([("IMPECCABLE_SELF".to_string(), "impeccable".to_string()), ("HOME".to_string(), home.clone()), ("USERPROFILE".to_string(), home)]);
+        let mut env = Env::from([("IMPECCABLE_SELF".to_string(), "impeccable".to_string()), ("IMPECCABLE_SEED_SALT".to_string(), "test-salt".to_string()), ("HOME".to_string(), home.clone()), ("USERPROFILE".to_string(), home)]);
         for (k, v) in extra_env {
             env.insert(k.to_string(), v.to_string());
         }
@@ -3822,12 +3925,14 @@ mod tests {
         });
         let round = |n: usize| crate::telemetry::SeedRound { scope: "direction".into(), reroll: n, mode: Some("persuade".into()), pool_revision: Some("0123456789ab".into()), dealt: vec!["teletext-service".into(), "microfiche-reader".into()], ..Default::default() };
         // What concept-seed leaves after an API roll, then what --start does with it.
+        let ledger = crate::telemetry::Ledger::new(&Env::from([("IMPECCABLE_SEED_SALT".to_string(), "test-salt".to_string())]), &cwd);
         let deal = |n: usize| {
-            record_roll(&cwd, "direction", "seed-1", n, worlds.as_array().unwrap(), Some(&ApiRoll { mode: Some("persuade"), register: None, pool_revision: Some("0123456789ab"), hand_id: Some("00112233445566778899aabbccddeeff") }));
-            crate::telemetry::record_seed_round(&cwd, "seed-1", &round(n));
+            ledger.record_key("seed-1");
+            record_roll(&cwd, "direction", &ledger.reference("seed-1"), n, worlds.as_array().unwrap(), Some(&ApiRoll { mode: Some("persuade"), register: None, pool_revision: Some("0123456789ab"), hand_id: Some("00112233445566778899aabbccddeeff") }));
+            ledger.record_round("seed-1", &round(n));
             let roll = read_roll(&qdir);
             let _ = std::fs::remove_file(hand_file(&qdir, "pk"));
-            let seed = roll_seed(roll.as_deref(), &payload);
+            let seed = seed_with_key(roll_seed(roll.as_deref(), &payload), &Env::from([("IMPECCABLE_SEED_SALT".to_string(), "test-salt".to_string())]), &cwd);
             assert!(seed.is_some());
             start_hand(&qdir, "pk", &cwd, &payload, &dealt_worlds(roll.as_deref(), &payload), seed).unwrap();
         };
@@ -3838,36 +3943,71 @@ mod tests {
         let got = seen.lock().unwrap().clone();
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0].0, format!("impeccable/{}+engine test", env!("CARGO_PKG_VERSION")));
-        assert_eq!(got[0].1, r#"{"chosenId":"teletext-service","key":"seed-1","scope":"direction","mode":"persuade","kind":"challenger","option":1,"reroll":0,"poolRevision":"0123456789ab","handId":"00112233445566778899aabbccddeeff","kindSource":"explicit","source":"picker"}"#);
-        assert_eq!(crate::telemetry::read_seed_round(&cwd, "seed-1", Some(0)).unwrap().recorded.as_deref(), Some("picker"));
+        let r0 = ledger.round("seed-1", Some(0)).unwrap();
+        assert_eq!(got[0].1, format!(r#"{{"chosenId":"teletext-service","key":"seed-1","scope":"direction","mode":"persuade","kind":"challenger","option":1,"reroll":0,"poolRevision":"0123456789ab","handId":"00112233445566778899aabbccddeeff","pingId":"{}","kindSource":"explicit","source":"picker"}}"#, r0.ping_id.clone().unwrap()));
+        assert_eq!(r0.recorded.as_deref(), Some("picker"));
         // The agent's rerun for the same round sends nothing.
-        let ping_env = Env::from([("IMPECCABLE_API_URL".to_string(), base.clone())]);
-        let (mut io, cap) = Io::captured("", dir.clone(), ping_env);
-        let argv: Vec<String> = ["--kind", "challenger", "--chosen", "teletext-service", "--from", "seed-1", "--scope", "direction"].iter().map(|s| s.to_string()).collect();
-        assert_eq!(crate::concept_seed::run(&argv, &mut io), 0);
-        assert_eq!(String::from_utf8(cap.stdout.borrow().clone()).unwrap(), "choice already recorded\n");
+        let home = dir.join("home").to_string_lossy().into_owned();
+        let agent = |extra: &[(&str, &str)], args: &[&str]| -> String {
+            let mut e = Env::from([("IMPECCABLE_API_URL".to_string(), base.clone()), ("IMPECCABLE_SEED_SALT".to_string(), "test-salt".to_string()), ("HOME".to_string(), home.clone()), ("USERPROFILE".to_string(), home.clone())]);
+            for (k, v) in extra {
+                e.insert(k.to_string(), v.to_string());
+            }
+            let (mut io, cap) = Io::captured("", dir.clone(), e);
+            let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            assert_eq!(crate::concept_seed::run(&argv, &mut io), 0);
+            let out = String::from_utf8(cap.stdout.borrow().clone()).unwrap();
+            out
+        };
+        assert_eq!(agent(&[], &["--kind", "challenger", "--chosen", "teletext-service", "--from", "seed-1", "--scope", "direction"]), "choice already recorded\n");
         assert_eq!(seen.lock().unwrap().len(), 1);
 
+        // A send still pending: the rerun waits, and a confirmation makes it a no-op.
+        deal(4);
+        ledger.claim("seed-1", 4).unwrap();
+        let confirm = {
+            let cwd = cwd.clone();
+            std::thread::spawn(move || {
+                sleep_ms(300);
+                crate::telemetry::Ledger::new(&Env::from([("IMPECCABLE_SEED_SALT".to_string(), "test-salt".to_string())]), &cwd).confirm("seed-1", 4, "picker");
+            })
+        };
+        assert_eq!(agent(&[], &["--kind", "assigned", "--from", "seed-1", "--scope", "direction", "--reroll", "4"]), "choice already recorded\n");
+        confirm.join().unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        // One that never resolves: past the deadline the rerun sends, under the same pingId.
+        deal(5);
+        let pending = ledger.claim("seed-1", 5).unwrap();
+        assert_eq!(agent(&[("IMPECCABLE_API_TIMEOUT", "300")], &["--kind", "assigned", "--from", "seed-1", "--scope", "direction", "--reroll", "5"]), "choice recorded\n");
+        assert!(seen.lock().unwrap().last().unwrap().1.contains(&format!(r#""pingId":"{}""#, pending.ping_id.unwrap())));
+        assert_eq!(ledger.round("seed-1", Some(5)).unwrap().recorded.as_deref(), Some("agent"));
+
         // Opted out: no ping and no mark, so nothing claims the round.
+        let sent_before = seen.lock().unwrap().len();
         deal(1);
         answer_on_page(&dir, &payload, "assigned", &[("IMPECCABLE_API_URL", &base), ("DO_NOT_TRACK", "1")]);
-        assert_eq!(seen.lock().unwrap().len(), 1);
-        assert_eq!(crate::telemetry::read_seed_round(&cwd, "seed-1", Some(1)).unwrap().recorded, None);
+        assert_eq!(seen.lock().unwrap().len(), sent_before);
+        assert_eq!(ledger.round("seed-1", Some(1)).unwrap().recorded, None);
 
         // A re-roll on the page is the hand rejected, sent once for that round.
         deal(3);
         answer_on_page(&dir, &payload, "reroll", &[("IMPECCABLE_API_URL", &base)]);
         let deadline = now_ms() + 5000.0;
-        while seen.lock().unwrap().len() < 2 && now_ms() < deadline {
+        let sent = seen.lock().unwrap().len();
+        while seen.lock().unwrap().len() == sent && now_ms() < deadline {
             sleep_ms(20);
         }
-        assert_eq!(seen.lock().unwrap().last().unwrap().1, r#"{"key":"seed-1","scope":"direction","mode":"persuade","kind":"reroll","reroll":3,"poolRevision":"0123456789ab","handId":"00112233445566778899aabbccddeeff","kindSource":"explicit","source":"picker"}"#);
-        assert_eq!(crate::telemetry::read_seed_round(&cwd, "seed-1", Some(3)).unwrap().recorded.as_deref(), Some("picker"));
+        while ledger.round("seed-1", Some(3)).unwrap().recorded.as_deref() == Some("pending") && now_ms() < deadline {
+            sleep_ms(20);
+        }
+        let r3 = ledger.round("seed-1", Some(3)).unwrap();
+        assert_eq!(seen.lock().unwrap().last().unwrap().1, format!(r#"{{"key":"seed-1","scope":"direction","mode":"persuade","kind":"reroll","reroll":3,"poolRevision":"0123456789ab","handId":"00112233445566778899aabbccddeeff","pingId":"{}","kindSource":"explicit","source":"picker"}}"#, r3.ping_id.clone().unwrap()));
+        assert_eq!(r3.recorded.as_deref(), Some("picker"));
 
         // A ping that cannot leave the machine clears its mark for the agent's rerun.
         deal(2);
         answer_on_page(&dir, &payload, "assigned", &[("IMPECCABLE_API_URL", "http://127.0.0.1:9/api"), ("IMPECCABLE_API_TIMEOUT", "300")]);
-        assert_eq!(crate::telemetry::read_seed_round(&cwd, "seed-1", Some(2)).unwrap().recorded, None);
+        assert_eq!(ledger.round("seed-1", Some(2)).unwrap().recorded, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3948,9 +4088,9 @@ mod tests {
         assert!(!ignore.exists());
         record_roll(&cwd, "direction", "seed-1", 0, &[], None);
         assert_eq!(std::fs::read_to_string(&ignore).unwrap(), expected);
-        // The roll record's time is floored to the minute.
-        let at = serde_json::from_str::<Value>(&std::fs::read_to_string(qdir.join("roll.json")).unwrap()).unwrap()["at"].as_u64().unwrap();
-        assert_eq!(at % 60_000, 0);
+        // The roll record names its seed by reference and holds no time.
+        let rec: Value = serde_json::from_str(&std::fs::read_to_string(qdir.join("roll.json")).unwrap()).unwrap();
+        assert!(rec.get("at").is_none() && rec.get("key").is_none() && rec["seed"] == "seed-1", "{rec}");
         // A hand write restores it too, and leaves an existing one byte-equal.
         std::fs::remove_file(&ignore).unwrap();
         write_hand(&qdir.to_string_lossy(), "k1", &new_hand(&cwd, &json!({ "options": [{ "id": "a" }] }))).unwrap();
@@ -3964,6 +4104,39 @@ mod tests {
             let listed = String::from_utf8_lossy(&out.stdout).to_string();
             assert!(!listed.contains(".impeccable/questions"), "{listed}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tracked_runtime_files_get_a_one_time_notice_and_the_roll_record_moves_aside() {
+        let dir = temp_project("tracked-runtime");
+        let cwd = dir.to_string_lossy().to_string();
+        let git = |args: &[&str]| std::process::Command::new("git").args(args).current_dir(&dir).output();
+        if !git(&["init", "-q"]).is_ok_and(|o| o.status.success()) {
+            return; // no git on this machine: nothing to check
+        }
+        let qdir = dir.join(".impeccable/questions");
+        // Outside any tracked runtime file there is no notice.
+        assert_eq!(tracked_runtime_notice(&cwd), None);
+        // A project that committed roll.json before the directory ignored itself.
+        std::fs::write(qdir.join("roll.json"), r#"{"scope":"direction","key":"old"}"#).unwrap();
+        git(&["add", "-f", ".impeccable/questions/roll.json"]).unwrap();
+        let notice = tracked_runtime_notice(&cwd).expect("a notice");
+        assert!(notice.starts_with("TRACKED RUNTIME FILES: git already tracks 1 file(s)") && notice.contains("`git rm -r --cached .impeccable/questions`"), "{notice}");
+        assert_eq!(tracked_runtime_notice(&cwd), None, "once per tracked set");
+        // The roll record goes to an untracked name, and the tracked file is left as it was.
+        record_roll(&cwd, "direction", "seed:0123456789abcdef", 0, &[], None);
+        assert_eq!(std::fs::read_to_string(qdir.join("roll.json")).unwrap(), r#"{"scope":"direction","key":"old"}"#);
+        let local = std::fs::read_to_string(qdir.join("roll.local.json")).unwrap();
+        assert!(local.contains("seed:0123456789abcdef"), "{local}");
+        assert!(read_roll(&qdir.to_string_lossy()).unwrap().contains("seed:0123456789abcdef"), "the untracked record wins");
+        let status = git(&["status", "--porcelain", "--untracked-files=all"]).unwrap();
+        assert!(!String::from_utf8_lossy(&status.stdout).contains("roll.local.json"));
+        // Untracked again: the record returns to roll.json and the aside file goes.
+        git(&["rm", "-q", "--cached", ".impeccable/questions/roll.json"]).unwrap();
+        record_roll(&cwd, "direction", "seed:fedcba9876543210", 0, &[], None);
+        assert!(std::fs::read_to_string(qdir.join("roll.json")).unwrap().contains("seed:fedcba9876543210"));
+        assert!(!qdir.join("roll.local.json").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
