@@ -3,6 +3,26 @@
 Fixture: `../antipatterns/hard-offset-shadow.html`. It contains four should-flag
 panels and eight should-pass panels, with explicit sizes and distinct headings.
 
+## Visual verification for reviewers
+
+Open [the PR verification site](https://impeccable-radar.vercel.app/pr/998/).
+No extension installation is needed. The page identifies detector commit
+`a9fb66ad6`; the subsequent readiness update changes documentation only.
+
+1. Open the live fixture: expect four hard-offset advisories in the should-flag
+   column and none for this rule among the eight should-pass controls.
+2. Compare the regular and upset prxps cards at rest and on hover. Use keyboard
+   focus or "Keep hover state visible" on touch screens. These are captured
+   screenshots; recorded scans show 0 → 1 → 0 as the pointer enters and leaves.
+3. Review the Chrome/Firefox panel captures: the findings belong to **Advisories**
+   and should not prescribe automatic fixes. The panel harness uses real WASM
+   findings with stubbed extension APIs; it is not an extension-installation test.
+
+Mager reviewed the prxps examples on October 11, 2026 and supports shipping this
+as a review prompt even though he likes the hover effects. This validates the
+advisory's purpose, not a claim that those effects must be removed or that every
+geometric match is unwanted. Intentional choices can use the existing waivers.
+
 ## Automated gates
 
 - `cargo test -p impeccable-core checks::hard_offset_shadow`: positive/negative
@@ -118,7 +138,8 @@ The route declares these shadows in
 Its [design brief](https://github.com/mager/prxps/blob/281f09669fc227df94c1b4d5c282539500152431/DESIGN.md#L137)
 calls for soft card shadows and physical hover interactions. That makes these
 useful candidates for human review, but does not prove they are unwanted or
-AI-authored. Owner confirmation remains pending. The separate `.input:focus`
+AI-authored. Owner review is recorded above: the effect can be worth questioning
+even when the owner likes it. The separate `.input:focus`
 hard shadow is not counted as unwanted evidence: it has a focus-indication role
 and a dark-scheme override.
 
@@ -176,7 +197,7 @@ The affected live-server sources, cleanup sources, and live-target tests have
 no diff from the base; this PR does not change their behavior or relax assertions.
 Do not run two copies of the live-target suite concurrently: it binds port 8497.
 
-## Limits and calibration before ready
+## Limits and calibration
 
 This rule measures resolved outer box shadows with zero blur, nonnegative spread,
 alpha after element opacity above 0.1, and an offset of at least 4 CSS pixels on
@@ -185,7 +206,12 @@ Unresolved lengths/colors and negative spread remain outside this initial rule.
 It does not scan text-shadow or raw CSS/JS declarations, infer neobrutalist intent,
 or recommend deleting shadows. Static scans cannot establish actual occlusion.
 
-Before enabling this beyond a draft, review real generated-project examples
-against their design briefs as well as intentional neobrutalist examples. The
-synthetic fixture proves the mechanical rule, not precision on unwanted designs.
-Use existing scoped or project ignore mechanisms for intentional uses.
+The prxps owner review and intentional neobrutalist controls support presenting
+this as an advisory, not an automatic correction. The synthetic fixture proves
+the mechanical rule, not precision on unwanted designs. There is no measured
+precision corpus establishing which matches users will want to change. The 4px
+threshold remains open to maintainer calibration. Use existing scoped or project
+ignore mechanisms for intentional uses.
+
+Readiness documentation prepared with AI assistance from OpenAI Codex under
+Mager's direction.
