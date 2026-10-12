@@ -38,11 +38,12 @@ export const ENGINE_MISSING_MESSAGE =
 /** Environment the launcher would export for the binary when run from this repo's skill dir. */
 export function engineEnv(bin, extra = {}) {
   return {
-    // Any roll API request a test makes is tagged as test traffic.
-    IMPECCABLE_TELEMETRY_CHANNEL: 'test',
     ...process.env,
     IMPECCABLE_SKILL_DIR: path.join(REPO_ROOT, 'skill'),
     IMPECCABLE_SELF: bin,
     ...extra,
+    // Any roll API request a test makes is tagged as test traffic. Set last,
+    // so neither the shell nor a test's extras can untag it.
+    IMPECCABLE_TELEMETRY_CHANNEL: 'test',
   };
 }

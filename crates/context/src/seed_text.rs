@@ -107,3 +107,5 @@ pub const WAIT_NOW: &str = "Right after serving, with no comp to generate first,
 pub const PRESENT_FALLBACK: &str = "- The structured question tool is the fallback, never the first channel: take it when --start exits 2, when --wait exits 4 after the page closed unanswered, or when your harness cannot hold a blocking --wait at all (say so in your first reply). It carries the same options and asks nothing about the build path.";
 
 pub const SEED_REFERENCE: &str = "SEED REFERENCE: @@REFERENCE@@. Write this, never the key, wherever the seed is recorded (the surface brief's FORM line, build-phase start --direction); on this machine --from accepts it in place of the key.\n";
+
+pub const SEED_REFERENCE_UNAVAILABLE: &str = "SEED REFERENCE: unavailable on this machine (no seed salt could be kept in ~/.impeccable/ or .impeccable/questions/). Record no seed: write `seed: none (unavailable)` on the surface brief's FORM line and pass --direction none to build-phase start; never write the key.\n";

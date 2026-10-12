@@ -121,17 +121,19 @@ fn save_state(io: &Io, state: &Value) {
 }
 
 /// The seed reference the state records for `--direction`: a reference
-/// (`seed:` + 16 lowercase hex) as given, a raw seed key as its reference
-/// under this user's salt (`impeccable_common::seed`, the same one
-/// concept-seed prints), so the build state never holds the key the roll
-/// API saw. The direction is only ever shown, never resolved, so nothing is
-/// lost.
+/// (`seed:` + 16 lowercase hex) or `none` as given, a raw seed key as its
+/// reference under this user's salt (`impeccable_common::seed`, the same
+/// one concept-seed prints), so the build state never holds the key the roll
+/// API saw. With no salt on this machine a raw key becomes `none`: there is
+/// no reference to give, and never an unsalted one. The direction is only
+/// ever shown, never resolved, so nothing is lost.
 fn seed_reference(io: &Io, v: &str) -> String {
-    if impeccable_common::seed::parse_reference(v).is_some() {
+    if v == "none" || impeccable_common::seed::parse_reference(v).is_some() {
         return v.to_string();
     }
-    let salt = impeccable_common::seed::salt(&io.home().map(|h| h.to_string_lossy().into_owned()).unwrap_or_default(), io.env("IMPECCABLE_SEED_SALT").as_deref());
-    impeccable_common::seed::reference(&salt, v)
+    let home = io.home().map(|h| h.to_string_lossy().into_owned()).unwrap_or_default();
+    let salt = impeccable_common::seed::salt(&home, Some(&io.cwd.to_string_lossy()), io.env("IMPECCABLE_SEED_SALT"));
+    salt.map(|s| impeccable_common::seed::reference(&s, v)).unwrap_or_else(|| "none".to_string())
 }
 
 fn new_state(comp: Option<&str>, breakpoint: Option<&str>, artifact: Option<&str>, direction: Option<&str>) -> Value {
@@ -2983,6 +2985,13 @@ mod transparency_guidance_tests {
         assert_eq!(seed_reference(&pinned, "seed:0123456789abcdef"), "seed:0123456789abcdef");
         let r = seed_reference(&pinned, "3f9a1c2e");
         assert_eq!(r, impeccable_common::seed::reference("test-salt", "3f9a1c2e"), "the reference concept-seed prints");
+        assert_eq!(seed_reference(&pinned, "none"), "none");
+        // No salt on this machine: a raw key is recorded as no seed, never as an unsalted hash.
+        let bad_home = dir.join("bad-home");
+        std::fs::create_dir_all(bad_home.join(".impeccable")).unwrap();
+        std::fs::write(bad_home.join(".impeccable/seed-salt"), "corrupt").unwrap();
+        let (nosalt, _) = Io::captured("", dir.clone(), [("HOME".to_string(), bad_home.to_string_lossy().into_owned()), ("USERPROFILE".to_string(), bad_home.to_string_lossy().into_owned())].into_iter().collect());
+        assert_eq!(seed_reference(&nosalt, "3f9a1c2e"), "none");
         assert!(r.starts_with("seed:") && r.len() == 21 && !r.contains("3f9a1c2e"), "{r}");
         save_state(&io, &new_state(None, None, None, Some("seed-1")));
         let ignore = dir.join(".impeccable/build/.gitignore");
@@ -3401,7 +3410,7 @@ pub fn run_with_renderer(argv: &[String],io: &mut Io,organic_scan: OrganicScan,r
             return 1;
         }
         if comp.is_none() && direction.is_none() {
-            io.err("build-phase: start needs --comp <approved comp png> (comp already approved) or --direction <seed key> (comp round still to run)\n");
+            io.err("build-phase: start needs --comp <approved comp png> (comp already approved) or --direction <seed reference, or none> (comp round still to run)\n");
             return 1;
         }
         if let Some(c) = comp {

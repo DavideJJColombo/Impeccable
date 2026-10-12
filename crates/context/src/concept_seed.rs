@@ -284,7 +284,7 @@ fn ping_chosen(env: &Env, cwd: &str, budget: &mut ApiBudget, a: &PingArgs) -> Pi
         return PingOutcome::Skipped;
     }
     if let (Some(k), Some(r)) = (key, &round) {
-        ledger.confirm(k, r.reroll, "agent");
+        ledger.confirm(k, r.reroll, "agent", r.ping_id.as_deref());
     }
     PingOutcome::Sent
 }
@@ -421,7 +421,10 @@ fn render_concept_seed(env: &Env, cwd: &str, budget: &mut ApiBudget, a: &SeedArg
     // PRESENTATION closes every roll, where a middle-truncated read still
     // reaches it, like the restated lines above it.
     let register = a.register.clone().flatten();
-    let reference = fill(t::SEED_REFERENCE, &[("REFERENCE", &telemetry::Ledger::new(env, cwd).reference(&a.key))]);
+    let reference = match telemetry::Ledger::new(env, cwd).reference(&a.key) {
+        Some(r) => fill(t::SEED_REFERENCE, &[("REFERENCE", &r)]),
+        None => t::SEED_REFERENCE_UNAVAILABLE.to_string(),
+    };
     Ok((roll + &reference + &presentation_block(env, cwd, scope, reroll, degraded, register.as_deref(), a.mode.clone().flatten().as_deref(), a.build_path.as_ref()), meta))
 }
 
@@ -682,6 +685,30 @@ pub fn run(args: &[String], io: &mut Io) -> i32 {
     // args[idx+1] may be undefined -> None
     let val = |name: &str| -> Option<Option<String>> { idx(name).map(|i| args.get(i + 1).cloned()) };
     let mut budget = ApiBudget::new(&env);
+    // `--check-seed <reference>`: whether this machine rolled that seed, so a
+    // reviewer can corroborate a brief's FORM line against the local ledger.
+    if let Some(v) = val("--check-seed") {
+        let v = v.unwrap_or_default();
+        if v == "none" {
+            let available = telemetry::seed_salt(&env, &cwd).is_some();
+            io.out(if available { "SEED NONE: this machine can make seed references, so a brief written here records one; `none` means the roll was skipped.\n" } else { "SEED NONE ACCEPTED: this machine has no seed salt, so no reference can exist and the brief rightly records none.\n" });
+            return if available { 1 } else { 0 };
+        }
+        if impeccable_common::seed::parse_reference(&v).is_none() {
+            io.out("SEED UNKNOWN: not a seed reference (`seed:` and 16 hex). A raw key never belongs in a brief.\n");
+            return 1;
+        }
+        return match telemetry::Ledger::new(&env, &cwd).resolve(&v) {
+            Ok(_) => {
+                io.out(&format!("SEED KNOWN: {} was rolled on this machine.\n", v));
+                0
+            }
+            Err(_) => {
+                io.out(&format!("SEED UNKNOWN: {} was not rolled on this machine (or its record is gone); corroborate it against the roll output instead.\n", v));
+                1
+            }
+        };
+    }
     let chosen = val("--chosen");
     let kind = val("--kind");
     if chosen.is_some() || kind.is_some() || idx("--option").is_some() {
@@ -759,7 +786,7 @@ pub fn run(args: &[String], io: &mut Io) -> i32 {
             let tracked = meta.api && !telemetry::telemetry_disabled(&env, &cwd);
             ledger.record_key(&seed.key);
             let api = tracked.then(|| crate::serve_question::ApiRoll { mode: mode.as_deref(), register: register.as_deref(), pool_revision: meta.pool_revision.as_deref(), hand_id: meta.hand_id.as_deref() });
-            crate::serve_question::record_roll(&cwd, scope, &ledger.reference(&seed.key), seed.reroll as usize, &meta.worlds, api.as_ref());
+            crate::serve_question::record_roll(&cwd, scope, ledger.reference(&seed.key).as_deref(), seed.reroll as usize, &meta.worlds, api.as_ref());
             // An API-dealt round also enters the seed ledger, which outlives
             // the roll record, for the choice ping that follows the round.
             if tracked {
@@ -936,7 +963,7 @@ mod tests {
         let (code, out) = seed(&proj, &skill, true, &["--scope", "direction", "--mode", "persuade", "--from", "k1"]);
         assert_eq!(code, 0, "{out}");
         let block = presentation(&out);
-        let reference = tl(&proj).reference("k1");
+        let reference = tl(&proj).reference("k1").unwrap();
         assert!(out.contains(&format!("seed key k1.\nSEED REFERENCE: {reference}. Write this, never the key, wherever the seed is recorded (the surface brief's FORM line, build-phase start --direction); on this machine --from accepts it in place of the key.\nPRESENTATION (the decision round, condensed from new-work.md;")), "the reference, then the block, follow the restated line: {out}");
         let lines: Vec<&str> = block.trim_end().split('\n').collect();
         assert_eq!(lines.len(), 6, "{block}");
@@ -1095,7 +1122,7 @@ mod tests {
         assert_eq!(code, 0);
         let r = read();
         // The record names the roll by its seed reference, never its key, and holds no time.
-        let k1 = tl(&proj).reference("k1");
+        let k1 = tl(&proj).reference("k1").unwrap();
         assert_eq!((r["scope"].as_str(), r["seed"].as_str(), r["reroll"].as_u64()), (Some("surface"), Some(k1.as_str()), Some(0)));
         assert!(r.get("key").is_none() && r.get("at").is_none(), "{r}");
         // The record names every challenger the roll printed, with the same
@@ -1115,7 +1142,7 @@ mod tests {
         let (code, _) = seed(&proj, &skill, false, &["--scope", "direction", "--from", "k2", "--reroll", "1"]);
         assert_eq!(code, 0);
         let r = read();
-        let k2 = tl(&proj).reference("k2");
+        let k2 = tl(&proj).reference("k2").unwrap();
         assert_eq!((r["scope"].as_str(), r["seed"].as_str(), r["reroll"].as_u64()), (Some("direction"), Some(k2.as_str()), Some(1)));
         // A degraded roll dealt no world: the record keeps its old shape.
         assert!(r.get("worlds").is_none(), "{r}");
@@ -1255,7 +1282,7 @@ mod tests {
         let (proj, skill) = fixture("seed-reference", &[("mode-persuade", MODE_FILE)]);
         let (base, seen) = roll_api();
         let first = seed_api(&proj, &skill, &base, &["--scope", "direction", "--mode", "persuade", "--from", "3f9a1c2e"]);
-        let reference = tl(&proj).reference("3f9a1c2e");
+        let reference = tl(&proj).reference("3f9a1c2e").unwrap();
         assert!(first.contains(&format!("SEED REFERENCE: {reference}.")), "{first}");
         // The reference reproduces the same deal and asks the API with the real key.
         let again = seed_api(&proj, &skill, &base, &["--scope", "direction", "--mode", "persuade", "--from", &reference]);
@@ -1272,7 +1299,7 @@ mod tests {
             ("HOME".into(), proj.join("home").to_string_lossy().into_owned()),
         ]);
         let (mut io, cap) = Io::captured("", proj.clone(), env);
-        let unknown = tl(&proj).reference("elsewhere");
+        let unknown = tl(&proj).reference("elsewhere").unwrap();
         let argv: Vec<String> = ["--scope", "direction", "--from", unknown.as_str()].iter().map(|s| s.to_string()).collect();
         assert_eq!(run(&argv, &mut io), 1);
         let err = String::from_utf8(cap.stderr.borrow().clone()).unwrap();
@@ -1298,11 +1325,54 @@ mod tests {
         let record: Value = serde_json::from_str(&std::fs::read_to_string(proj.join(".impeccable/questions/roll.json")).unwrap()).unwrap();
         assert!(record.get("poolRevision").is_none() && record.get("source").is_none(), "{record}");
         assert_eq!(tl(&proj).round("k1", None), None);
-        assert_eq!(tl(&proj).resolve(&tl(&proj).reference("k1")).unwrap(), "k1");
+        assert_eq!(tl(&proj).resolve(&tl(&proj).reference("k1").unwrap()).unwrap(), "k1");
         assert_eq!(seed_api(&proj, &skill, &base, &["--kind", "assigned", "--from", "k1", "--scope", "direction"]), "choice ping skipped\n");
         assert!(chosen_bodies(&seen).is_empty());
         // DO_NOT_TRACK=0 is not an opt-out.
         std::fs::remove_file(home.join(".impeccable/config.json")).unwrap();
         assert!(!telemetry::telemetry_disabled(&Env::from([("DO_NOT_TRACK".into(), "0".into()), ("HOME".into(), home.to_string_lossy().into_owned())]), &proj.to_string_lossy()));
+    }
+
+    #[test]
+    fn without_a_salt_the_roll_offers_no_reference_and_records_no_seed() {
+        let (proj, skill) = fixture("no-salt", &[("mode-persuade", MODE_FILE)]);
+        let home = proj.join("home");
+        std::fs::create_dir_all(home.join(".impeccable")).unwrap();
+        std::fs::write(home.join(".impeccable/seed-salt"), "corrupt\n").unwrap();
+        let env = Env::from([
+            ("IMPECCABLE_SKILL_DIR".into(), skill.to_string_lossy().into_owned()),
+            ("IMPECCABLE_CATALOG_DIR".into(), std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/concept-catalog").to_string_lossy().into_owned()),
+            ("IMPECCABLE_API_URL".into(), "http://127.0.0.1:9/api".into()),
+            ("IMPECCABLE_NO_TELEMETRY".into(), "1".into()),
+            ("IMPECCABLE_NO_STALENESS_CHECK".into(), "1".into()),
+            ("HOME".into(), home.to_string_lossy().into_owned()),
+            ("USERPROFILE".into(), home.to_string_lossy().into_owned()),
+        ]);
+        let (mut io, cap) = Io::captured("", proj.clone(), env);
+        let argv: Vec<String> = ["--scope", "direction", "--from", "k1"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(run(&argv, &mut io), 0);
+        let out = String::from_utf8(cap.stdout.borrow().clone()).unwrap();
+        assert!(out.contains("SEED REFERENCE: unavailable on this machine") && out.contains("`seed: none (unavailable)`") && !out.contains("SEED REFERENCE: seed:"), "{out}");
+        let record: Value = serde_json::from_str(&std::fs::read_to_string(proj.join(".impeccable/questions/roll.json")).unwrap()).unwrap();
+        assert!(record.get("seed").is_none() && record.get("key").is_none(), "{record}");
+    }
+
+    #[test]
+    fn check_seed_corroborates_a_reference_against_this_machine() {
+        let (proj, skill) = fixture("check-seed", &[("mode-persuade", MODE_FILE)]);
+        let check = |v: &str| {
+            let env = Env::from([("IMPECCABLE_SEED_SALT".into(), "test-salt".into()), ("HOME".into(), proj.join("home").to_string_lossy().into_owned())]);
+            let (mut io, cap) = Io::captured("", proj.clone(), env);
+            let code = run(&["--check-seed".to_string(), v.to_string()], &mut io);
+            let out = String::from_utf8(cap.stdout.borrow().clone()).unwrap();
+            (code, out)
+        };
+        let reference = tl(&proj).reference("k1").unwrap();
+        assert_eq!(check(&reference).0, 1, "not rolled yet");
+        seed(&proj, &skill, true, &["--scope", "direction", "--from", "k1"]);
+        let (code, out) = check(&reference);
+        assert_eq!((code, out.starts_with("SEED KNOWN")), (0, true), "{out}");
+        assert!(check("k1").1.starts_with("SEED UNKNOWN: not a seed reference"));
+        assert_eq!(check("none").0, 1, "a salt exists here, so none means skipped");
     }
 }

@@ -325,7 +325,6 @@ function buildInvocation(c, { impl, bin, ws, isolatedHome }) {
     IMPECCABLE_NO_UPDATE_CHECK: '1',
     IMPECCABLE_NO_TELEMETRY: '1',
     DO_NOT_TRACK: '1',
-    IMPECCABLE_TELEMETRY_CHANNEL: 'test',
     // Seed references are salted per user; a pinned salt keeps goldens stable.
     IMPECCABLE_SEED_SALT: 'oracle',
     ...(c.isolateHome === false ? {} : { HOME: isolatedHome, USERPROFILE: isolatedHome }),
@@ -333,6 +332,8 @@ function buildInvocation(c, { impl, bin, ws, isolatedHome }) {
     ...(impl === 'bin' ? { IMPECCABLE_SKILL_DIR: path.join(REPO_ROOT, 'skill'), IMPECCABLE_SELF: bin } : {}),
     ...Object.fromEntries(Object.entries(c.env || {}).map(([k, v]) => [k, v == null ? v : sub(v)])),
   };
+  // Tagged as test traffic last, so neither the shell nor a case can untag it.
+  env.IMPECCABLE_TELEMETRY_CHANNEL = 'test';
   for (const [k, v] of Object.entries(env)) if (v == null) delete env[k];
   const stdin = typeof c.stdin === 'string' ? sub(c.stdin) : c.stdin != null ? sub(JSON.stringify(c.stdin)) : '';
   return { argv, cwd, env, stdin };

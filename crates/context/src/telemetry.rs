@@ -82,7 +82,7 @@ pub fn opt_out_reason(env: &Env, cwd: &str) -> Option<String> {
     }
     let user = user_config_path(env);
     if config_says_off(&user) {
-        return Some(format!("\"telemetry\": false in {}", user));
+        return Some(format!("\"telemetry\": false in {}", impeccable_common::jsp::to_posix(&user)));
     }
     // The project config is read where `context` reads its defaults: the
     // working directory, the resolved project root, then the repo root.
@@ -101,8 +101,10 @@ pub fn opt_out_reason(env: &Env, cwd: &str) -> Option<String> {
         for name in ["config.local.json", "config.json"] {
             let p = jsp::join(&[root, ".impeccable", name]);
             if config_says_off(&p) {
+                // Shown with forward slashes on every platform, like every
+                // path the engine prints.
                 let shown = jsp::relative(cwd, cwd, &p);
-                return Some(format!("\"telemetry\": false in {}", if shown.is_empty() { p.clone() } else { shown }));
+                return Some(format!("\"telemetry\": false in {}", impeccable_common::jsp::to_posix(if shown.is_empty() { &p } else { &shown })));
             }
         }
     }
@@ -188,8 +190,10 @@ impl SeedRound {
 }
 
 /// The salt seed references are computed under (`impeccable_common::seed`).
-pub fn seed_salt(env: &Env) -> String {
-    impeccable_common::seed::salt(&crate::util::homedir(env), env.get("IMPECCABLE_SEED_SALT").map(String::as_str))
+/// `None` when no valid salt can be persisted on this machine: then there
+/// is no seed reference at all, never an unsalted one.
+pub fn seed_salt(env: &Env, cwd: &str) -> Option<String> {
+    impeccable_common::seed::salt(&crate::util::homedir(env), Some(cwd), env.get("IMPECCABLE_SEED_SALT").map(String::as_str))
 }
 
 /// The seed ledger of one project directory: `.impeccable/questions/seeds/
@@ -201,7 +205,7 @@ pub fn seed_salt(env: &Env) -> String {
 /// other's writes.
 pub struct Ledger {
     cwd: String,
-    salt: String,
+    salt: Option<String>,
 }
 
 /// Ledger rounds older than this are pruned when a ledger is written; the
@@ -271,7 +275,7 @@ fn round_from(v: &Value, reroll: usize) -> SeedRound {
 
 impl Ledger {
     pub fn new(env: &Env, cwd: &str) -> Ledger {
-        Ledger { cwd: cwd.to_string(), salt: seed_salt(env) }
+        Ledger { cwd: cwd.to_string(), salt: seed_salt(env, cwd) }
     }
 
     fn dir(&self) -> String {
@@ -283,12 +287,15 @@ impl Ledger {
     }
 
     fn file(&self, key: &str) -> String {
-        self.file_for_tag(&impeccable_common::seed::tag(&self.salt, key))
+        // Without a salt there are no references to resolve; the file still
+        // needs a name, which only this ignored folder ever sees.
+        self.file_for_tag(&impeccable_common::seed::tag(self.salt.as_deref().unwrap_or("no-salt:local-ledger-name"), key))
     }
 
-    /// The seed reference committed files record instead of `key`.
-    pub fn reference(&self, key: &str) -> String {
-        impeccable_common::seed::reference(&self.salt, key)
+    /// The seed reference committed files record instead of `key`, or `None`
+    /// when this machine has no salt (`seed_salt`).
+    pub fn reference(&self, key: &str) -> Option<String> {
+        self.salt.as_deref().map(|s| impeccable_common::seed::reference(s, key))
     }
 
     fn read_file(path: &str) -> Option<Map<String, Value>> {
@@ -325,9 +332,10 @@ impl Ledger {
     /// names a reference this machine has no record of.
     pub fn resolve(&self, v: &str) -> Result<String, String> {
         let Some(tag) = impeccable_common::seed::parse_reference(v) else { return Ok(v.to_string()) };
+        let Some(salt) = self.salt.as_deref() else { return Err(v.to_string()) };
         Self::read_file(&self.file_for_tag(tag))
             .and_then(|l| l.get("key").and_then(Value::as_str).map(str::to_string))
-            .filter(|k| impeccable_common::seed::tag(&self.salt, k) == tag)
+            .filter(|k| impeccable_common::seed::tag(salt, k) == tag)
             .ok_or_else(|| v.to_string())
     }
 
@@ -409,19 +417,30 @@ impl Ledger {
         .flatten()
     }
 
-    /// A confirmed send by `by`: the round's later reruns are no-ops.
-    pub fn confirm(&self, key: &str, reroll: usize, by: &str) {
+    /// Whether a completion for the report `ping_id` still belongs to this
+    /// round: a reproduced round gets a new `pingId`, so a send for the old
+    /// one that finishes late touches nothing.
+    fn same_report(r: &Map<String, Value>, ping_id: Option<&str>) -> bool {
+        r.get("pingId").and_then(Value::as_str) == ping_id
+    }
+
+    /// A confirmed send of the report `ping_id` by `by`: the round's later
+    /// reruns are no-ops. Ignored when the round now names another report.
+    pub fn confirm(&self, key: &str, reroll: usize, by: &str, ping_id: Option<&str>) {
         self.with_round(key, reroll, |r| {
-            r.insert("recorded".into(), Value::String(by.to_string()));
-            r.remove("pendingAt");
+            if Self::same_report(r, ping_id) {
+                r.insert("recorded".into(), Value::String(by.to_string()));
+                r.remove("pendingAt");
+            }
         });
     }
 
-    /// A send that failed: a still-pending round goes back to no state, so
-    /// the agent's rerun sends it.
-    pub fn release(&self, key: &str, reroll: usize) {
+    /// A send of the report `ping_id` that failed: a still-pending round
+    /// goes back to no state, so the agent's rerun sends it. Ignored when
+    /// the round now names another report.
+    pub fn release(&self, key: &str, reroll: usize, ping_id: Option<&str>) {
         self.with_round(key, reroll, |r| {
-            if r.get("recorded").and_then(Value::as_str) == Some("pending") {
+            if Self::same_report(r, ping_id) && r.get("recorded").and_then(Value::as_str) == Some("pending") {
                 r.remove("recorded");
                 r.remove("pendingAt");
             }
@@ -442,9 +461,14 @@ impl Ledger {
                 continue;
             }
             if let Some(_guard) = lock(&path) {
-                if let Some(mut l) = Self::read_file(&path) {
-                    l.remove("rounds");
-                    self.write_file(&path, &l);
+                // Re-checked under the lock: another process may have written
+                // a round, or claimed one, since the unlocked look above.
+                let still_old = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok()).is_some_and(|age| age.as_millis() as f64 > SEED_TTL_MS);
+                if let Some(mut l) = Self::read_file(&path).filter(|_| still_old) {
+                    let pending = l.get("rounds").and_then(Value::as_object).is_some_and(|rs| rs.values().any(|r| r.get("recorded").and_then(Value::as_str) == Some("pending")));
+                    if !pending && l.remove("rounds").is_some() {
+                        self.write_file(&path, &l);
+                    }
                 }
             }
         }
@@ -671,8 +695,8 @@ pub fn run(args: &[String], io: &mut impeccable_common::Io) -> i32 {
         let Some(text) = safe_read(&path) else { return Ok(Map::new()) };
         match serde_json::from_str::<Value>(&text) {
             Ok(Value::Object(m)) => Ok(m),
-            Ok(_) => Err(format!("{} is not a JSON object", path)),
-            Err(e) => Err(format!("{} is not valid JSON ({})", path, e)),
+            Ok(_) => Err(format!("{} is not a JSON object", impeccable_common::jsp::to_posix(&path))),
+            Err(e) => Err(format!("{} is not valid JSON ({})", impeccable_common::jsp::to_posix(&path), e)),
         }
     };
     let write = |m: &Map<String, Value>| -> Result<(), String> {
@@ -794,12 +818,13 @@ mod tests {
         assert_eq!(l.claim("k1", 0), None);
         let pending = l.round("k1", Some(0)).unwrap();
         assert!(pending.recorded.as_deref() == Some("pending") && pending.pending_at.is_some() && !pending.confirmed());
-        l.release("k1", 0);
+        let id = Some(ping_id.as_str());
+        l.release("k1", 0, id);
         assert_eq!(l.round("k1", Some(0)).unwrap().recorded, None);
         // A confirmed send is final; release never undoes it.
         l.claim("k1", 0).unwrap();
-        l.confirm("k1", 0, "picker");
-        l.release("k1", 0);
+        l.confirm("k1", 0, "picker", id);
+        l.release("k1", 0, id);
         let done = l.round("k1", Some(0)).unwrap();
         assert!(done.confirmed() && done.pending_at.is_none(), "{done:?}");
         assert_eq!(l.round("k1", Some(0)).unwrap().ping_id.as_deref(), Some(ping_id.as_str()));
@@ -817,8 +842,43 @@ mod tests {
             assert!(name.len() == 21 && name.ends_with(".json") && !name.contains("k1") && !name.contains("Evil"), "{name}");
             assert!(!std::fs::read_to_string(e.path()).unwrap().contains("\"at\""));
         }
-        assert_eq!(l.resolve(&l.reference("../Evil Key")).unwrap(), "../Evil Key");
+        assert_eq!(l.resolve(&l.reference("../Evil Key").unwrap()).unwrap(), "../Evil Key");
         assert_eq!(std::fs::read_to_string(format!("{}/.impeccable/questions/.gitignore", cwd)).unwrap(), format!("{}\n*\n", impeccable_common::git::RUNTIME_IGNORE_HEADER));
+    }
+
+    #[test]
+    fn a_late_completion_for_a_replaced_round_changes_nothing() {
+        let cwd = temp_dir("ledger-late");
+        let l = test_ledger(&cwd);
+        l.record_round("k1", &round(0, &["a"]));
+        let old = l.claim("k1", 0).unwrap().ping_id;
+        // The round is reproduced (a new presentation, a new report) while the
+        // old send is still in flight.
+        l.record_round("k1", &round(0, &["a"]));
+        let fresh = l.round("k1", Some(0)).unwrap();
+        assert_ne!(fresh.ping_id, old);
+        // The old send finishing, either way, leaves the new round alone.
+        l.confirm("k1", 0, "picker", old.as_deref());
+        assert_eq!(l.round("k1", Some(0)).unwrap().recorded, None, "a late success does not record the new round");
+        let new_claim = l.claim("k1", 0).unwrap();
+        l.release("k1", 0, old.as_deref());
+        assert_eq!(l.round("k1", Some(0)).unwrap().recorded.as_deref(), Some("pending"), "a late failure does not clear the new claim");
+        l.confirm("k1", 0, "picker", new_claim.ping_id.as_deref());
+        assert!(l.round("k1", Some(0)).unwrap().confirmed());
+    }
+
+    #[test]
+    fn no_salt_means_no_reference_never_an_unsalted_one() {
+        let cwd = temp_dir("no-salt");
+        let home = format!("{}/home", cwd);
+        std::fs::create_dir_all(format!("{}/.impeccable", home)).unwrap();
+        std::fs::write(format!("{}/.impeccable/seed-salt", home), "corrupt").unwrap();
+        let l = Ledger::new(&env(&[("HOME", home.as_str()), ("USERPROFILE", home.as_str())]), &cwd);
+        assert_eq!(l.reference("k1"), None);
+        assert_eq!(l.resolve(&impeccable_common::seed::reference("", "k1")), Err(impeccable_common::seed::reference("", "k1")), "an unsalted hash resolves to nothing");
+        // Telemetry rounds still work by key.
+        l.record_round("k1", &round(0, &["a"]));
+        assert!(l.round("k1", Some(0)).is_some());
     }
 
     #[test]
@@ -835,8 +895,8 @@ mod tests {
                 let cwd = cwd.clone();
                 std::thread::spawn(move || {
                     let l = test_ledger(&cwd);
-                    l.claim("k1", n).unwrap();
-                    l.confirm("k1", n, "picker");
+                    let claimed = l.claim("k1", n).unwrap();
+                    l.confirm("k1", n, "picker", claimed.ping_id.as_deref());
                 })
             })
             .collect();
@@ -871,9 +931,17 @@ mod tests {
         let path = l.file("k1");
         let old = std::time::SystemTime::now() - Duration::from_secs(40 * 24 * 3600);
         std::fs::File::options().write(true).open(&path).unwrap().set_modified(old).unwrap();
+        // A pending send keeps its rounds even on an old file.
+        l.claim("k1", 0).unwrap();
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(old).unwrap();
+        l.record_key("other");
+        assert!(l.round("k1", Some(0)).is_some(), "a pending round is never pruned");
+        let id = l.round("k1", Some(0)).unwrap().ping_id;
+        l.release("k1", 0, id.as_deref());
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(old).unwrap();
         l.record_key("other");
         assert_eq!(l.round("k1", None), None, "old rounds go");
-        assert_eq!(l.resolve(&l.reference("k1")).unwrap(), "k1", "the reference still resolves");
+        assert_eq!(l.resolve(&l.reference("k1").unwrap()).unwrap(), "k1", "the reference still resolves");
     }
 
     #[test]
@@ -1030,10 +1098,10 @@ mod tests {
     fn seed_references_are_salted_hashes_that_resolve_only_where_recorded() {
         let cwd = temp_dir("reference");
         let l = test_ledger(&cwd);
-        let r = l.reference("3f9a1c2e");
+        let r = l.reference("3f9a1c2e").unwrap();
         assert!(impeccable_common::seed::parse_reference(&r).is_some() && r.len() == 21 && !r.contains("3f9a1c2e"), "{r}");
-        assert_eq!(l.reference("3f9a1c2e"), r, "stable");
-        assert_ne!(Ledger::new(&env(&[("IMPECCABLE_SEED_SALT", "another")]), &cwd).reference("3f9a1c2e"), r, "salted");
+        assert_eq!(l.reference("3f9a1c2e").unwrap(), r, "stable");
+        assert_ne!(Ledger::new(&env(&[("IMPECCABLE_SEED_SALT", "another")]), &cwd).reference("3f9a1c2e").unwrap(), r, "salted");
         // A key resolves to itself; a reference only once this machine recorded its key.
         assert_eq!(l.resolve("k1").unwrap(), "k1");
         assert_eq!(l.resolve(&r), Err(r.clone()));

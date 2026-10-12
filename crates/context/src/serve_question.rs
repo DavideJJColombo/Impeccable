@@ -474,9 +474,14 @@ pub struct ApiRoll<'a> {
 /// page carries into its hand (`roll_seed`) so the picker can send the
 /// choice ping itself. The questions directory ignores itself before the
 /// record is written.
-pub fn record_roll(cwd: &str, scope: &str, reference: &str, reroll: usize, worlds: &[Value], api: Option<&ApiRoll>) {
+pub fn record_roll(cwd: &str, scope: &str, reference: Option<&str>, reroll: usize, worlds: &[Value], api: Option<&ApiRoll>) {
     let qdir = jsp::join(&[cwd, ".impeccable", "questions"]);
-    let mut record = json!({ "scope": scope, "seed": reference, "reroll": reroll });
+    // No reference (no salt on this machine): the record names no seed, and
+    // the page sends no ping, since it could not name the key.
+    let mut record = json!({ "scope": scope, "reroll": reroll });
+    if let Some(r) = reference {
+        record["seed"] = json!(r);
+    }
     if !worlds.is_empty() {
         record["worlds"] = Value::Array(worlds.to_vec());
     }
@@ -1837,9 +1842,9 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
                     let ledger = crate::telemetry::Ledger::new(&env, &cwd);
                     let (key, reroll) = (ping.key.clone().unwrap_or_default(), ping.reroll.unwrap_or(0));
                     if crate::telemetry::send_choice(&env, &cwd, &ping, crate::telemetry::api_timeout(&env)) {
-                        ledger.confirm(&key, reroll, "picker");
+                        ledger.confirm(&key, reroll, "picker", ping.ping_id.as_deref());
                     } else {
-                        ledger.release(&key, reroll);
+                        ledger.release(&key, reroll, ping.ping_id.as_deref());
                     }
                 })
             });
@@ -3072,7 +3077,7 @@ mod tests {
         let qdir = jsp::join(&[&dir.to_string_lossy(), ".impeccable", "questions"]);
         let roll = dir.join(".impeccable/questions/roll.json");
         // Recorded the way concept-seed records a roll.
-        record_roll(&dir.to_string_lossy(), "surface", "seed-1", 0, &[], None);
+        record_roll(&dir.to_string_lossy(), "surface", Some("seed-1"), 0, &[], None);
         assert!(surface_roll_pending(read_roll(&qdir).as_deref()));
         std::fs::write(dir.join("p.json"), surface_round(false).to_string()).unwrap();
         let run_err = |args: &[&str]| {
@@ -3928,7 +3933,7 @@ mod tests {
         let ledger = crate::telemetry::Ledger::new(&Env::from([("IMPECCABLE_SEED_SALT".to_string(), "test-salt".to_string())]), &cwd);
         let deal = |n: usize| {
             ledger.record_key("seed-1");
-            record_roll(&cwd, "direction", &ledger.reference("seed-1"), n, worlds.as_array().unwrap(), Some(&ApiRoll { mode: Some("persuade"), register: None, pool_revision: Some("0123456789ab"), hand_id: Some("00112233445566778899aabbccddeeff") }));
+            record_roll(&cwd, "direction", ledger.reference("seed-1").as_deref(), n, worlds.as_array().unwrap(), Some(&ApiRoll { mode: Some("persuade"), register: None, pool_revision: Some("0123456789ab"), hand_id: Some("00112233445566778899aabbccddeeff") }));
             ledger.record_round("seed-1", &round(n));
             let roll = read_roll(&qdir);
             let _ = std::fs::remove_file(hand_file(&qdir, "pk"));
@@ -3964,12 +3969,12 @@ mod tests {
 
         // A send still pending: the rerun waits, and a confirmation makes it a no-op.
         deal(4);
-        ledger.claim("seed-1", 4).unwrap();
+        let claimed = ledger.claim("seed-1", 4).unwrap();
         let confirm = {
             let cwd = cwd.clone();
             std::thread::spawn(move || {
                 sleep_ms(300);
-                crate::telemetry::Ledger::new(&Env::from([("IMPECCABLE_SEED_SALT".to_string(), "test-salt".to_string())]), &cwd).confirm("seed-1", 4, "picker");
+                crate::telemetry::Ledger::new(&Env::from([("IMPECCABLE_SEED_SALT".to_string(), "test-salt".to_string())]), &cwd).confirm("seed-1", 4, "picker", claimed.ping_id.as_deref());
             })
         };
         assert_eq!(agent(&[], &["--kind", "assigned", "--from", "seed-1", "--scope", "direction", "--reroll", "4"]), "choice already recorded\n");
@@ -4086,7 +4091,7 @@ mod tests {
         // A project from before the ignore file: the next roll record writes it.
         std::fs::write(qdir.join("roll.json"), "{}").unwrap();
         assert!(!ignore.exists());
-        record_roll(&cwd, "direction", "seed-1", 0, &[], None);
+        record_roll(&cwd, "direction", Some("seed-1"), 0, &[], None);
         assert_eq!(std::fs::read_to_string(&ignore).unwrap(), expected);
         // The roll record names its seed by reference and holds no time.
         let rec: Value = serde_json::from_str(&std::fs::read_to_string(qdir.join("roll.json")).unwrap()).unwrap();
@@ -4095,7 +4100,7 @@ mod tests {
         std::fs::remove_file(&ignore).unwrap();
         write_hand(&qdir.to_string_lossy(), "k1", &new_hand(&cwd, &json!({ "options": [{ "id": "a" }] }))).unwrap();
         assert_eq!(std::fs::read_to_string(&ignore).unwrap(), expected);
-        record_roll(&cwd, "direction", "seed-1", 0, &[], None);
+        record_roll(&cwd, "direction", Some("seed-1"), 0, &[], None);
         assert_eq!(std::fs::read_to_string(&ignore).unwrap(), expected);
         // Git agrees: nothing under questions/ is offered for a commit.
         let git = |args: &[&str]| std::process::Command::new("git").args(args).current_dir(&dir).output();
@@ -4125,7 +4130,7 @@ mod tests {
         assert!(notice.starts_with("TRACKED RUNTIME FILES: git already tracks 1 file(s)") && notice.contains("`git rm -r --cached .impeccable/questions`"), "{notice}");
         assert_eq!(tracked_runtime_notice(&cwd), None, "once per tracked set");
         // The roll record goes to an untracked name, and the tracked file is left as it was.
-        record_roll(&cwd, "direction", "seed:0123456789abcdef", 0, &[], None);
+        record_roll(&cwd, "direction", Some("seed:0123456789abcdef"), 0, &[], None);
         assert_eq!(std::fs::read_to_string(qdir.join("roll.json")).unwrap(), r#"{"scope":"direction","key":"old"}"#);
         let local = std::fs::read_to_string(qdir.join("roll.local.json")).unwrap();
         assert!(local.contains("seed:0123456789abcdef"), "{local}");
@@ -4134,7 +4139,7 @@ mod tests {
         assert!(!String::from_utf8_lossy(&status.stdout).contains("roll.local.json"));
         // Untracked again: the record returns to roll.json and the aside file goes.
         git(&["rm", "-q", "--cached", ".impeccable/questions/roll.json"]).unwrap();
-        record_roll(&cwd, "direction", "seed:fedcba9876543210", 0, &[], None);
+        record_roll(&cwd, "direction", Some("seed:fedcba9876543210"), 0, &[], None);
         assert!(std::fs::read_to_string(qdir.join("roll.json")).unwrap().contains("seed:fedcba9876543210"));
         assert!(!qdir.join("roll.local.json").exists());
         let _ = std::fs::remove_dir_all(&dir);

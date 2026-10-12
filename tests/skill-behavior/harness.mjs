@@ -188,7 +188,7 @@ function execBash(workspace, command, timeoutMs = 20_000, extraEnv = {}) {
       cwd: workspace,
       // The agent may roll against the live API: tag its roll and choice
       // requests as test traffic so they stay out of the choice dataset.
-      env: { IMPECCABLE_TELEMETRY_CHANNEL: 'test', ...shellEnv, ...(ENGINE_BIN ? { IMPECCABLE_BIN: ENGINE_BIN } : {}), IMPECCABLE_QUESTION_DISABLED: '1' },
+      env: { ...shellEnv, ...(ENGINE_BIN ? { IMPECCABLE_BIN: ENGINE_BIN } : {}), IMPECCABLE_QUESTION_DISABLED: '1', IMPECCABLE_TELEMETRY_CHANNEL: 'test' },
     });
     let stdout = '';
     let stderr = '';
