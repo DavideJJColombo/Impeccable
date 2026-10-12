@@ -41,21 +41,7 @@ pub fn new_key() -> String {
     })
 }
 
-/// Where a salt is persisted, first that works: the user's
-/// `<home>/.impeccable/seed-salt`, else the project's own
-/// `<project>/.impeccable/questions/seed-salt` (an ignored runtime folder,
-/// for sandboxes whose home is read-only). `IMPECCABLE_SEED_SALT` overrides
-/// both, for reproducible tests.
-///
-/// `None` when no valid salt can be had: a salt file that exists but is not
-/// 32 lowercase hex is left alone (rewriting it would silently orphan every
-/// reference made under it), and a location that cannot be written yields
-/// nothing. There is never an unsalted fallback: an unsalted reference is a
-/// public hash of the key, linkable to anyone holding keys.
-pub fn salt(home: &str, project: Option<&str>, override_salt: Option<&str>) -> Option<String> {
-    if let Some(s) = override_salt.filter(|s| !s.is_empty()) {
-        return Some(s.to_string());
-    }
+fn salt_places(home: &str, project: Option<&str>) -> Vec<std::path::PathBuf> {
     let mut places: Vec<std::path::PathBuf> = Vec::new();
     if !home.is_empty() {
         places.push(std::path::Path::new(home).join(".impeccable").join("seed-salt"));
@@ -63,38 +49,107 @@ pub fn salt(home: &str, project: Option<&str>, override_salt: Option<&str>) -> O
     if let Some(p) = project.filter(|p| !p.is_empty()) {
         places.push(std::path::Path::new(p).join(".impeccable").join("questions").join("seed-salt"));
     }
-    for file in places {
-        match std::fs::read_to_string(&file) {
-            Ok(text) => {
-                let t = text.trim();
-                // Present: valid or not, this location decides.
-                return is_hex(t, 32).then(|| t.to_string());
+    places
+}
+
+/// A salt file's state: absent, present and valid, or present and not 32
+/// lowercase hex.
+enum Kept {
+    Absent,
+    Valid(String),
+    Corrupt,
+}
+
+fn kept(file: &std::path::Path) -> Kept {
+    match std::fs::read_to_string(file) {
+        Ok(text) if is_hex(text.trim(), 32) => Kept::Valid(text.trim().to_string()),
+        Ok(_) => Kept::Corrupt,
+        Err(_) if file.exists() => Kept::Corrupt,
+        Err(_) => Kept::Absent,
+    }
+}
+
+/// Every valid salt this machine already keeps, home first then project
+/// (or only the override). References made under any of them resolve.
+pub fn existing_salts(home: &str, project: Option<&str>, override_salt: Option<&str>) -> Vec<String> {
+    if let Some(s) = override_salt.filter(|s| !s.is_empty()) {
+        return vec![s.to_string()];
+    }
+    let mut out: Vec<String> = Vec::new();
+    for file in salt_places(home, project) {
+        if let Kept::Valid(s) = kept(&file) {
+            if !out.contains(&s) {
+                out.push(s);
             }
-            Err(_) if file.exists() => return None,
-            Err(_) => {}
         }
-        let Some(fresh) = random_hex32() else { return None };
-        let dir = file.parent().map(|d| d.to_path_buf()).unwrap_or_default();
-        if std::fs::create_dir_all(&dir).is_err() {
-            continue;
+    }
+    out
+}
+
+fn create(file: &std::path::Path) -> Option<String> {
+    let fresh = random_hex32()?;
+    let dir = file.parent()?.to_path_buf();
+    std::fs::create_dir_all(&dir).ok()?;
+    if file.to_string_lossy().contains("questions") {
+        crate::git::ensure_dir_ignored(&dir.to_string_lossy(), &["*"]);
+    }
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(file) {
+        Ok(mut f) => {
+            use std::io::Write;
+            if f.write_all(format!("{}\n", fresh).as_bytes()).is_err() {
+                let _ = std::fs::remove_file(file);
+                return None;
+            }
+            Some(fresh)
         }
-        if file.to_string_lossy().contains("questions") {
-            crate::git::ensure_dir_ignored(&dir.to_string_lossy(), &["*"]);
-        }
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&file) {
-            Ok(mut f) => {
-                use std::io::Write;
-                if f.write_all(format!("{}\n", fresh).as_bytes()).is_err() {
-                    let _ = std::fs::remove_file(&file);
-                    continue;
+        // Another process created it first: use theirs.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => match kept(file) {
+            Kept::Valid(s) => Some(s),
+            _ => None,
+        },
+        Err(_) => None,
+    }
+}
+
+/// The salt new references are made under. `IMPECCABLE_SEED_SALT` wins
+/// (reproducible tests). Otherwise an existing valid salt always wins over
+/// making one, so a reference never stops resolving because a better place
+/// became writable: the user's `<home>/.impeccable/seed-salt`, else the
+/// project's `<project>/.impeccable/questions/seed-salt` (an ignored runtime
+/// folder, for sandboxes whose home is read-only); only with neither is one
+/// created, in the home first, then the project.
+///
+/// `None` when no valid salt can be had. A corrupt salt file is never
+/// rewritten (that would orphan every reference made under it), and a
+/// corrupt home salt is not replaced by a new project one; there is never an
+/// unsalted fallback, since an unsalted reference is a public hash of the
+/// key, linkable by anyone holding keys.
+pub fn salt(home: &str, project: Option<&str>, override_salt: Option<&str>) -> Option<String> {
+    if let Some(s) = override_salt.filter(|s| !s.is_empty()) {
+        return Some(s.to_string());
+    }
+    if let Some(s) = existing_salts(home, project, None).into_iter().next() {
+        return Some(s);
+    }
+    let places = salt_places(home, project);
+    let mut home_corrupt = false;
+    for (i, file) in places.iter().enumerate() {
+        match kept(file) {
+            Kept::Valid(s) => return Some(s),
+            Kept::Corrupt => {
+                if i == 0 && !home.is_empty() {
+                    home_corrupt = true;
                 }
-                return Some(fresh);
+                continue;
             }
-            // Another process created it first: read theirs.
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                return std::fs::read_to_string(&file).ok().map(|t| t.trim().to_string()).filter(|t| is_hex(t, 32));
+            Kept::Absent => {
+                if home_corrupt {
+                    return None;
+                }
+                if let Some(s) = create(file) {
+                    return Some(s);
+                }
             }
-            Err(_) => continue,
         }
     }
     None
@@ -181,5 +236,31 @@ mod tests {
             let _ = std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755));
             let _ = std::fs::remove_dir_all(d);
         }
+    }
+
+    #[test]
+    fn a_project_salt_keeps_winning_once_the_home_becomes_writable() {
+        let home = temp("later-home");
+        let project = temp("later-project");
+        let (h, p) = (home.to_string_lossy().into_owned(), project.to_string_lossy().into_owned());
+        // A sandboxed run with no usable home made the project salt.
+        let first = salt("", Some(&p), None).unwrap();
+        assert!(project.join(".impeccable/questions/seed-salt").exists());
+        // Later the home is writable: the existing salt still wins, no new one is made.
+        assert_eq!(salt(&h, Some(&p), None).unwrap(), first);
+        assert!(!home.join(".impeccable/seed-salt").exists());
+        assert_eq!(existing_salts(&h, Some(&p), None), vec![first]);
+    }
+
+    #[test]
+    fn a_home_salt_wins_and_a_stray_project_salt_still_counts() {
+        let home = temp("both-home");
+        let project = temp("both-project");
+        let (h, p) = (home.to_string_lossy().into_owned(), project.to_string_lossy().into_owned());
+        let project_salt = salt("", Some(&p), None).unwrap();
+        std::fs::create_dir_all(home.join(".impeccable")).unwrap();
+        std::fs::write(home.join(".impeccable/seed-salt"), "0123456789abcdef0123456789abcdef\n").unwrap();
+        assert_eq!(salt(&h, Some(&p), None).unwrap(), "0123456789abcdef0123456789abcdef");
+        assert_eq!(existing_salts(&h, Some(&p), None), vec!["0123456789abcdef0123456789abcdef".to_string(), project_salt]);
     }
 }

@@ -196,6 +196,12 @@ pub fn seed_salt(env: &Env, cwd: &str) -> Option<String> {
     impeccable_common::seed::salt(&crate::util::homedir(env), Some(cwd), env.get("IMPECCABLE_SEED_SALT").map(String::as_str))
 }
 
+/// Every valid salt this machine keeps (home and project): a reference made
+/// under any of them resolves.
+pub fn seed_salts(env: &Env, cwd: &str) -> Vec<String> {
+    impeccable_common::seed::existing_salts(&crate::util::homedir(env), Some(cwd), env.get("IMPECCABLE_SEED_SALT").map(String::as_str))
+}
+
 /// The seed ledger of one project directory: `.impeccable/questions/seeds/
 /// <reference hex>.json`, `{"key", "rounds"?: {"<reroll>": {...}}}`. The key
 /// entry is what lets a reference stand for its key on this machine and is
@@ -206,6 +212,8 @@ pub fn seed_salt(env: &Env, cwd: &str) -> Option<String> {
 pub struct Ledger {
     cwd: String,
     salt: Option<String>,
+    /// Every salt references may have been made under, `salt` first.
+    salts: Vec<String>,
 }
 
 /// Ledger rounds older than this are pruned when a ledger is written; the
@@ -275,7 +283,14 @@ fn round_from(v: &Value, reroll: usize) -> SeedRound {
 
 impl Ledger {
     pub fn new(env: &Env, cwd: &str) -> Ledger {
-        Ledger { cwd: cwd.to_string(), salt: seed_salt(env, cwd) }
+        let salt = seed_salt(env, cwd);
+        let mut salts: Vec<String> = salt.iter().cloned().collect();
+        for s in seed_salts(env, cwd) {
+            if !salts.contains(&s) {
+                salts.push(s);
+            }
+        }
+        Ledger { cwd: cwd.to_string(), salt, salts }
     }
 
     fn dir(&self) -> String {
@@ -332,10 +347,13 @@ impl Ledger {
     /// names a reference this machine has no record of.
     pub fn resolve(&self, v: &str) -> Result<String, String> {
         let Some(tag) = impeccable_common::seed::parse_reference(v) else { return Ok(v.to_string()) };
-        let Some(salt) = self.salt.as_deref() else { return Err(v.to_string()) };
+        // A reference may come from any salt this machine keeps (a project
+        // salt from a sandboxed run, the home salt since): the ledger file is
+        // named by its tag, and the key in it must hash back to that tag
+        // under one of them.
         Self::read_file(&self.file_for_tag(tag))
             .and_then(|l| l.get("key").and_then(Value::as_str).map(str::to_string))
-            .filter(|k| impeccable_common::seed::tag(salt, k) == tag)
+            .filter(|k| self.salts.iter().any(|s| impeccable_common::seed::tag(s, k) == tag))
             .ok_or_else(|| v.to_string())
     }
 
@@ -1200,5 +1218,28 @@ mod tests {
                 assert_eq!(std::fs::read_to_string(format!("{}/.impeccable/config.json", home)).unwrap(), body, "untouched");
             }
         }
+    }
+
+    #[test]
+    fn references_from_either_salt_resolve() {
+        let cwd = temp_dir("two-salts");
+        let home = format!("{}/home", cwd);
+        let e = env(&[("HOME", home.as_str()), ("USERPROFILE", home.as_str())]);
+        // A sandboxed run (no home) makes a project salt and a reference under it.
+        // A home that cannot hold a directory (it is a file) stands in for a read-only one.
+        let blocked = format!("{}/blocked-home", cwd);
+        std::fs::write(&blocked, "").unwrap();
+        let sandboxed = Ledger::new(&env(&[("HOME", blocked.as_str()), ("USERPROFILE", blocked.as_str())]), &cwd);
+        let old = sandboxed.reference("k1").unwrap();
+        sandboxed.record_key("k1");
+        // A stray home salt appears later (another tool, a restored backup).
+        std::fs::create_dir_all(format!("{}/.impeccable", home)).unwrap();
+        std::fs::write(format!("{}/.impeccable/seed-salt", home), "0123456789abcdef0123456789abcdef\n").unwrap();
+        let l = Ledger::new(&e, &cwd);
+        let new = l.reference("k2").unwrap();
+        assert_ne!(impeccable_common::seed::parse_reference(&new), None);
+        l.record_key("k2");
+        assert_eq!(l.resolve(&old).unwrap(), "k1", "the project salt's reference still resolves");
+        assert_eq!(l.resolve(&new).unwrap(), "k2");
     }
 }
