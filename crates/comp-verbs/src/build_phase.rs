@@ -121,19 +121,19 @@ fn save_state(io: &Io, state: &Value) {
 }
 
 /// The seed reference the state records for `--direction`: a reference
-/// (`seed:` + 16 lowercase hex) or `none` as given, a raw seed key as its
-/// reference under this user's salt (`impeccable_common::seed`, the same
-/// one concept-seed prints), so the build state never holds the key the roll
-/// API saw. With no salt on this machine a raw key becomes `none`: there is
-/// no reference to give, and never an unsalted one. The direction is only
-/// ever shown, never resolved, so nothing is lost.
+/// (`seed:` + 16 lowercase hex) or `none` as given, a raw seed key as the
+/// reference the shared locator gives it (`impeccable_common::seed::
+/// reference_for_key`, the same answer concept-seed printed for that key),
+/// so the build state never holds the key the roll API saw. With no
+/// reference to give (no salt on this machine) a raw key becomes `none`,
+/// never an unsalted hash. The direction is only ever shown, never
+/// resolved, so nothing is lost.
 fn seed_reference(io: &Io, v: &str) -> String {
     if v == "none" || impeccable_common::seed::parse_reference(v).is_some() {
         return v.to_string();
     }
     let home = io.home().map(|h| h.to_string_lossy().into_owned()).unwrap_or_default();
-    let salt = impeccable_common::seed::salt(&home, Some(&io.cwd.to_string_lossy()), io.env("IMPECCABLE_SEED_SALT"));
-    salt.map(|s| impeccable_common::seed::reference(&s, v)).unwrap_or_else(|| "none".to_string())
+    impeccable_common::seed::reference_for_key(&home, &io.cwd.to_string_lossy(), io.env("IMPECCABLE_SEED_SALT"), v).unwrap_or_else(|| "none".to_string())
 }
 
 fn new_state(comp: Option<&str>, breakpoint: Option<&str>, artifact: Option<&str>, direction: Option<&str>) -> Value {

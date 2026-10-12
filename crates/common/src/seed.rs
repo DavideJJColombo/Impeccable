@@ -170,6 +170,104 @@ pub fn parse_reference(v: &str) -> Option<&str> {
     v.strip_prefix("seed:").filter(|h| is_hex(h, 16))
 }
 
+// ---- the seed ledger locator ---------------------------------------------------
+
+/// The salt name a ledger made with no salt at all is filed under. Such a
+/// ledger is marked `"unsalted": true` and never yields a reference.
+pub const NO_SALT: &str = "no-salt:local-ledger-name";
+
+/// `<project>/.impeccable/questions/seeds`: one ledger file per seed key,
+/// named by the key's reference tag and holding the key itself.
+pub fn seeds_dir(project: &str) -> std::path::PathBuf {
+    std::path::Path::new(project).join(".impeccable").join("questions").join("seeds")
+}
+
+/// A key's ledger as the locator found it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Located {
+    /// Where the key's ledger lives (or will, when `exists` is false).
+    pub path: std::path::PathBuf,
+    pub exists: bool,
+    /// The key's seed reference: the existing ledger's own name, or for a
+    /// new key the primary salt's tag. `None` for an unsalted ledger, or a
+    /// new key on a machine with no salt.
+    pub reference: Option<String>,
+}
+
+fn ledger_key(path: &std::path::Path) -> Option<(String, bool)> {
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    let key = v.get("key")?.as_str()?.to_string();
+    Some((key, v.get("unsalted").and_then(|u| u.as_bool()) == Some(true)))
+}
+
+/// The one rule that ties a key to its salt: a key's salt is chosen once,
+/// when its ledger is first written, and everything else (the printed SEED
+/// REFERENCE, the roll record's seed, the ledger file, `--from`,
+/// `--check-seed`, build-phase's `--direction`) derives from that file.
+///
+/// An existing ledger for `key` wins, wherever it is: first the key's names
+/// under `primary` and every `kept` salt (cheap), then a scan of the folder
+/// (a ledger made under a salt this machine no longer has, such as a home
+/// salt now out of reach). Its reference is its own file name. Only a key
+/// with no ledger takes `primary`; with no salt at all it gets an unsalted
+/// file and no reference.
+pub fn locate(project: &str, primary: Option<&str>, kept: &[String], key: &str) -> Located {
+    let dir = seeds_dir(project);
+    let found = |path: std::path::PathBuf| -> Option<Located> {
+        let (k, unsalted) = ledger_key(&path)?;
+        if k != key {
+            return None;
+        }
+        let stem = path.file_stem()?.to_string_lossy().into_owned();
+        let reference = (!unsalted && is_hex(&stem, 16)).then(|| format!("seed:{}", stem));
+        Some(Located { path, exists: true, reference })
+    };
+    let mut names: Vec<&str> = primary.into_iter().collect();
+    for s in kept {
+        if !names.contains(&s.as_str()) {
+            names.push(s);
+        }
+    }
+    names.push(NO_SALT);
+    for s in &names {
+        if let Some(l) = found(dir.join(format!("{}.json", tag(s, key)))) {
+            return l;
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        let mut paths: Vec<std::path::PathBuf> = entries.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "json")).collect();
+        paths.sort();
+        for p in paths {
+            if let Some(l) = found(p) {
+                return l;
+            }
+        }
+    }
+    match primary {
+        Some(s) => Located { path: dir.join(format!("{}.json", tag(s, key))), exists: false, reference: Some(reference(s, key)) },
+        None => Located { path: dir.join(format!("{}.json", tag(NO_SALT, key))), exists: false, reference: None },
+    }
+}
+
+/// The key a seed reference names on this machine: its ledger file, named
+/// by the reference itself, and the key recorded in it. `None` when there
+/// is no such ledger, or it is unsalted.
+pub fn resolve(project: &str, reference: &str) -> Option<String> {
+    let t = parse_reference(reference)?;
+    match ledger_key(&seeds_dir(project).join(format!("{}.json", t)))? {
+        (k, false) => Some(k),
+        _ => None,
+    }
+}
+
+/// A key's seed reference for a command that does not write the ledger
+/// (build-phase): the locator's answer, under this machine's salts.
+pub fn reference_for_key(home: &str, project: &str, override_salt: Option<&str>, key: &str) -> Option<String> {
+    let primary = salt(home, Some(project), override_salt);
+    let kept = existing_salts(home, Some(project), override_salt);
+    locate(project, primary.as_deref(), &kept, key).reference
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

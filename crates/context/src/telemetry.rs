@@ -252,13 +252,16 @@ fn lock(path: &str) -> Option<LockGuard> {
             // Windows answers a create racing a delete of the same name with
             // access denied rather than exists: both mean another holder.
             Err(e) if matches!(e.kind(), std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied) => {
-                let stale = std::fs::metadata(&lock).ok().and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok()).is_some_and(|age| age.as_millis() > LOCK_STALE_MS);
-                if stale {
-                    let _ = std::fs::remove_file(&lock);
-                    continue;
-                }
+                // Every pass checks the overall deadline first, the stale
+                // branch included: a lock that cannot be removed (Windows
+                // keeps a deleted file delete-pending; a read-only folder)
+                // must not spin forever. Giving up never blocks a flow.
                 if start.elapsed().as_millis() > LOCK_WAIT_MS {
                     return None;
+                }
+                let stale = std::fs::metadata(&lock).ok().and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok()).is_some_and(|age| age.as_millis() > LOCK_STALE_MS);
+                if stale && std::fs::remove_file(&lock).is_ok() {
+                    continue;
                 }
                 std::thread::sleep(Duration::from_millis(15));
             }
@@ -299,28 +302,23 @@ impl Ledger {
         jsp::join(&[&self.cwd, ".impeccable", "questions", "seeds"])
     }
 
-    fn file_for_tag(&self, tag: &str) -> String {
-        jsp::join(&[&self.dir(), &format!("{}.json", tag)])
+    /// The key's ledger, located once by the shared rule
+    /// (`impeccable_common::seed::locate`): every operation, the printed
+    /// reference and resolution all derive from this one answer.
+    fn locate(&self, key: &str) -> impeccable_common::seed::Located {
+        impeccable_common::seed::locate(&self.cwd, self.salt.as_deref(), &self.salts, key)
     }
 
-    /// The one place a key's ledger is located, so every operation (resolve,
-    /// round, claim, confirm, release, record, prune) acts on the same file:
-    /// the first that exists among the key's names under every salt this
-    /// machine keeps (a sandboxed run's project salt, the home salt since),
-    /// else the primary salt's name, for a new ledger. Without any salt there
-    /// are no references; the file still needs a name, which only this
-    /// ignored folder ever sees.
     fn file(&self, key: &str) -> String {
-        const NO_SALT: &str = "no-salt:local-ledger-name";
-        let primary = self.file_for_tag(&impeccable_common::seed::tag(self.salt.as_deref().unwrap_or(NO_SALT), key));
-        let candidates = self.salts.iter().map(String::as_str).chain(std::iter::once(NO_SALT)).map(|s| self.file_for_tag(&impeccable_common::seed::tag(s, key)));
-        std::iter::once(primary.clone()).chain(candidates).find(|p| std::path::Path::new(p).exists()).unwrap_or(primary)
+        self.locate(key).path.to_string_lossy().into_owned()
     }
 
-    /// The seed reference committed files record instead of `key`, or `None`
-    /// when this machine has no salt (`seed_salt`).
+    /// The seed reference committed files record instead of `key`: the
+    /// reference of the key's existing ledger, under whichever salt it was
+    /// made, or for a new key the primary salt's. `None` when this machine
+    /// has no salt and the key has no salted ledger.
     pub fn reference(&self, key: &str) -> Option<String> {
-        self.salt.as_deref().map(|s| impeccable_common::seed::reference(s, key))
+        self.locate(key).reference
     }
 
     fn read_file(path: &str) -> Option<Map<String, Value>> {
@@ -353,9 +351,14 @@ impl Ledger {
             return None;
         }
         crate::serve_question::ignore_questions_dir(&jsp::join(&[&self.cwd, ".impeccable", "questions"]));
-        let path = self.file(key);
+        let located = self.locate(key);
+        let path = located.path.to_string_lossy().into_owned();
         let _guard = lock(&path)?;
         let mut ledger = Self::read_file(&path).unwrap_or_default();
+        // A ledger made with no salt says so, so it never yields a reference.
+        if !located.exists && located.reference.is_none() {
+            ledger.insert("unsalted".into(), Value::Bool(true));
+        }
         let before = ledger.clone();
         let out = f(&mut ledger);
         if ledger != before {
@@ -368,15 +371,11 @@ impl Ledger {
     /// reference resolves to the key this machine recorded for it. `Err`
     /// names a reference this machine has no record of.
     pub fn resolve(&self, v: &str) -> Result<String, String> {
-        let Some(tag) = impeccable_common::seed::parse_reference(v) else { return Ok(v.to_string()) };
-        // A reference may come from any salt this machine keeps (a project
-        // salt from a sandboxed run, the home salt since): the ledger file is
-        // named by its tag, and the key in it must hash back to that tag
-        // under one of them.
-        Self::read_file(&self.file_for_tag(tag))
-            .and_then(|l| l.get("key").and_then(Value::as_str).map(str::to_string))
-            .filter(|k| self.salts.iter().any(|s| impeccable_common::seed::tag(s, k) == tag))
-            .ok_or_else(|| v.to_string())
+        if impeccable_common::seed::parse_reference(v).is_none() {
+            return Ok(v.to_string());
+        }
+        // The ledger is named by the reference itself, whatever salt made it.
+        impeccable_common::seed::resolve(&self.cwd, v).ok_or_else(|| v.to_string())
     }
 
     /// Records the key behind a reference, for every roll whatever the
@@ -1263,5 +1262,26 @@ mod tests {
         l.record_key("k2");
         assert_eq!(l.resolve(&old).unwrap(), "k1", "the project salt's reference still resolves");
         assert_eq!(l.resolve(&new).unwrap(), "k2");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_lock_that_cannot_be_removed_gives_up_within_the_deadline() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::path::PathBuf::from(temp_dir("lock-stuck"));
+        let path = dir.join("ledger.json").to_string_lossy().into_owned();
+        let lock_path = format!("{}.lock", path);
+        std::fs::write(&lock_path, "").unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(60);
+        std::fs::File::options().write(true).open(&lock_path).unwrap().set_modified(old).unwrap();
+        // A read-only folder: the stale lock can be neither removed nor replaced.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::remove_file(&lock_path).is_ok() {
+            return; // running as root: permissions are not enforced
+        }
+        let start = std::time::Instant::now();
+        assert!(lock(&path).is_none());
+        assert!(start.elapsed().as_millis() < LOCK_WAIT_MS + 1_000, "{:?}", start.elapsed());
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
     }
 }
