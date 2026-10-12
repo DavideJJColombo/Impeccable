@@ -214,6 +214,9 @@ pub struct Ledger {
     salt: Option<String>,
     /// Every salt references may have been made under, `salt` first.
     salts: Vec<String>,
+    /// A key this run generated itself: it cannot have a ledger, so the
+    /// locator skips its search (`for_fresh_key`).
+    fresh: Option<String>,
 }
 
 /// Ledger rounds older than this are pruned when a ledger is written; the
@@ -295,7 +298,7 @@ impl Ledger {
                 salts.push(s);
             }
         }
-        Ledger { cwd: cwd.to_string(), salt, salts }
+        Ledger { cwd: cwd.to_string(), salt, salts, fresh: None }
     }
 
     fn dir(&self) -> String {
@@ -306,7 +309,20 @@ impl Ledger {
     /// (`impeccable_common::seed::locate`): every operation, the printed
     /// reference and resolution all derive from this one answer.
     fn locate(&self, key: &str) -> impeccable_common::seed::Located {
+        if self.fresh.as_deref() == Some(key) {
+            return impeccable_common::seed::locate_fresh(&self.cwd, self.salt.as_deref(), key);
+        }
         impeccable_common::seed::locate(&self.cwd, self.salt.as_deref(), &self.salts, key)
+    }
+
+    /// Marks `key` as one this run just generated (no `--from`, no
+    /// `IMPECCABLE_CONCEPT_SEED`): 128 random bits have no ledger, so no
+    /// name check or folder scan is spent on it.
+    pub fn for_fresh_key(mut self, key: &str, fresh: bool) -> Ledger {
+        if fresh {
+            self.fresh = Some(key.to_string());
+        }
+        self
     }
 
     fn file(&self, key: &str) -> String {

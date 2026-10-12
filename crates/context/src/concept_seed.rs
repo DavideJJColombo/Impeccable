@@ -396,6 +396,9 @@ pub struct SeedArgs {
     pub candidate_count: f64,
     /// The recorded build-path default and its file (`recorded_build_path`).
     pub build_path: Option<(String, String)>,
+    /// The engine generated `key` itself this run (no `--from`, no
+    /// `IMPECCABLE_CONCEPT_SEED`), so it has no ledger to look for.
+    pub fresh_key: bool,
 }
 
 fn unit(scope: &str, salt: &str, key: &str) -> f64 {
@@ -421,7 +424,7 @@ fn render_concept_seed(env: &Env, cwd: &str, budget: &mut ApiBudget, a: &SeedArg
     // PRESENTATION closes every roll, where a middle-truncated read still
     // reaches it, like the restated lines above it.
     let register = a.register.clone().flatten();
-    let reference = match telemetry::Ledger::new(env, cwd).reference(&a.key) {
+    let reference = match telemetry::Ledger::new(env, cwd).for_fresh_key(&a.key, a.fresh_key).reference(&a.key) {
         Some(r) => fill(t::SEED_REFERENCE, &[("REFERENCE", &r)]),
         None => t::SEED_REFERENCE_UNAVAILABLE.to_string(),
     };
@@ -742,14 +745,16 @@ pub fn run(args: &[String], io: &mut Io) -> i32 {
         return 1;
     }
     let num = |v: Option<Option<String>>| -> Option<f64> { v.map(|x| x.map(|s| crate::critique_storage::js_number(&s)).unwrap_or(f64::NAN)) };
-    let given = match val("--from") {
-        Some(Some(k)) => k,
-        Some(None) => "undefined".to_string(),
-        None => env.get("IMPECCABLE_CONCEPT_SEED").filter(|v| !v.is_empty()).cloned().unwrap_or_else(impeccable_common::seed::new_key),
+    let supplied = match val("--from") {
+        Some(Some(k)) => Some(k),
+        Some(None) => Some("undefined".to_string()),
+        None => env.get("IMPECCABLE_CONCEPT_SEED").filter(|v| !v.is_empty()).cloned(),
     };
+    let fresh_key = supplied.is_none();
+    let given = supplied.unwrap_or_else(impeccable_common::seed::new_key);
     // A seed reference (what the surface brief records) stands for the key
     // this machine rolled it from; the deal depends on the key itself.
-    let ledger = telemetry::Ledger::new(&env, &cwd);
+    let ledger = telemetry::Ledger::new(&env, &cwd).for_fresh_key(&given, fresh_key);
     let key = match ledger.resolve(&given) {
         Ok(k) => k,
         Err(r) => {
@@ -770,6 +775,7 @@ pub fn run(args: &[String], io: &mut Io) -> i32 {
         platform: val("--platform"),
         candidate_count: num(val("--candidate-count")).unwrap_or(7.0),
         build_path: crate::context_cli::recorded_build_path(&ctx, &cwd),
+        fresh_key,
     };
     match render_concept_seed(&env, &cwd, &mut budget, &seed) {
         Ok((text, meta)) => {
@@ -1468,5 +1474,18 @@ mod tests {
             let body = seen.lock().unwrap().iter().rfind(|r| r.0 == "POST").unwrap().3.clone();
             assert!(body.contains(&format!(r#""pingId":"{}""#, r0.ping_id.unwrap())), "{name}: {body}");
         }
+    }
+
+    #[test]
+    fn a_generated_key_takes_the_primary_salt_and_resolves() {
+        let (proj, skill) = fixture("fresh-key", &[("mode-persuade", MODE_FILE)]);
+        let (code, out) = seed(&proj, &skill, true, &["--scope", "direction"]);
+        assert_eq!(code, 0, "{out}");
+        let reference = out.lines().find_map(|l| l.strip_prefix("SEED REFERENCE: ")).unwrap().split('.').next().unwrap().to_string();
+        let ledgers: Vec<String> = std::fs::read_dir(proj.join(".impeccable/questions/seeds")).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.ends_with(".json")).collect();
+        assert_eq!(ledgers, vec![format!("{}.json", reference.trim_start_matches("seed:"))]);
+        let key = tl(&proj).resolve(&reference).unwrap();
+        assert!(key.len() == 32 && key.bytes().all(|b| b.is_ascii_hexdigit()), "{key}");
+        assert_eq!(tl(&proj).reference(&key).unwrap(), reference, "the searched path agrees with the fresh one");
     }
 }

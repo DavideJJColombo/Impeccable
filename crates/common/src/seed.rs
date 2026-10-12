@@ -219,6 +219,10 @@ pub fn locate(project: &str, primary: Option<&str>, kept: &[String], key: &str) 
             return None;
         }
         let stem = path.file_stem()?.to_string_lossy().into_owned();
+        // Unsalted when marked so, or when named by the no-salt tag (ledgers
+        // written before the marker existed): such a name is a public hash
+        // of the key, so it never becomes a reference.
+        let unsalted = unsalted || stem == tag(NO_SALT, key);
         let reference = (!unsalted && is_hex(&stem, 16)).then(|| format!("seed:{}", stem));
         Some(Located { path, exists: true, reference })
     };
@@ -249,13 +253,30 @@ pub fn locate(project: &str, primary: Option<&str>, kept: &[String], key: &str) 
     }
 }
 
+/// `locate` for a key the engine has just generated: 128 random bits have no
+/// ledger anywhere, so there is nothing to search; the key takes the primary
+/// salt (or, with none, an unsalted file and no reference).
+pub fn locate_fresh(project: &str, primary: Option<&str>, key: &str) -> Located {
+    let dir = seeds_dir(project);
+    match primary {
+        Some(s) => {
+            let path = dir.join(format!("{}.json", tag(s, key)));
+            Located { exists: path.exists(), path, reference: Some(reference(s, key)) }
+        }
+        None => {
+            let path = dir.join(format!("{}.json", tag(NO_SALT, key)));
+            Located { exists: path.exists(), path, reference: None }
+        }
+    }
+}
+
 /// The key a seed reference names on this machine: its ledger file, named
 /// by the reference itself, and the key recorded in it. `None` when there
 /// is no such ledger, or it is unsalted.
 pub fn resolve(project: &str, reference: &str) -> Option<String> {
     let t = parse_reference(reference)?;
     match ledger_key(&seeds_dir(project).join(format!("{}.json", t)))? {
-        (k, false) => Some(k),
+        (k, false) if t != tag(NO_SALT, &k) => Some(k),
         _ => None,
     }
 }
@@ -360,5 +381,22 @@ mod tests {
         std::fs::write(home.join(".impeccable/seed-salt"), "0123456789abcdef0123456789abcdef\n").unwrap();
         assert_eq!(salt(&h, Some(&p), None).unwrap(), "0123456789abcdef0123456789abcdef");
         assert_eq!(existing_salts(&h, Some(&p), None), vec!["0123456789abcdef0123456789abcdef".to_string(), project_salt]);
+    }
+
+    #[test]
+    fn a_legacy_no_salt_ledger_never_yields_a_reference() {
+        let project = temp("legacy-nosalt");
+        let p = project.to_string_lossy().into_owned();
+        let dir = seeds_dir(&p);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Written by an earlier build: the no-salt name, no "unsalted" marker.
+        let legacy = dir.join(format!("{}.json", tag(NO_SALT, "k1")));
+        std::fs::write(&legacy, r#"{"key":"k1"}"#).unwrap();
+        let l = locate(&p, Some("salt"), &["salt".to_string()], "k1");
+        assert_eq!((l.exists, l.reference), (true, None), "found, but no committable reference");
+        assert_eq!(resolve(&p, &format!("seed:{}", tag(NO_SALT, "k1"))), None);
+        // A fresh key skips the search and takes the primary salt.
+        let f = locate_fresh(&p, Some("salt"), "k2");
+        assert_eq!((f.exists, f.reference), (false, Some(reference("salt", "k2"))));
     }
 }
