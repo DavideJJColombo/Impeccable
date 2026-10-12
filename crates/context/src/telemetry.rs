@@ -249,7 +249,9 @@ fn lock(path: &str) -> Option<LockGuard> {
     loop {
         match std::fs::OpenOptions::new().write(true).create_new(true).open(&lock) {
             Ok(_) => return Some(LockGuard(lock)),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Windows answers a create racing a delete of the same name with
+            // access denied rather than exists: both mean another holder.
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied) => {
                 let stale = std::fs::metadata(&lock).ok().and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok()).is_some_and(|age| age.as_millis() > LOCK_STALE_MS);
                 if stale {
                     let _ = std::fs::remove_file(&lock);
@@ -327,9 +329,21 @@ impl Ledger {
 
     fn write_file(&self, path: &str, ledger: &Map<String, Value>) {
         let temp = format!("{}.tmp-{}", path, unique_suffix());
-        if std::fs::write(&temp, json_compact(&Value::Object(ledger.clone()))).and_then(|_| std::fs::rename(&temp, path)).is_err() {
+        if std::fs::write(&temp, json_compact(&Value::Object(ledger.clone()))).is_err() {
             let _ = std::fs::remove_file(&temp);
+            return;
         }
+        // A rename over a file an unlocked reader has open can fail for a
+        // moment on Windows; retry briefly before giving up.
+        for attempt in 0..20 {
+            if std::fs::rename(&temp, path).is_ok() {
+                return;
+            }
+            if attempt < 19 {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        let _ = std::fs::remove_file(&temp);
     }
 
     /// Read, change, write `key`'s ledger under its lock. The questions
