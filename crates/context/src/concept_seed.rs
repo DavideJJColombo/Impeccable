@@ -1375,4 +1375,59 @@ mod tests {
         assert!(check("k1").1.starts_with("SEED UNKNOWN: not a seed reference"));
         assert_eq!(check("none").0, 1, "a salt exists here, so none means skipped");
     }
+
+    #[test]
+    fn a_ledger_made_under_a_project_salt_keeps_serving_after_a_home_salt_appears() {
+        let (proj, skill) = fixture("salt-move", &[("mode-persuade", MODE_FILE)]);
+        let (base, seen) = roll_api();
+        // A home that cannot hold a directory stands in for a sandbox's read-only one.
+        let blocked = proj.join("blocked-home");
+        std::fs::write(&blocked, "").unwrap();
+        let home = proj.join("home");
+        let env_for = |h: &std::path::Path| {
+            Env::from([
+                ("IMPECCABLE_SKILL_DIR".into(), skill.to_string_lossy().into_owned()),
+                ("IMPECCABLE_CATALOG_DIR".into(), proj.join("no-such-catalog").to_string_lossy().into_owned()),
+                ("IMPECCABLE_API_URL".into(), base.clone()),
+                ("IMPECCABLE_API_TIMEOUT".into(), "3000".into()),
+                ("IMPECCABLE_NO_STALENESS_CHECK".into(), "1".into()),
+                ("IMPECCABLE_SELF".into(), "impeccable".into()),
+                ("HOME".into(), h.to_string_lossy().into_owned()),
+                ("USERPROFILE".into(), h.to_string_lossy().into_owned()),
+            ])
+        };
+        let call = |h: &std::path::Path, args: &[&str]| {
+            let (mut io, cap) = Io::captured("", proj.clone(), env_for(h));
+            let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            assert_eq!(run(&argv, &mut io), 0);
+            let out = String::from_utf8(cap.stdout.borrow().clone()).unwrap();
+            out
+        };
+        // Round 0, rolled in the sandbox: the project salt and its ledger file.
+        call(&blocked, &["--scope", "direction", "--from", "k1"]);
+        assert!(proj.join(".impeccable/questions/seed-salt").exists());
+        let sandbox_ledger = telemetry::Ledger::new(&env_for(&blocked), &proj.to_string_lossy());
+        let ping0 = sandbox_ledger.round("k1", Some(0)).unwrap().ping_id.unwrap();
+        // A home salt appears beside it.
+        std::fs::create_dir_all(home.join(".impeccable")).unwrap();
+        std::fs::write(home.join(".impeccable/seed-salt"), "0123456789abcdef0123456789abcdef\n").unwrap();
+        let l = telemetry::Ledger::new(&env_for(&home), &proj.to_string_lossy());
+        // The full cycle runs against the original file: the round, the page's
+        // claim and confirmation, and the agent's rerun.
+        let r0 = l.round("k1", Some(0)).expect("the round rolled in the sandbox");
+        assert_eq!(r0.ping_id.as_deref(), Some(ping0.as_str()));
+        let claimed = l.claim("k1", 0).expect("the page's claim");
+        l.confirm("k1", 0, "picker", claimed.ping_id.as_deref());
+        assert_eq!(call(&home, &["--kind", "assigned", "--from", "k1", "--scope", "direction", "--reroll", "0"]), "choice already recorded\n");
+        assert!(sandbox_ledger.round("k1", Some(0)).unwrap().confirmed(), "the same file, seen from the sandbox");
+        // Round 1, rolled with the home salt, lands in that same file, and the
+        // agent's ping carries its pingId and hand.
+        call(&home, &["--scope", "direction", "--from", "k1", "--reroll", "1"]);
+        let r1 = sandbox_ledger.round("k1", Some(1)).expect("one ledger per key");
+        assert_eq!(call(&home, &["--kind", "assigned", "--from", "k1", "--scope", "direction", "--reroll", "1"]), "choice recorded\n");
+        let body = seen.lock().unwrap().iter().rfind(|r| r.0 == "POST").unwrap().3.clone();
+        assert!(body.contains(&format!(r#""pingId":"{}""#, r1.ping_id.unwrap())) && body.contains(r#""handId":"00112233445566778899aabbccddeeff""#), "{body}");
+        let files = std::fs::read_dir(proj.join(".impeccable/questions/seeds")).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().ends_with(".json")).count();
+        assert_eq!(files, 1, "never a second ledger for the same key");
+    }
 }

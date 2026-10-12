@@ -301,10 +301,18 @@ impl Ledger {
         jsp::join(&[&self.dir(), &format!("{}.json", tag)])
     }
 
+    /// The one place a key's ledger is located, so every operation (resolve,
+    /// round, claim, confirm, release, record, prune) acts on the same file:
+    /// the first that exists among the key's names under every salt this
+    /// machine keeps (a sandboxed run's project salt, the home salt since),
+    /// else the primary salt's name, for a new ledger. Without any salt there
+    /// are no references; the file still needs a name, which only this
+    /// ignored folder ever sees.
     fn file(&self, key: &str) -> String {
-        // Without a salt there are no references to resolve; the file still
-        // needs a name, which only this ignored folder ever sees.
-        self.file_for_tag(&impeccable_common::seed::tag(self.salt.as_deref().unwrap_or("no-salt:local-ledger-name"), key))
+        const NO_SALT: &str = "no-salt:local-ledger-name";
+        let primary = self.file_for_tag(&impeccable_common::seed::tag(self.salt.as_deref().unwrap_or(NO_SALT), key));
+        let candidates = self.salts.iter().map(String::as_str).chain(std::iter::once(NO_SALT)).map(|s| self.file_for_tag(&impeccable_common::seed::tag(s, key)));
+        std::iter::once(primary.clone()).chain(candidates).find(|p| std::path::Path::new(p).exists()).unwrap_or(primary)
     }
 
     /// The seed reference committed files record instead of `key`, or `None`
