@@ -239,6 +239,28 @@ passing computed styles to the detector. New Chrome/Firefox color screenshots
 are in the hosted verification page. Earlier packaged-extension and prxps
 captures above remain historical evidence at their stated revision.
 
+## Whole-shadow validity follow-up (2026-10-13)
+
+An invalid layer invalidates the entire `box-shadow` declaration. The review
+example `0 0 -1px black, 4px 4px black` previously produced a static advisory even
+though browsers render no shadow. The same mismatch occurred with the invalid
+layer after the matching one. Both core and static HTML regressions failed
+before the fix.
+
+The check now parses the entire comma-separated list before reporting. It rejects
+negative blur, invalid length counts, duplicate paint/inset, interrupted length
+groups and empty layers. Unresolved values conservatively suppress the list.
+Valid inset, soft, transparent and negative-spread layers can still coexist with
+an outer hard-shadow advisory. Named and functional color parsing is preserved.
+
+`lists.html` contains four valid controls that should produce advisories and
+eight invalid declarations that should produce none. The static HTML and native
+Chromium tests assert four findings. The Chrome/Firefox WASM harness checks the
+exact four selectors and confirms all eight invalid controls compute to `none`.
+The two reviewed `detect-hard-offset-shadow-lists-*` oracle cases pin four
+advisories/exit 0 and `--no-advisory` returning `[]`/exit 0. Frozen function vectors
+remain unchanged.
+
 ## Limits and calibration
 
 This rule measures resolved outer box shadows with zero blur, nonnegative spread,

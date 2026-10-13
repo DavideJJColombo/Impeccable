@@ -7057,3 +7057,12 @@ Adds `detect-hard-offset-shadow-colors-advisory` and
 named colors, HWB alpha, and nested color-mix, plus five pass controls. Review the
 new goldens for exactly four advisory findings and exit 0, and no findings with
 `--no-advisory`. No frozen function vectors are changed.
+
+## Recorded 2026-10-13: validate complete hard-offset shadow lists
+
+Added and manually reviewed `detect-hard-offset-shadow-lists-advisory` and
+`detect-hard-offset-shadow-lists-no-advisory`. The fixture contains eight invalid
+declarations (including a negative blur before or after an otherwise matching
+layer) and four valid mixed-layer controls. Only the four valid declarations
+produce advisories; the CLI exits 0. With `--no-advisory`, stdout is `[]` and the
+exit remains 0. No existing goldens or frozen function vectors were regenerated.

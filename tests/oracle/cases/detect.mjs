@@ -65,6 +65,12 @@ export default function cases() {
 
   out.push(
     ...[false, true].map(noAdvisory => ({
+      id: `detect-hard-offset-shadow-lists-${noAdvisory ? 'no-advisory' : 'advisory'}`,
+      verb: 'detect',
+      args: ['--no-config', '--json', ...(noAdvisory ? ['--no-advisory'] : []), 'lists.html'],
+      setup: ws => fs.copyFileSync(path.join(REPO_ROOT, 'tests/fixtures/hard-offset-shadow/lists.html'), path.join(ws, 'lists.html')),
+    })),
+    ...[false, true].map(noAdvisory => ({
       id: `detect-hard-offset-shadow-colors-${noAdvisory ? 'no-advisory' : 'advisory'}`,
       verb: 'detect',
       args: ['--no-config', '--json', ...(noAdvisory ? ['--no-advisory'] : []), 'colors.html'],

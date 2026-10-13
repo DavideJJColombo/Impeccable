@@ -1,41 +1,63 @@
 //! Advisory geometry check, shared by static HTML and rendered DOM scans.
 use crate::checks::rules::RuleHit;
-use crate::color::{parse_any_color, split_top_level_commas, Rgba, COLOR_FUNCTION_NAMES};
+use crate::color::{parse_any_color, Rgba, COLOR_FUNCTION_NAMES};
 use cssparser::{Parser, ParserInput, Token};
 
 /// Four CSS pixels separates the fixture's deliberate displaced slabs from
 /// its small offset accents. This is a review threshold, not a design standard.
 /// Negative spread and unresolved lengths/colors stay outside this first rule.
 pub fn check_hard_offset_shadow(shadow: &str, current_color: &str, opacity: f64) -> Vec<RuleHit> {
-    for layer in split_top_level_commas(shadow) {
-        let Some((v, color)) = parse_layer(&layer, current_color) else {
-            continue;
-        };
-        if !opacity.is_finite() || color.alpha_or_one() * opacity <= 0.1 {
-            continue;
-        }
-        if !(2..=4).contains(&v.len()) {
+    let mut input = ParserInput::new(shadow);
+    let mut parser = Parser::new(&mut input);
+    // A malformed layer invalidates the entire CSS declaration, including a
+    // matching layer before it. Do not emit findings until every layer parses.
+    // Unresolved values likewise cannot establish a visible shadow here.
+    let layers: Result<_, cssparser::ParseError<'_, ()>> = parser.parse_comma_separated(|parser| {
+        let start = parser.position();
+        let layer = parse_layer(parser, current_color).ok_or_else(|| parser.new_custom_error(()))?;
+        Ok((parser.slice_from(start), layer))
+    });
+    let Ok(layers) = layers else {
+        return Vec::new();
+    };
+    for (text, layer) in layers {
+        let v = &layer.lengths;
+        if layer.inset || !opacity.is_finite() || layer.color.alpha_or_one() * opacity <= 0.1 {
             continue;
         }
         let blur = v.get(2).copied().unwrap_or(0.0);
         let spread = v.get(3).copied().unwrap_or(0.0);
         if blur == 0.0 && spread >= 0.0 && v[0].abs().max(v[1].abs()) >= 4.0 {
             return vec![RuleHit::new("hard-offset-shadow", format!(
-                "box-shadow: {} — hard offset with no blur; check whether this belongs to the intended visual direction", layer.trim()
+                "box-shadow: {} — hard offset with no blur; check whether this belongs to the intended visual direction", text.trim()
             ))];
         }
     }
     Vec::new()
 }
 
+struct ShadowLayer {
+    lengths: Vec<f64>,
+    color: Rgba,
+    inset: bool,
+}
+
+fn shadow_color(paint: &str) -> Option<Rgba> {
+    if paint.eq_ignore_ascii_case("transparent") {
+        Some(Rgba::new(0.0, 0.0, 0.0, 0.0))
+    } else {
+        parse_any_color(Some(paint))
+    }
+}
+
 // The static CSS serializer can omit whitespace between tokens (0#333 or
 // rgb(0,0,0)4px). Tokenize CSS rather than splitting on spaces, keeping nested
 // color functions whole and rejecting unresolved lengths and unknown paint.
-fn parse_layer(layer: &str, current_color: &str) -> Option<(Vec<f64>, Rgba)> {
-    let mut input = ParserInput::new(layer);
-    let mut parser = Parser::new(&mut input);
+fn parse_layer(parser: &mut Parser<'_, '_>, current_color: &str) -> Option<ShadowLayer> {
     let mut lengths = Vec::new();
     let mut color = None;
+    let mut inset = false;
+    let mut lengths_closed = false;
     while !parser.is_exhausted() {
         parser.skip_whitespace();
         let start = parser.position();
@@ -48,14 +70,25 @@ fn parse_layer(layer: &str, current_color: &str) -> Option<(Vec<f64>, Rgba)> {
                 // tokenizer stores numeric values as f32.
                 let raw = parser.slice_from(start);
                 let value = raw[..raw.len() - unit.len()].parse::<f64>().ok()?;
-                if !value.is_finite() {
+                if !value.is_finite() || lengths_closed {
                     return None;
                 }
                 lengths.push(value);
                 continue;
             }
             Token::Number { .. } if parser.slice_from(start).parse::<f64>().ok()? == 0.0 => {
+                if lengths_closed {
+                    return None;
+                }
                 lengths.push(0.0);
+                continue;
+            }
+            Token::Ident(ref name) if name.eq_ignore_ascii_case("inset") => {
+                if inset {
+                    return None;
+                }
+                inset = true;
+                lengths_closed |= !lengths.is_empty();
                 continue;
             }
             Token::Ident(ref name) if name.eq_ignore_ascii_case("currentcolor") => current_color,
@@ -75,21 +108,72 @@ fn parse_layer(layer: &str, current_color: &str) -> Option<(Vec<f64>, Rgba)> {
             }
             _ => return None,
         };
-        // A shadow has at most one paint; transparent/unknown paint stays out.
-        let parsed = parse_any_color(Some(paint))?;
+        // Color and inset may surround the length group, but cannot split it.
+        lengths_closed |= !lengths.is_empty();
+        let parsed = shadow_color(paint)?;
         if color.replace(parsed).is_some() {
             return None;
         }
     }
-    Some((
+    if !(2..=4).contains(&lengths.len()) || lengths.get(2).is_some_and(|blur| *blur < 0.0) {
+        return None;
+    }
+    Some(ShadowLayer {
         lengths,
-        color.or_else(|| parse_any_color(Some(current_color)))?,
-    ))
+        color: color.or_else(|| shadow_color(current_color))?,
+        inset,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn invalid_layer_rejects_the_entire_shadow_list() {
+        for invalid in [
+            "0 0 -1px black",
+            "inset 0 0 -1px black",
+            "4px black",
+            "0 0 0 0 0 black",
+            "4px 4px red blue",
+            "4px red 4px",
+            "4px inset 4px",
+            "inset inset 4px 4px",
+            "4px 4px notacolor",
+            "none",
+            "",
+        ] {
+            for shadow in [
+                format!("{invalid}, 4px 4px black"),
+                format!("4px 4px black, {invalid}"),
+            ] {
+                assert!(check_hard_offset_shadow(&shadow, "black", 1.0).is_empty(), "{shadow}");
+            }
+        }
+    }
+
+    #[test]
+    fn valid_nonmatching_layers_preserve_outer_shadow_advisories() {
+        for control in [
+            "inset 4px 4px black",
+            "4px 4px black inset",
+            "black inset 4px 4px",
+            "0 0 1px black",
+            "0 0 0 -1px black",
+            "0 0 transparent",
+            "0 0 TRANSPARENT",
+            "0 0 rgba(0, 0, 0, 0.1)",
+            "0 0 color-mix(in srgb, rgb(255, 0, 0) 50%, blue)",
+        ] {
+            for shadow in [
+                format!("{control}, 4px 4px black"),
+                format!("4px 4px black, {control}"),
+            ] {
+                assert_eq!(check_hard_offset_shadow(&shadow, "black", 1.0).len(), 1, "{shadow}");
+            }
+        }
+    }
+
     #[test]
     fn named_and_functional_shadow_colors() {
         for shadow in [

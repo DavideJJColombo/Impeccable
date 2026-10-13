@@ -118,3 +118,15 @@ fn named_and_functional_colors_match_static_findings_in_browser() {
         );
     }
 }
+
+#[test]
+fn invalid_shadow_lists_match_static_findings_in_browser() {
+    let Some(rows) = scan("hard-offset-shadow/lists.html") else {
+        return;
+    };
+    let hits: Vec<_> = rows.iter().filter(|f| f.0 == "hard-offset-shadow").collect();
+    assert_eq!(hits.len(), 4, "{hits:#?}");
+    for i in 0..4 {
+        assert!(hits.iter().any(|f| f.2 == format!("#flag-{i}") && f.3 == "advisory"), "{hits:#?}");
+    }
+}
