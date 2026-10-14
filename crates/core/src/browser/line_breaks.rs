@@ -50,14 +50,25 @@ const HEADING_MIN_COLUMN_CHARS: f64 = 20.0;
 const MIN_WORDS: usize = 3;
 
 /// The widths of the lines `el`'s text rendered on, top to bottom.
+///
+/// `None` when the lines do not stack in one column. Lines come back sorted
+/// top to bottom, so across `column-count` columns the lowest line need not
+/// be the last one read, and the rules would judge the wrong line. A line
+/// that shares no horizontal span with the widest one sits in another
+/// column; centered and indented lines still overlap it.
 fn line_widths(dom: &dyn Dom, el: ElId) -> Option<Vec<f64>> {
-    Some(
-        dom.text_line_rects(el)?
-            .into_iter()
-            .filter(|r| r.width > 0.0 && r.height > 0.0)
-            .map(|r| r.width)
-            .collect(),
-    )
+    let rects: Vec<_> = dom
+        .text_line_rects(el)?
+        .into_iter()
+        .filter(|r| r.width > 0.0 && r.height > 0.0)
+        .collect();
+    let widest = rects.iter().copied().reduce(|a, b| if b.width > a.width { b } else { a });
+    if let Some(w) = widest {
+        if rects.iter().any(|r| r.right <= w.left || r.left >= w.right) {
+            return None;
+        }
+    }
+    Some(rects.into_iter().map(|r| r.width).collect())
 }
 
 /// Whether `el`'s computed `text-wrap-style` is `style`. Chrome before 130
@@ -192,7 +203,7 @@ fn check_straggler(dom: &dyn Dom, el: ElId) -> Option<RuleHit> {
 /// `unbalanced-heading`: a heading of two or three lines whose last line is
 /// far shorter than the line above it.
 fn check_unbalanced_heading(dom: &dyn Dom, el: ElId) -> Option<RuleHit> {
-    if wraps_with(dom, el, "balance") || breaks_are_authored(dom, el) {
+    if wraps_with(dom, el, "balance") || wraps_with(dom, el, "pretty") || breaks_are_authored(dom, el) {
         return None;
     }
     let widths = line_widths(dom, el)?;
@@ -368,6 +379,42 @@ mod tests {
 
         d.set_style(h, "textWrapStyle", "balance");
         assert!(ids(&d, h).is_empty(), "balanced");
+    }
+
+    /// `pretty` on a heading is the author's choice of wrap too, as it is on
+    /// a paragraph: the rule does not second-guess it.
+    #[test]
+    fn a_pretty_heading_stands_the_rule_down() {
+        let mut d = FakeDom::new();
+        let (_h, body) = d.with_page();
+        let h = block(&mut d, body, "h2", "Design that holds up under real content and real people", &[856.0, 110.0]);
+        d.set_style(h, "textWrapStyle", "pretty");
+        assert!(ids(&d, h).is_empty());
+    }
+
+    /// In a multi-column paragraph the lines come back top to bottom across
+    /// the columns, so the lowest line need not be the last one in reading
+    /// order. Here the short line in the second column sorts last, but the
+    /// rule cannot tell that from a straggler it read in text order, so it
+    /// stays quiet rather than judge the wrong line.
+    #[test]
+    fn a_paragraph_set_in_columns_is_not_judged() {
+        let mut d = FakeDom::new();
+        let (_h, body) = d.with_page();
+        let text = format!("{PROSE} {PROSE}");
+        let p = block(&mut d, body, "p", &text, &[]);
+        d.set_text_lines(
+            p,
+            &[
+                (0.0, 100.0, 400.0, 19.0),
+                (440.0, 100.0, 400.0, 19.0),
+                (0.0, 124.0, 400.0, 19.0),
+                (440.0, 124.0, 400.0, 19.0),
+                (0.0, 148.0, 400.0, 19.0),
+                (440.0, 148.0, 40.0, 19.0),
+            ],
+        );
+        assert!(ids(&d, p).is_empty());
     }
 
     /// Near-even lines, a one-line heading, and a long statement set as a
