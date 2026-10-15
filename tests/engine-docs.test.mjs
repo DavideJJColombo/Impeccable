@@ -169,8 +169,14 @@ test('Windows and placeholder launchers are inspected', () => {
     assert.deepEqual(inline(command).diagnostics, [], command);
     assert.equal(inline(command.replace('--json', '--bad')).diagnostics.length, 1, command);
   }
-  assert.deepEqual(check('```cmd\nimpeccable.cmd detect ^\n  --json\n```').diagnostics, []);
-  assert.deepEqual(check('```powershell\nimpeccable.cmd detect `\n  --json\n```').diagnostics, []);
+  for (const [language, continuation] of [['cmd', '^'], ['powershell', '`']]) {
+    const result = check('```' + language + '\nimpeccable.cmd detect ' + continuation + '\n  --json\nimpeccable.cmd doctor --fix\n```');
+    assert.deepEqual(result.diagnostics, []);
+    assert.deepEqual(result.references.map((ref) => [ref.path, ref.line, ref.options]), [
+      [['detect'], 2, [{ name: '--json', form: 'separate', line: 3 }]],
+      [['doctor'], 4, [{ name: '--fix', form: 'separate', line: 4 }]],
+    ]);
+  }
 });
 
 test('a flag-shaped required value follows its parser, while standalone quotes do not hide options', () => {
@@ -220,10 +226,67 @@ test('skill prefixes and non-shell code are explicitly classified', () => {
 });
 
 test('multiline spans and longer backtick delimiters are inspected', () => {
-  assert.deepEqual(check('`impeccable generate-image\n--ref <image>`').diagnostics, []);
+  const result = check('`impeccable generate-image\n--ref <image>`');
+  assert.deepEqual(result.diagnostics, []);
+  assert.deepEqual(result.references[0].options, [{ name: '--ref', form: 'separate', line: 2 }]);
   assert.deepEqual(check("``impeccable embed-prompt image.png --prompt '`literal`'``").diagnostics, []);
   assert.match(check('```sh\nimpeccable detect --json').diagnostics[0]?.message ?? '', /Unclosed command fence/);
   assert.match(fence('impeccable comp-spec --crop "unclosed').diagnostics[0]?.message ?? '', /unclosed quote/);
+});
+
+test('wrapped inline options are validated at their original source lines', () => {
+  const result = inline('impeccable detect\n--unknown');
+  assert.deepEqual(result.references[0].options, [{ name: '--unknown', form: 'separate', line: 2 }]);
+  assert.equal(result.diagnostics.length, 1);
+  assert.equal(result.diagnostics[0].line, 2);
+  assert.match(result.diagnostics[0].message, /Unsupported or unreviewed option --unknown/);
+});
+
+test('wrapped check-seed retains the historical release mismatch', () => {
+  const command = 'impeccable concept-seed\n--check-seed <reference>';
+  const old = inline(command, historical);
+  assert.equal(old.diagnostics.length, 1);
+  assert.equal(old.diagnostics[0].line, 2);
+  assert.match(old.diagnostics[0].message, /--check-seed.*concept-seed.*0\.1\.14/);
+  const current = inline(command);
+  assert.deepEqual(current.diagnostics, []);
+  assert.deepEqual(current.references[0].options, [{ name: '--check-seed', form: 'separate', line: 2 }]);
+});
+
+test('inline line breaks become spaces before shell quotes, comments, or escapes', () => {
+  for (const command of ['impeccable detect "--js\non"', 'impeccable detect --js\\\non']) {
+    const result = inline(command);
+    assert.deepEqual(result.references[0].options, [{ name: '--js on', form: 'separate', line: 1 }]);
+    assert.equal(result.diagnostics.length, 1);
+    assert.match(result.diagnostics[0].message, /Unsupported or unreviewed option --js on/);
+  }
+  const comment = inline('# explanation\nimpeccable detect --unknown');
+  assert.deepEqual(comment.references, []);
+  assert.deepEqual(comment.diagnostics, []);
+  assert.equal(comment.classifications[0].kind, 'shell-comment');
+});
+
+test('tokens after multiline quotes and placeholders retain source lines', () => {
+  const quoted = inline('impeccable embed-prompt image.png --prompt "hero\nphoto" --unknown');
+  assert.deepEqual(quoted.references[0].options, [
+    { name: '--prompt', form: 'separate', line: 1 },
+    { name: '--unknown', form: 'separate', line: 2 },
+  ]);
+  assert.equal(quoted.diagnostics[0].line, 2);
+  for (const text of [
+    '`impeccable generate-image --ref <image📷\npath> --unknown`',
+    '```sh\nimpeccable generate-image --ref <image📷\npath> --unknown\n```',
+  ]) {
+    const result = check(text);
+    const firstLine = text.startsWith('```') ? 2 : 1;
+    assert.deepEqual(result.references[0].options, [
+      { name: '--ref', form: 'separate', line: firstLine },
+      { name: '--unknown', form: 'separate', line: firstLine + 1 },
+    ]);
+    assert.equal(result.diagnostics.length, 1);
+    assert.equal(result.diagnostics[0].line, firstLine + 1);
+    assert.match(result.diagnostics[0].message, /--unknown/);
+  }
 });
 
 test('the authored corpus passes and includes the historic invocation and explicit template classifications', () => {
