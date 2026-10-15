@@ -7066,3 +7066,11 @@ declarations (including a negative blur before or after an otherwise matching
 layer) and four valid mixed-layer controls. Only the four valid declarations
 produce advisories; the CLI exits 0. With `--no-advisory`, stdout is `[]` and the
 exit remains 0. No existing goldens or frozen function vectors were regenerated.
+
+## Recorded 2026-10-15: hard-offset shadow review trims
+
+At the maintainer's request on #998, hard-offset shadow findings now use the
+`quality` category and a colon instead of an em dash in the detail text. Reviewed
+the seven affected fixture, directory, and isolated CLI goldens: only this rule's
+category and punctuation changed. Findings, advisory severity, exit codes, and
+waiver behavior are unchanged. Frozen function vectors were not regenerated.

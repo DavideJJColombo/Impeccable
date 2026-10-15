@@ -3,8 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 
-// Run the shipped panel script, with extension APIs stubbed. Browser rendering
-// is exercised separately by fixtures/hard-offset-shadow/browser-check.mjs.
+// Run the shipped panel script, with extension APIs stubbed.
 function panel() {
   const element = () => ({ addEventListener() {}, style: {}, classList: { add() {} } });
   const context = vm.createContext({
@@ -29,7 +28,7 @@ function panel() {
 }
 
 const shadow = {
-  type: 'hard-offset-shadow', category: 'slop', severity: 'advisory', advisory: true,
+  type: 'hard-offset-shadow', category: 'quality', severity: 'advisory', advisory: true,
   name: 'Hard offset shadow', detail: '8px 8px 0px #111',
   description: 'Check whether this fits the intended design direction.',
 };
@@ -63,5 +62,25 @@ test('mixed reports preserve existing categories and suggestions for other rules
 test('empty reports and the existing unknown-rule fallback still work', async () => {
   const context = panel();
   assert.equal(await context.formatFindingsForCopy([]), 'Impeccable found no anti-patterns on this page.');
-  assert.equal(context.fixSkillFor('unknown-rule'), '/polish');
+  assert.equal(context.fixSkillFor({ type: 'unknown-rule' }), '/polish');
+});
+
+test('advisory presentation follows metadata for any rule and registry row', async () => {
+  const context = panel();
+  for (const advisory of [
+    { type: 'future-rule', category: 'quality', severity: 'advisory' },
+    { type: 'bounce-easing', category: 'slop', advisory: true },
+    { id: 'future-settings-rule', category: 'quality', severity: 'advisory' },
+  ]) {
+    assert.equal(context.presentationCategory(advisory), 'advisory');
+    assert.equal(context.fixSkillFor(advisory), '');
+    const finding = { ...advisory, name: 'Review this choice', detail: 'example' };
+    const report = await context.formatFindingsForCopy([item([finding])]);
+    assert.match(report, /## Advisories \(1\)/);
+    assert.doesNotMatch(report, /Suggested Impeccable skills to fix/);
+    const single = await context.formatSingleFindingForCopy(item([finding]), finding);
+    assert.doesNotMatch(single, /Suggested Impeccable skill/);
+  }
+  assert.equal(context.presentationCategory({ type: 'hard-offset-shadow', category: 'quality' }), 'quality');
+  assert.equal(context.fixSkillFor({ type: 'side-tab', advisory: false }), '/distill, /polish');
 });

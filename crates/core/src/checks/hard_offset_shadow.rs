@@ -29,7 +29,7 @@ pub fn check_hard_offset_shadow(shadow: &str, current_color: &str, opacity: f64)
         let spread = v.get(3).copied().unwrap_or(0.0);
         if blur == 0.0 && spread >= 0.0 && v[0].abs().max(v[1].abs()) >= 4.0 {
             return vec![RuleHit::new("hard-offset-shadow", format!(
-                "box-shadow: {} — hard offset with no blur; check whether this belongs to the intended visual direction", text.trim()
+                "box-shadow: {}: hard offset with no blur; check whether this belongs to the intended visual direction", text.trim()
             ))];
         }
     }

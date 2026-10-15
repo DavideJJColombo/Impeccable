@@ -182,7 +182,7 @@ pub static ANTIPATTERNS: &[Antipattern] = &[
     },
     Antipattern {
         id: "hard-offset-shadow",
-        category: "slop",
+        category: "quality",
         scopes: None,
         severity: Some("advisory"),
         name: "Hard offset shadow",
@@ -831,6 +831,7 @@ mod tests {
     fn registry_shape() {
         assert_eq!(ANTIPATTERNS.len(), 60);
         assert!(is_advisory_rule("hard-offset-shadow"));
+        assert_eq!(get_antipattern("hard-offset-shadow").unwrap().category, "quality");
         assert!(!IMMEDIATE_TIER_RULES.contains(&"hard-offset-shadow"));
         assert_eq!(ANTIPATTERNS[0].id, "side-tab");
         assert_eq!(rule_scopes(), vec!["type", "layout"]);

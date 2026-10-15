@@ -111,10 +111,12 @@ function initSpotlightBlurToggle(currentValue) {
 
 const CATEGORY_LABELS = { slop: 'AI tells', quality: 'Quality issues', advisory: 'Advisories' };
 
+function isAdvisory(finding) {
+  return finding.severity === 'advisory' || finding.advisory === true;
+}
+
 function presentationCategory(finding) {
-  // This geometric match asks about design intent; it cannot establish AI
-  // authorship. Keep the engine registry category stable for existing consumers.
-  if ((finding.type || finding.id) === 'hard-offset-shadow') return 'advisory';
+  if (isAdvisory(finding)) return 'advisory';
   return finding.category === 'slop' ? 'slop' : 'quality';
 }
 
@@ -261,9 +263,9 @@ const FIX_SKILLS = {
   'wide-tracking':           'typeset',
 };
 
-function fixSkillFor(type) {
-  if (type === 'hard-offset-shadow') return '';
-  const skills = FIX_SKILLS[type] || 'polish';
+function fixSkillFor(finding) {
+  if (isAdvisory(finding)) return '';
+  const skills = FIX_SKILLS[finding.type] || 'polish';
   // Prefix each comma-separated skill with a slash for clarity
   return skills.split(',').map(s => '/' + s.trim()).join(', ');
 }
@@ -274,7 +276,7 @@ function uniqueSkillsForFindings(findings) {
   const counts = new Map();
   for (const item of findings) {
     for (const f of item.findings) {
-      const skills = fixSkillFor(f.type);
+      const skills = fixSkillFor(f);
       if (!skills) continue;
       const list = skills.split(', ');
       for (const s of list) {
@@ -342,7 +344,7 @@ async function formatSingleFindingForCopy(item, finding) {
   lines.push('');
   lines.push(finding.description);
   lines.push('');
-  const skills = fixSkillFor(finding.type);
+  const skills = fixSkillFor(finding);
   if (skills) lines.push(`Suggested Impeccable skill(s) to fix: ${skills}`);
   return lines.join('\n');
 }
