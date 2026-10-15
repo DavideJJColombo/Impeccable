@@ -88,17 +88,24 @@ function markdownRegions(text) {
   }
   spans();
   if (fence) regions.push({ text: fence.lines.join('\n'), line: fence.line, unclosed: true, complete: true });
-  return regions;
+  return regions.map((region) => {
+    const sourceLines = [];
+    let line = region.line;
+    for (let i = 0; i < region.text.length; i++) {
+      sourceLines.push(line);
+      if (region.text[i] === '\n') line++;
+    }
+    return { ...region, input: { text: region.complete ? region.text : region.text.replace(/\n/g, ' '), sourceLines } };
+  });
 }
 
-function shellCommands(text, firstLine, language) {
+function shellCommands({ text, sourceLines }, language) {
   const commands = [];
   let tokens = [];
   let value = '';
   let started = false;
   let quote;
-  let line = firstLine;
-  let tokenLine = line;
+  let tokenLine;
   let problem;
   const token = () => {
     if (started) tokens.push({ value, line: tokenLine });
@@ -116,7 +123,6 @@ function shellCommands(text, firstLine, language) {
     if ((c === '\\' || language === 'cmd' && c === '^' || ['powershell', 'ps1'].includes(language) && c === '`')
       && text[i + 1] === '\n' && quote !== "'") {
       i++;
-      line++;
       continue;
     }
     if (quote) {
@@ -126,21 +132,19 @@ function shellCommands(text, firstLine, language) {
         if (quote === '"' && (c === '`' || c === '$' && text[i + 1] === '(')) problem = 'command substitution';
         value += c;
       }
-      if (c === '\n') line++;
       continue;
     }
     if (c === '#' && !started) {
       while (i < text.length && text[i] !== '\n') i++;
       command();
-      line++;
       continue;
     }
     if (/\s/.test(c)) {
       token();
-      if (c === '\n') { command(); line++; }
+      if (c === '\n') command();
       continue;
     }
-    if (!started) { started = true; tokenLine = line; }
+    if (!started) { started = true; tokenLine = sourceLines[i]; }
     if (c === '"' || c === "'") { quote = c; continue; }
     if (c === '<' && /^[a-zA-Z]/.test(text[i + 1] ?? '') && text.indexOf('>', i) >= 0) {
       const end = text.indexOf('>', i);
@@ -181,7 +185,7 @@ export function checkDocuments(documents, contract) {
         classifications.push({ file, line: region.line, kind: template.kind, text: template.text });
         continue;
       }
-      const commands = shellCommands(region.text, region.line, region.language);
+      const commands = shellCommands(region.input, region.language);
       let found = false;
       for (const { tokens, problem } of commands) {
         const index = tokens.findIndex((token) => LAUNCHER.test(token.value)
