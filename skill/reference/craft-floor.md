@@ -41,6 +41,17 @@ Surface habits:
 - Geometric masks standing in for organic contours. A circle, polygon, or radial-gradient cutout approximating a photographic subject's edge is the cheap version of the effect and reads worse than omitting it. Derive an alpha matte from the actual image, or produce a cut-out asset. <!-- rule:skill-ban-geometric-occlusion-mask -->
 - Light or dark picked by category. Pick it from the use scene: who, where, under what ambient light. <!-- rule:skill-reflex-theme-by-habit -->
 
+Generated tells:
+
+These clusters arrive together whatever the subject; any one of them needs the brief's own words behind it.
+
+- The warm cream-and-clay palette: cream ground around #F4F1EA, a high-contrast serif display, and a terracotta or warm-clay accent around #D97757. It is the most common generated look; reaching for it on a free axis means not deciding. <!-- rule:skill-reflex-cream-clay-palette -->
+- Near-black ground with a single acid-green or vermilion accent carrying the whole palette. One accent is a default, not a system. <!-- rule:skill-reflex-one-accent-dark -->
+- Broadsheet costume: hairline rules, zero border-radius, and dense newspaper columns on a subject with no broadsheet in it. <!-- rule:skill-reflex-broadsheet-costume -->
+- Template chrome that follows the page regardless of subject: meta strings joined with middle dots (A · B · C), labels built as 'WORD — fragment' with a spaced em dash, a monospace face on every small data label, and an arrow appended to link and button text. The tracked-out ALL-CAPS eyebrow is banned above; these are its siblings. <!-- rule:skill-reflex-template-meta-chrome -->
+- Tinted near-black (#0B0B0B, #111) standing in for black. Black is a choice; near-black is a tell. <!-- rule:skill-reflex-tinted-near-black -->
+- One soft grey shadow (rgba(0,0,0,.1)) under every card and a single border-radius on everything, whatever the hierarchy says. Depth and radius are per-element decisions. <!-- rule:skill-reflex-uniform-shadow-radius -->
+
 <codex>
 - Tracking stops at -0.04em. -0.02 to -0.03em usually reads better. <!-- rule:skill-typo-codex-tracking-repeat -->
 - Declare elevation once, border or shadow. A 1px border under a wide soft shadow is the ghost card. Card radii stay at 12–16px; pills are for small controls. <!-- rule:skill-codex-elevation-radius --> <!-- rule:skill-ban-codex-ghost-card --> <!-- rule:skill-ban-codex-over-round -->
