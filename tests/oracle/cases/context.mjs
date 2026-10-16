@@ -767,6 +767,10 @@ const cases = [
   { id: 'genimg-real-base-openai-default', verb: 'generate-image', workspace: 'ctx-empty', args: ['--prompt', 'x', '--out', 'x.png'], env: env({ OPENAI_BASE_URL: 'https://api.openai.com/v1' }) },
   { id: 'genimg-real-base-model-guard', verb: 'generate-image', workspace: 'ctx-empty', args: ['--prompt', 'x', '--out', 'x.png'], env: env({ OPENAI_BASE_URL: 'http://127.0.0.1:9/v1' }) },
   { id: 'genimg-real-base-invalid', verb: 'generate-image', workspace: 'ctx-empty', args: ['--prompt', 'x', '--out', 'x.png'], env: env({ OPENAI_BASE_URL: 'ftp://127.0.0.1:8188/v1', OPENAI_API_KEY: 'sk-oracle' }) },
+  // --ref uploads to OpenAI's asset API; a configured endpoint refuses it by name before any request.
+  { id: 'genimg-real-base-ref', verb: 'generate-image', workspace: 'ctx-empty', args: ['--prompt', 'x', '--out', 'x.png', '--model', 'seedream', '--ref', 'world.webp'], env: env({ OPENAI_BASE_URL: 'http://127.0.0.1:9/v1', OPENAI_API_KEY: 'sk-oracle' }) },
+  // Fake mode ignores the seam entirely: an unusable base must not break a fake generation.
+  { id: 'genimg-fake-base-invalid', verb: 'generate-image', workspace: 'ctx-empty', args: ['--prompt', 'A comp.', '--out', 'x.png', '--size', '64x40'], env: env({ IMPECCABLE_IMAGE_GEN_FAKE: '1', OPENAI_BASE_URL: 'ftp://localhost/v1' }) },
   // --ref takes a URL too; one that cannot be downloaded names the URL and generates nothing.
   { id: 'genimg-real-ref-url-unreachable', verb: 'generate-image', workspace: 'ctx-empty', args: ['--prompt', 'x', '--out', 'x.png', '--ref', 'http://127.0.0.1:9/cards/world.webp'], env: env({ OPENAI_API_KEY: 'sk-oracle' }), files: ['x.png*'] },
   // Fake mode never fetches a URL ref.

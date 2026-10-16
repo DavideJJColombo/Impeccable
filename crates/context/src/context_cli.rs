@@ -206,7 +206,7 @@ fn append_image_gen_directive(parts: &mut Parts, env: &Env, provider: &Provider)
         parts.push([
             "IMAGE_GEN_AVAILABLE: your harness-native image tool is always the first choice for generation; use it whenever one exists.".to_string(),
             "This environment also carries an OpenAI-compatible image endpoint as the fallback for harnesses with no native tool:".to_string(),
-            format!("`{} --prompt \"...\" --out <file> --model <id>` (the endpoint configured in OPENAI_BASE_URL at {base}; generations run there, not billed to OpenAI; --model names the model that endpoint serves; say so before the first render, and never reach for it when a native tool exists).", provider.verb_cmd("generate-image")),
+            format!("`{} --prompt \"...\" --out <file> --model <id>` (the endpoint configured in OPENAI_BASE_URL at {base}; generations run there, not billed to OpenAI; --model names the model that endpoint serves; reference uploads (--ref) are unavailable there; say so before the first render, and never reach for it when a native tool exists).", provider.verb_cmd("generate-image")),
             "Visualizing a direction before building it measurably strengthens the result.".to_string(),
         ].join(" "));
         return;
@@ -950,6 +950,7 @@ mod image_gen_directive_tests {
         assert!(line.contains("OpenAI-compatible image endpoint"), "{line}");
         assert!(line.contains("http://127.0.0.1:8188/v1"), "{line}");
         assert!(line.contains("--model <id>"), "{line}");
+        assert!(line.contains("reference uploads (--ref) are unavailable"), "{line}");
         assert!(!line.contains("carries an OpenAI key"), "{line}");
         assert!(!line.contains("billed to the user's key"), "{line}");
         assert!(!line.contains("billed to your OpenAI key"), "{line}");
