@@ -368,6 +368,14 @@ The rule logic lives in `crates/core`: every check, the browser rule adapters ov
 
 Order for a new rule: fixture here first, registry row in `crates/foundation/src/registry.rs`, the check in `crates/core` against that fixture, oracle case + golden, `cargo xtask bundle` to refresh the two tracked live assets, then `bun run build && bun run test` with a binary present. Rule counts quoted in `README.md` / `README.npm.md` are validated by `generateCounts` against `crates/live/assets/antipatterns.json`.
 
+**Hook cost is part of a rule.** The edit hook is a new process on every Edit or Write in millions of agent sessions, and it runs the whole text engine (or, for `.html`, the whole static HTML engine) cold: `IMMEDIATE_TIER_RULES` only filters which findings are shown per edit, it does not skip rules. So every text or static-HTML rule is paid on every edit, regex compilation and lazy tables included, and a millisecond matters. Before landing a new or changed check in those engines, measure it on main and on the branch and put both numbers in the PR:
+
+```bash
+cargo run --release -p impeccable-html --example rule_cost -- --runs 9 tests/fixtures/antipatterns <real project source>
+```
+
+It writes `rule-cost.json`: per edit, cold, per engine, the shared parse and cascade work, and every profiled unit with the rules it emitted (mean, p50, p95 ms). A rule inside a shared pass (`color-rules`, `html-patterns`, ...) moves that pass's number. Prefer the detection that touches less: one regex over many, a tag- or property-gated check over a per-element walk, work that rides an existing pass over a new one. A check that needs layout or pixels belongs in the browser engine, not the hook. The Detector Lab's Rules page charts these numbers per rule.
+
 ### Rule packs (downstream crates adding rules)
 
 A crate that depends on this workspace can add rules without forking it: implement `impeccable_core::rule_pack::RulePack` (text plus the two browser DOM hooks) and, for the static engine, `impeccable_html::StaticRulePack`, call `impeccable_core::rule_pack::install(&PACK)` at startup, and hand the pack to the engine through `TextOptions` / `ScanOptions`, `DetectHtmlOptions`, `StaticHtmlEngine`, or `BrowserConfig`. Every hook runs after the built-ins and before inline ignores, so built-in output with no pack installed is byte-identical, which the oracle enforces. The registry keeps `ANTIPATTERNS` as the built-in list and `registry::extend` appends a pack's rows, panicking on an id collision. `crates/wasm --features detect` exposes the two file engines as JSON exports (`detect_text_json`, `detect_html_source_json`) for hosts that cannot exec the binary; Pristine consumes that path. Full contract in `docs/ENGINE.md` ("Rule packs"). The shipped `impeccable` binary installs no pack, and nothing in this repo should start doing so.
