@@ -44,6 +44,12 @@
       <p class="label">Pass: the hero heading set with text-wrap balance</p>
       <h1 class="head pass-balance" style="width: 32.5ch; text-wrap: balance">Design that holds up under real content</h1>
 
+      <!-- pretty inherited from an ancestor does not stand the rule down; the
+           rule reads the lines Chromium set, and Chromium's pretty pulls
+           "real" down, so the tail is no longer a leftover. -->
+      <p class="label">Pass: the hero heading under text-wrap pretty set on an ancestor</p>
+      <div style="text-wrap: pretty"><h1 class="head pass-pretty-ancestor" style="width: 32.5ch">Design that holds up under real content</h1></div>
+
       <p class="label">Pass: a heading that fits one line</p>
       <h2 class="head pass-one-line" style="width: 32.5ch">Design that holds up</h2>
 

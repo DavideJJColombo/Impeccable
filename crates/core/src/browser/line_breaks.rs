@@ -5,7 +5,10 @@
 //! Both read the rendered lines (`Dom::text_line_rects`, one rect per line
 //! box), so only the URL engine reports them: the static engine lays out
 //! nothing. Both stand down where the author already chose how the lines
-//! break: `text-wrap: pretty` or `balance`, a `<br>`, preformatted text.
+//! break: `text-wrap: balance`, a `<br>`, preformatted text. `pretty` stands
+//! down `straggler` only: it pulls a word down beside a lone last word but
+//! does not even out a heading, and it inherits, so `pretty` on `body` would
+//! otherwise silence every heading on the page.
 //!
 //! Both are advisory. An uneven break can be the design: a headline that
 //! lands on one word for weight, a poster line, a pull quote.
@@ -203,7 +206,7 @@ fn check_straggler(dom: &dyn Dom, el: ElId) -> Option<RuleHit> {
 /// `unbalanced-heading`: a heading of two or three lines whose last line is
 /// far shorter than the line above it.
 fn check_unbalanced_heading(dom: &dyn Dom, el: ElId) -> Option<RuleHit> {
-    if wraps_with(dom, el, "balance") || wraps_with(dom, el, "pretty") || breaks_are_authored(dom, el) {
+    if wraps_with(dom, el, "balance") || breaks_are_authored(dom, el) {
         return None;
     }
     let widths = line_widths(dom, el)?;
@@ -381,15 +384,16 @@ mod tests {
         assert!(ids(&d, h).is_empty(), "balanced");
     }
 
-    /// `pretty` on a heading is the author's choice of wrap too, as it is on
-    /// a paragraph: the rule does not second-guess it.
+    /// `pretty` does not even out a heading's lines, and it inherits: set on
+    /// `body` for the prose, it computes as `pretty` on every heading. So it
+    /// leaves the heading rule on; only `balance` stands it down.
     #[test]
-    fn a_pretty_heading_stands_the_rule_down() {
+    fn a_pretty_heading_is_still_unbalanced() {
         let mut d = FakeDom::new();
         let (_h, body) = d.with_page();
         let h = block(&mut d, body, "h2", "Design that holds up under real content and real people", &[856.0, 110.0]);
         d.set_style(h, "textWrapStyle", "pretty");
-        assert!(ids(&d, h).is_empty());
+        assert_eq!(ids(&d, h), ["unbalanced-heading"]);
     }
 
     /// In a multi-column paragraph the lines come back top to bottom across

@@ -94,6 +94,6 @@ fn the_line_break_rules_read_the_rendered_lines() {
         &headings,
         "unbalanced-heading",
         &["flag-hero", "flag-three-lines", "flag-centred", "flag-card"],
-        &["pass-balance", "pass-one-line", "pass-even", "pass-stacked", "pass-statement", "pass-two-words", "pass-narrow", "pass-break"],
+        &["pass-balance", "pass-pretty-ancestor", "pass-one-line", "pass-even", "pass-stacked", "pass-statement", "pass-two-words", "pass-narrow", "pass-break"],
     );
 }
