@@ -57,9 +57,12 @@ fn ext(path: &Path) -> String {
 }
 
 /// One cold sample: the engine the hook would pick, over one file, profiled.
-fn one(path: &Path) -> Value {
+/// A file that cannot be read or scanned is an error, never an empty sample.
+fn one(path: &Path) -> Result<Value, String> {
     let file = path.to_string_lossy().to_string();
-    let content = std::fs::read_to_string(path).unwrap_or_default();
+    // As the hook reads it (`hook.rs`): bytes, decoded lossily.
+    let bytes = std::fs::read(path).map_err(|e| format!("cannot read {file}: {e}"))?;
+    let content = String::from_utf8_lossy(&bytes).into_owned();
     let profile = Rc::new(DetectorProfile::new());
     let html = is_html(path);
     let started = Instant::now();
@@ -71,7 +74,7 @@ fn one(path: &Path) -> Value {
         };
         StaticHtmlEngine::default()
             .detect_html(&file, &options, &mut std::io::sink())
-            .unwrap_or_default()
+            .map_err(|e| format!("the HTML engine failed on {file}: {}", e.message))?
     } else {
         let options = TextOptions {
             profile: Some(&profile),
@@ -87,17 +90,26 @@ fn one(path: &Path) -> Value {
         .iter()
         .map(|e| json!({ "engine": e.engine, "phase": e.phase, "unit": e.rule_id, "ms": e.ms, "rules": e.finding_ids.clone().unwrap_or_default() }))
         .collect();
-    json!({
+    Ok(json!({
         "file": file,
         "engine": if html { "static-html" } else { "text" },
-        "bytes": content.len(),
+        "bytes": bytes.len(),
         "totalMs": total_ms,
         "findings": findings.len(),
         "events": events,
-    })
+    }))
 }
 
-fn collect(path: &Path, out: &mut Vec<PathBuf>) {
+/// The files the hook would scan under `path`. A symlink met while walking is
+/// skipped (a link to a sibling would weigh its files twice, a link to a
+/// parent would loop); a path given on the command line is followed.
+fn collect(path: &Path, out: &mut Vec<PathBuf>, top: bool) {
+    let link = std::fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false);
+    if link && !top {
+        return;
+    }
     if path.is_dir() {
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if matches!(
@@ -111,7 +123,7 @@ fn collect(path: &Path, out: &mut Vec<PathBuf>) {
             .unwrap_or_default();
         entries.sort();
         for entry in entries {
-            collect(&entry, out);
+            collect(&entry, out, false);
         }
     } else if HOOK_EXTS.contains(&ext(path).as_str()) {
         out.push(path.to_path_buf());
@@ -122,6 +134,8 @@ fn collect(path: &Path, out: &mut Vec<PathBuf>) {
 /// matching, extracting style blocks. Every edit pays it.
 const SHARED_PHASES: &[&str] = &[
     "setup",
+    // Reading a page's local linked stylesheets (`cascade/build.rs`).
+    "preprocess",
     "parse-html",
     "parse-css",
     "cascade",
@@ -175,7 +189,13 @@ fn main() {
             eprintln!("usage: rule_cost --one <file>");
             std::process::exit(1);
         };
-        println!("{}", one(Path::new(path)));
+        match one(Path::new(path)) {
+            Ok(sample) => println!("{sample}"),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+        }
         return;
     }
 
@@ -198,7 +218,11 @@ fn main() {
             skip = true;
             continue;
         }
-        collect(Path::new(a), &mut inputs);
+        if !Path::new(a).exists() {
+            eprintln!("rule_cost: no such file or directory: {a}");
+            std::process::exit(1);
+        }
+        collect(Path::new(a), &mut inputs, true);
     }
     if inputs.is_empty() {
         eprintln!("usage: rule_cost [--runs N] [--out rule-cost.json] <file-or-dir>...");
@@ -221,8 +245,18 @@ fn main() {
                 .output()
                 .expect("spawn");
             let wall = started.elapsed().as_secs_f64() * 1000.0;
-            let Ok(sample) = serde_json::from_slice::<Value>(&output.stdout) else {
-                continue;
+            // A failed sample stops the run: a report with holes in it is not a measurement.
+            let sample = match serde_json::from_slice::<Value>(&output.stdout) {
+                Ok(sample) if output.status.success() => sample,
+                _ => {
+                    eprintln!(
+                        "\nrule_cost: the sample of {} failed ({}): {}",
+                        path.display(),
+                        output.status,
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    );
+                    std::process::exit(1);
+                }
             };
             let engine = sample["engine"].as_str().unwrap_or("?").to_string();
             process_ms.entry(engine.clone()).or_default().push(wall);
