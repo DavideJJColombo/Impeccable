@@ -8,6 +8,48 @@ use std::io::Write;
 
 pub const DEFAULT_MODEL: &str = "gpt-image-2.5-flare";
 
+/// The endpoint `generate-image` had always hardcoded. Unset, empty, or a
+/// value equal to this keeps today's behavior exactly: key required, OpenAI
+/// billing claimed, default model sent.
+pub const DEFAULT_API_BASE: &str = "https://api.openai.com/v1";
+
+/// #832: normalize `OPENAI_BASE_URL`. `Ok(Some(endpoint))` when the operator
+/// configured a valid http(s) URL other than OpenAI's (outer whitespace and
+/// trailing slashes stripped), `Ok(None)` when unset, empty, whitespace-only,
+/// or already pointing at `api.openai.com/v1`, and `Err(reason)` when set to
+/// a value that cannot be used — callers refuse rather than guess around it,
+/// because the operator meant to point the tool somewhere specific.
+pub fn configured_api_base(env: &Env) -> Result<Option<String>, String> {
+    let Some(raw) = env.get("OPENAI_BASE_URL").filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let base = raw.trim().trim_end_matches('/');
+    if base.is_empty() || base == DEFAULT_API_BASE {
+        return Ok(None);
+    }
+    let rest = match base.strip_prefix("https://").or_else(|| base.strip_prefix("http://")) {
+        Some(rest) => rest,
+        None => return Err("must start with http:// or https://".into()),
+    };
+    if base.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("must not contain whitespace or control characters".into());
+    }
+    if rest.is_empty() || rest.starts_with('/') {
+        return Err("must name a host".into());
+    }
+    Ok(Some(base.to_string()))
+}
+
+/// The provenance fragment on the success line: an OpenAI billing claim only
+/// when the endpoint actually is OpenAI's.
+fn provenance_for(api_base: &str) -> String {
+    if api_base == DEFAULT_API_BASE {
+        "billed to your OpenAI key".into()
+    } else {
+        format!("generated via the configured endpoint {api_base}")
+    }
+}
+
 fn arg(args: &[String], name: &str) -> Option<String> {
     let i = args.iter().position(|a| a == &format!("--{}", name))?;
     let v = args.get(i + 1)?;
@@ -313,7 +355,25 @@ fn url_file_name(url: &str) -> String {
 }
 
 pub fn run(args: &[String], io: &mut Io) -> i32 {
-    run_with_api_base(args, io, "https://api.openai.com/v1")
+    // #832: OPENAI_BASE_URL re-points real requests at any OpenAI-compatible
+    // image endpoint. The model guard belongs here — it is about what the
+    // operator configured — and skips fake mode, which makes no request.
+    let api_base = match configured_api_base(&io.env) {
+        Ok(Some(base)) => {
+            let fake = io.env.get("IMPECCABLE_IMAGE_GEN_FAKE").map(|v| !v.is_empty()).unwrap_or(false);
+            if !fake && arg(args, "model").as_deref().unwrap_or(DEFAULT_MODEL) == DEFAULT_MODEL {
+                io.err("generate-image: OPENAI_BASE_URL names a non-OpenAI endpoint, whose served model is not the OpenAI default; add --model <id> matching the model that endpoint serves.\n");
+                return 1;
+            }
+            base
+        }
+        Ok(None) => DEFAULT_API_BASE.to_string(),
+        Err(reason) => {
+            io.err(&format!("generate-image: OPENAI_BASE_URL is set but unusable: {reason}. Unset it to use api.openai.com/v1.\n"));
+            return 1;
+        }
+    };
+    run_with_api_base(args, io, &api_base)
 }
 
 fn run_with_api_base(args: &[String], io: &mut Io, api_base: &str) -> i32 {
@@ -368,10 +428,15 @@ fn run_with_api_base(args: &[String], io: &mut Io, api_base: &str) -> i32 {
         note_generated_slot(io, &out);
         return 0;
     }
-    let Some(key) = env.get("OPENAI_API_KEY").filter(|k| !k.is_empty()).cloned() else {
+    // A configured endpoint is the operator's own server: a missing key means
+    // an unauthenticated call, not a refusal. OpenAI's default keeps the key
+    // requirement (that endpoint refuses anyway). The endpoint model guard
+    // lives in run(), where the configuration is read.
+    let key = env.get("OPENAI_API_KEY").filter(|k| !k.is_empty()).cloned().unwrap_or_default();
+    if api_base == DEFAULT_API_BASE && key.is_empty() {
         io.err("generate-image: OPENAI_API_KEY is not set; use the harness-native image tool instead.\n");
         return 1;
-    };
+    }
     let prompt = match arg(args, "prompt-file") {
         Some(pf) => match read_prompt_file(io, &pf) {
             Ok(p) => Some(p),
@@ -448,9 +513,9 @@ fn run_with_api_base(args: &[String], io: &mut Io, api_base: &str) -> i32 {
             body.extend_from_slice(b"\r\n");
         }
         body.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
-        agent
-            .post(&format!("{api_base}/images/edits"))
-            .set("Authorization", &format!("Bearer {}", key))
+        let post = agent.post(&format!("{api_base}/images/edits"));
+        let post = if key.is_empty() { post } else { post.set("Authorization", &format!("Bearer {key}")) };
+        post
             .set("Content-Type", &format!("multipart/form-data; boundary={}", boundary))
             .send_bytes(&body)
     } else {
@@ -464,9 +529,9 @@ fn run_with_api_base(args: &[String], io: &mut Io, api_base: &str) -> i32 {
             m.insert("background".into(), Value::String(background.clone()));
             m.insert("output_format".into(), Value::String("png".into()));
         }
-        agent
-            .post(&format!("{api_base}/images/generations"))
-            .set("Authorization", &format!("Bearer {}", key))
+        let post = agent.post(&format!("{api_base}/images/generations"));
+        let post = if key.is_empty() { post } else { post.set("Authorization", &format!("Bearer {key}")) };
+        post
             .set("content-type", "application/json")
             .send_string(&serde_json::to_string(&Value::Object(m)).unwrap())
     };
@@ -512,6 +577,9 @@ fn run_with_api_base(args: &[String], io: &mut Io, api_base: &str) -> i32 {
         m.insert("createdAt".into(), Value::String(iso_now()));
         m.insert("tool".into(), Value::String("impeccable generate-image".into()));
         m.insert("model".into(), Value::String(model.clone()));
+        if api_base != DEFAULT_API_BASE {
+            m.insert("endpoint".into(), Value::String(api_base.to_string()));
+        }
         if let Some(background) = &background {
             m.insert("background".into(), Value::String(background.clone()));
             m.insert("outputFormat".into(), Value::String("png".into()));
@@ -523,11 +591,12 @@ fn run_with_api_base(args: &[String], io: &mut Io, api_base: &str) -> i32 {
     }
     note_generated_slot(io, &out);
     io.out(&format!(
-        "IMAGE: {} ({}, {}, {}, billed to your OpenAI key); {} at {}.json\n",
+        "IMAGE: {} ({}, {}, {}, {}); {} at {}.json\n",
         out,
         size,
         quality,
         model,
+        provenance_for(api_base),
         if embedded { "prompt embedded + sidecar" } else { "sidecar" },
         out
     ));
@@ -648,10 +717,13 @@ mod tests {
         let original = base64_decode("iVBORw0KGgoAAAANSUhEUgAAAAQAAAABCAYAAAD5PA/NAAAAGklEQVR4nGP4////f7mAigYGBgaG/////wMAUdQJXhk2RAEAAAAASUVORK5CYII=");
         assert!(image.starts_with(&original[..original.len() - 12]));
         assert_eq!(sidecar["model"], model);
+        assert_eq!(sidecar["endpoint"], api_base);
         assert_eq!(sidecar["prompt"], "Comp regression");
         assert!(image.starts_with(b"\x89PNG\r\n\x1a\n"));
         let stdout = String::from_utf8(captured.stdout.borrow().clone()).unwrap();
-        assert!(stdout.contains(&format!("{model}, billed to your OpenAI key")));
+        // The round-trip server is not OpenAI, so the contract line names the
+        // endpoint instead of claiming OpenAI billing (#832).
+        assert!(stdout.contains(&format!("{model}, generated via the configured endpoint {api_base}")), "{stdout}");
         assert!(stdout.contains("prompt embedded + sidecar"));
     }
 
@@ -872,5 +944,152 @@ mod tests {
             assert!(stderr.contains("--background"), "{stderr}");
             assert!(!stderr.contains("OPENAI_API_KEY"));
         }
+    }
+
+    // #832: OPENAI_BASE_URL re-points the request at any OpenAI-compatible
+    // image endpoint. Unset (or empty, or already api.openai.com/v1) is
+    // today's behavior exactly. A configured endpoint carries no OpenAI
+    // billing claim and no OpenAI key requirement; its model must be named.
+
+    #[test]
+    fn api_base_resolution() {
+        // Unset, empty, whitespace-only, or already OpenAI (with or without
+        // trailing slashes): the default, so no re-pointing happened.
+        for raw in ["", "   ", "https://api.openai.com/v1", "https://api.openai.com/v1///"] {
+            assert_eq!(configured_api_base(&Env::from([("OPENAI_BASE_URL".into(), raw.into())])), Ok(None), "{raw:?}");
+        }
+        // A configured endpoint, outer whitespace and trailing slashes stripped.
+        assert_eq!(
+            configured_api_base(&Env::from([("OPENAI_BASE_URL".into(), " http://127.0.0.1:8188/v1/ ".into())])),
+            Ok(Some("http://127.0.0.1:8188/v1".into()))
+        );
+        // An unusable value is refused with a reason, never guessed around.
+        for bad in ["not a url", "ftp://127.0.0.1:8188/v1", "HTTP://127.0.0.1/v1", "http://", "http:///v1", "http://lo cal/v1", "https://\r\nx/v1"] {
+            assert!(configured_api_base(&Env::from([("OPENAI_BASE_URL".into(), bad.into())])).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn an_unusable_configured_base_refuses_before_anything_else() {
+        let dir = temp("base-invalid");
+        let (mut io, captured) = Io::captured(
+            "",
+            dir.clone(),
+            Env::from([("OPENAI_BASE_URL".into(), "ftp://127.0.0.1:8188/v1".into()), ("OPENAI_API_KEY".into(), "test-key".into())]),
+        );
+        let args: Vec<String> = ["--prompt", "p", "--out", "comp.png"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(run(&args, &mut io), 1);
+        let stderr = String::from_utf8(captured.stderr.borrow().clone()).unwrap();
+        assert!(stderr.contains("OPENAI_BASE_URL"), "{stderr}");
+        assert!(!stderr.contains("OPENAI_API_KEY"), "the base error comes first: {stderr}");
+        assert!(!dir.join("comp.png").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_configured_base_demands_its_model_before_args_are_read() {
+        // A configured endpoint with no key must not print the OpenAI key
+        // refusal; the model guard fires instead, because a local server
+        // does not serve the OpenAI default model id.
+        let (mut io, captured) = Io::captured("", std::env::temp_dir(), Env::from([("OPENAI_BASE_URL".into(), "http://127.0.0.1:9/v1".into())]));
+        let args: Vec<String> = ["--prompt", "p", "--out", "comp.png"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(run(&args, &mut io), 1);
+        let stderr = String::from_utf8(captured.stderr.borrow().clone()).unwrap();
+        assert!(stderr.contains("--model"), "{stderr}");
+        assert!(!stderr.contains("OPENAI_API_KEY is not set"), "{stderr}");
+    }
+
+    #[test]
+    fn the_default_base_still_requires_the_key() {
+        // OPENAI_BASE_URL pointing at OpenAI verbatim is today's behavior:
+        // the key refusal fires unchanged.
+        let (mut io, captured) = Io::captured("", std::env::temp_dir(), Env::from([("OPENAI_BASE_URL".into(), "https://api.openai.com/v1".into())]));
+        let args: Vec<String> = ["--prompt", "p", "--out", "comp.png"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(run(&args, &mut io), 1);
+        let stderr = String::from_utf8(captured.stderr.borrow().clone()).unwrap();
+        assert!(stderr.contains("OPENAI_API_KEY is not set"), "{stderr}");
+    }
+
+    #[test]
+    fn fake_mode_ignores_the_configured_endpoint_and_its_guard() {
+        // Test mode makes no request: neither the key requirement nor the
+        // endpoint model guard applies.
+        let dir = temp("base-fake");
+        let (mut io, captured) = Io::captured(
+            "",
+            dir.clone(),
+            Env::from([("OPENAI_BASE_URL".into(), "http://127.0.0.1:9/v1".into()), ("IMPECCABLE_IMAGE_GEN_FAKE".into(), "1".into())]),
+        );
+        let args: Vec<String> = ["--prompt", "p", "--out", "comp.png"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(run(&args, &mut io), 0, "{:?}", captured.stderr);
+        assert!(dir.join("comp.png").exists());
+        assert!(String::from_utf8(captured.stdout.borrow().clone()).unwrap().contains("fake synthetic comp"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_configured_endpoint_serves_without_a_key_and_names_itself_as_provenance() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = format!("http://{}", server.server_addr());
+        let dir = temp("local-endpoint");
+        let handle = std::thread::spawn(move || {
+            let mut request = server.recv_timeout(Duration::from_secs(10)).unwrap().expect("image request");
+            let path = request.url().to_string();
+            let auth = request.headers().iter().find(|h| h.field.equiv("Authorization")).map(|h| h.value.as_str().to_string());
+            let mut bytes = Vec::new();
+            request.as_reader().read_to_end(&mut bytes).unwrap();
+            let body = String::from_utf8_lossy(&bytes).into_owned();
+            request.respond(tiny_http::Response::from_string(r#"{"data":[{"b64_json":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="}]}"#)).unwrap();
+            (path, auth, body)
+        });
+        // The trailing slash proves run() normalizes before dispatching.
+        let env = Env::from([("OPENAI_BASE_URL".into(), format!("{addr}/")), ("IMPECCABLE_SELF".into(), "impeccable".into())]);
+        let (mut io, captured) = Io::captured("", dir.clone(), env);
+        let args: Vec<String> = ["--prompt", "A tiny test image.", "--out", "comp.png", "--model", "tiny-img"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(run(&args, &mut io), 0, "{:?}", captured.stderr);
+        let (path, auth, _) = handle.join().unwrap();
+        assert_eq!(path, "/images/generations");
+        assert_eq!(auth, None, "no key configured means no Authorization header, not an empty Bearer");
+        let stdout = String::from_utf8(captured.stdout.borrow().clone()).unwrap();
+        assert!(stdout.contains(&format!("generated via the configured endpoint {addr}")), "{stdout}");
+        assert!(!stdout.contains("billed to your OpenAI key"), "{stdout}");
+        assert!(dir.join("comp.png").exists());
+        let sidecar: Value = serde_json::from_slice(&std::fs::read(dir.join("comp.png.json")).unwrap()).unwrap();
+        assert_eq!(sidecar["model"], "tiny-img");
+        assert_eq!(sidecar["endpoint"], addr);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_configured_endpoint_sends_the_key_when_one_is_present() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = format!("http://{}", server.server_addr());
+        let dir = temp("local-endpoint-key");
+        let handle = std::thread::spawn(move || {
+            let mut request = server.recv_timeout(Duration::from_secs(10)).unwrap().expect("image request");
+            let auth = request.headers().iter().find(|h| h.field.equiv("Authorization")).map(|h| h.value.as_str().to_string());
+            let mut bytes = Vec::new();
+            request.as_reader().read_to_end(&mut bytes).unwrap();
+            request.respond(tiny_http::Response::from_string(r#"{"data":[{"b64_json":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="}]}"#)).unwrap();
+            auth
+        });
+        let env = Env::from([("OPENAI_BASE_URL".into(), addr.clone()), ("OPENAI_API_KEY".into(), "test-key".into()), ("IMPECCABLE_SELF".into(), "impeccable".into())]);
+        let (mut io, captured) = Io::captured("", dir.clone(), env);
+        let args: Vec<String> = ["--prompt", "A tiny test image.", "--out", "comp.png", "--model", "tiny-img"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(run(&args, &mut io), 0, "{:?}", captured.stderr);
+        assert_eq!(handle.join().unwrap().as_deref(), Some("Bearer test-key"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_billing_note_names_openai_only_for_openai() {
+        assert_eq!(provenance_for(DEFAULT_API_BASE), "billed to your OpenAI key");
+        assert_eq!(provenance_for("http://127.0.0.1:8188/v1"), "generated via the configured endpoint http://127.0.0.1:8188/v1");
     }
 }
