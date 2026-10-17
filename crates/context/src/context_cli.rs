@@ -193,6 +193,24 @@ fn append_build_path_directive(parts: &mut Parts, ctx: &Ctx, cwd: &str) {
 }
 
 fn append_image_gen_directive(parts: &mut Parts, env: &Env, provider: &Provider) {
+    // #832: the fallback is whichever of the two actually exists — the
+    // user's OpenAI key, or an OpenAI-compatible endpoint configured in
+    // OPENAI_BASE_URL. An unusable configured base claims nothing:
+    // generate-image refuses to run until it is fixed or unset.
+    let Ok(configured_base) = crate::generate_image::configured_api_base(env) else {
+        return;
+    };
+    if let Some(base) = configured_base {
+        // A configured endpoint is the operator's own server: no OpenAI key
+        // requirement, no OpenAI billing claim, and its model must be named.
+        parts.push([
+            "IMAGE_GEN_AVAILABLE: your harness-native image tool is always the first choice for generation; use it whenever one exists.".to_string(),
+            "This environment also carries an OpenAI-compatible image endpoint as the fallback for harnesses with no native tool:".to_string(),
+            format!("`{} --prompt \"...\" --out <file> --model <id>` (the endpoint configured in OPENAI_BASE_URL at {base}; generations run there, not billed to OpenAI; --model names the model that endpoint serves; reference uploads (--ref) are unavailable there; say so before the first render, and never reach for it when a native tool exists).", provider.verb_cmd("generate-image")),
+            "Visualizing a direction before building it measurably strengthens the result.".to_string(),
+        ].join(" "));
+        return;
+    }
     if !env.get("OPENAI_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
         return;
     }
@@ -887,6 +905,77 @@ mod output_budget_tests {
     #[test]
     fn shell_arg_keeps_the_path_literal() {
         assert_eq!(shell_arg("/work/$client/it's"), "'/work/$client/it'\\''s'");
+    }
+}
+
+#[cfg(test)]
+mod image_gen_directive_tests {
+    use super::*;
+
+    // #832: IMAGE_GEN_AVAILABLE must describe whichever fallback actually
+    // exists — the user's OpenAI key, or a configured OpenAI-compatible
+    // endpoint from OPENAI_BASE_URL — and must not claim OpenAI billing for
+    // an endpoint that is not OpenAI. An unusable base claims nothing.
+    fn provider() -> Provider {
+        Provider {
+            id: "claude".to_string(),
+            command_prefix: "npx impeccable".to_string(),
+            command: "npx impeccable".to_string(),
+            skill_dir: Some("/home/user/.claude/skills/impeccable".to_string()),
+            self_cmd: "~/.claude/skills/impeccable/bin/impeccable".to_string(),
+        }
+    }
+
+    fn directive(env: &[(&str, &str)]) -> Option<String> {
+        let mut parts = Parts::default();
+        let mut map = Env::new();
+        for (k, v) in env {
+            map.insert((*k).to_string(), (*v).to_string());
+        }
+        append_image_gen_directive(&mut parts, &map, &provider());
+        parts.render().lines().find(|l| l.contains("IMAGE_GEN_AVAILABLE")).map(String::from)
+    }
+
+    #[test]
+    fn a_key_alone_keeps_today_s_wording() {
+        let line = directive(&[("OPENAI_API_KEY", "sk-oracle")]).unwrap();
+        assert!(line.contains("carries an OpenAI key"), "{line}");
+        assert!(line.contains("billed to the user's key"), "{line}");
+        assert!(line.contains("gpt-image-2.5-flare"), "{line}");
+    }
+
+    #[test]
+    fn a_configured_endpoint_claims_the_endpoint_not_openai_billing() {
+        let line = directive(&[("OPENAI_BASE_URL", "http://127.0.0.1:8188/v1"), ("OPENAI_API_KEY", "sk-oracle")]).unwrap();
+        assert!(line.contains("OpenAI-compatible image endpoint"), "{line}");
+        assert!(line.contains("http://127.0.0.1:8188/v1"), "{line}");
+        assert!(line.contains("--model <id>"), "{line}");
+        assert!(line.contains("reference uploads (--ref) are unavailable"), "{line}");
+        assert!(!line.contains("carries an OpenAI key"), "{line}");
+        assert!(!line.contains("billed to the user's key"), "{line}");
+        assert!(!line.contains("billed to your OpenAI key"), "{line}");
+    }
+
+    #[test]
+    fn a_base_pointing_at_openai_verbatim_is_today_s_behavior() {
+        let line = directive(&[("OPENAI_BASE_URL", "https://api.openai.com/v1"), ("OPENAI_API_KEY", "sk-oracle")]).unwrap();
+        assert!(line.contains("carries an OpenAI key"), "{line}");
+        assert!(!line.contains("OPENAI_BASE_URL"), "{line}");
+    }
+
+    #[test]
+    fn an_unusable_base_claims_nothing() {
+        assert!(directive(&[("OPENAI_BASE_URL", "ftp://x/v1"), ("OPENAI_API_KEY", "sk-oracle")]).is_none());
+        assert!(directive(&[("OPENAI_BASE_URL", "ftp://x/v1")]).is_none());
+    }
+
+    #[test]
+    fn nothing_configured_claims_nothing() {
+        assert!(directive(&[]).is_none());
+        assert!(directive(&[("OPENAI_API_KEY", "")]).is_none());
+        // An empty OPENAI_BASE_URL is as good as unset.
+        let line = directive(&[("OPENAI_BASE_URL", ""), ("OPENAI_API_KEY", "sk-oracle")]).unwrap();
+        assert!(line.contains("carries an OpenAI key"), "{line}");
     }
 }
 

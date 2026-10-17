@@ -1,0 +1,7 @@
+{
+  "stdout": "",
+  "stderr": "generate-image: --ref uploads to OpenAI's asset API, which the configured endpoint does not serve; generate without --ref there, or unset OPENAI_BASE_URL to use references.\n",
+  "exit": 1,
+  "signal": null,
+  "files": {}
+}
