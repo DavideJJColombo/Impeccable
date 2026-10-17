@@ -104,9 +104,16 @@ pub fn automatic_hook_mode(ctx: &Ctx, cwd: &str, env: &Env, provider: &Provider)
             }
         }
     }
-    if provider.id == "claude-code" {
-        let user_settings = jsp::join(&[&crate::util::homedir(env), ".claude", "settings.json"]);
-        if let Some(raw) = read_json(&user_settings) {
+    let user_manifest = match provider.id.as_str() {
+        "claude-code" => Some(jsp::join(&[&crate::util::homedir(env), ".claude", "settings.json"])),
+        "codex" | "agents" => Some(match env_nonempty(env, "CODEX_HOME") {
+            Some(root) => std::path::Path::new(cwd).join(root).join("hooks.json").to_string_lossy().into_owned(),
+            None => jsp::join(&[&crate::util::homedir(env), ".codex", "hooks.json"]),
+        }),
+        _ => None,
+    };
+    if let Some(path) = user_manifest {
+        if let Some(raw) = read_json(&path) {
             if let Some(hooks) = raw.get("hooks") {
                 if crate::staleness::js_truthy(hooks) && value_has_hook_marker(hooks) {
                     return "stop";
