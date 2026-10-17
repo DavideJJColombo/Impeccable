@@ -93,7 +93,7 @@ fn the_line_break_rules_read_the_rendered_lines() {
     assert_cases(
         &headings,
         "unbalanced-heading",
-        &["flag-hero", "flag-three-lines", "flag-centred", "flag-card"],
+        &["flag-hero", "flag-three-lines", "flag-centred", "flag-card", "flag-pretty-ancestor"],
         &["pass-balance", "pass-pretty-ancestor", "pass-one-line", "pass-even", "pass-stacked", "pass-statement", "pass-two-words", "pass-narrow", "pass-break"],
     );
 }

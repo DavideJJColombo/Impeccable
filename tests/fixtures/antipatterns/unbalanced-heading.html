@@ -37,6 +37,12 @@
 
       <p class="label">Flag: a card heading with a one-word tail</p>
       <div class="card"><h3 class="head flag-card" style="width: 28.5ch">Billing that grows with your team</h3></div>
+
+      <!-- pretty inherited from an ancestor does not stand the rule down:
+           Chromium's pretty pulls "and" down beside "shape", and a two-word
+           tail at 31% of the line above is still a leftover. -->
+      <p class="label">Flag: a heading under text-wrap pretty on an ancestor that pretty leaves uneven</p>
+      <div style="text-wrap: pretty"><h2 class="head flag-pretty-ancestor" style="width: 32.5ch">Plans for teams of every size and shape</h2></div>
     </div>
 
     <div class="col" data-col="pass">
