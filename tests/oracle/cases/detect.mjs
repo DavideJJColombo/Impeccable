@@ -127,6 +127,11 @@ function Thumb({ url }: { url?: string }) {
 
     // Flag surface and errors
     { id: 'detect-help', verb: 'detect', args: ['--help'] },
+    { id: 'detect-list-rules', verb: 'detect', args: ['--list-rules'] },
+    { id: 'detect-list-rules-json', verb: 'detect', args: ['--list-rules', '--json'] },
+    { id: 'detect-list-rules-quiet', verb: 'detect', args: ['--list-rules', '--quiet'] },
+    { id: 'detect-list-rules-with-target', verb: 'detect', args: ['--list-rules', 'src/'] },
+    { id: 'detect-list-rules-with-cdp', verb: 'detect', args: ['--list-rules', '--cdp', '9222'] },
     { id: 'detect-no-args', verb: 'detect', args: [] },
     { id: 'detect-missing-file', verb: 'detect', args: ['--no-config', 'does-not-exist.html'] },
     { id: 'detect-missing-file-json', verb: 'detect', args: ['--no-config', '--json', 'does-not-exist.html'] },

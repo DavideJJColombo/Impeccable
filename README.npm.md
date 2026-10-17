@@ -36,6 +36,9 @@ npx impeccable detect https://example.com
 
 # JSON output for CI/tooling
 npx impeccable detect --json src/
+
+# Catalog of detector rules (no scan)
+npx impeccable detect --list-rules
 ```
 
 `npx impeccable skills <command>` is the legacy namespace and still works.
@@ -72,9 +75,10 @@ Operational failure takes precedence when a multi-target scan is partial. In JSO
 ```
 impeccable detect [options] [file-or-dir-or-url...]
 
-  --json      Output findings as JSON
-  --scope     Only report rules in a design domain (type, layout)
-  --help      Show help
+  --json        Output findings as JSON
+  --list-rules  Print the detector rule catalog and exit
+  --scope       Only report rules in a design domain (type, layout)
+  --help        Show help
 ```
 
 ## Requirements
