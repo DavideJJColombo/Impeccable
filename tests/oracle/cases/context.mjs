@@ -44,6 +44,7 @@ const REPO = '<REPO>';
 // Env the recording machine may carry that would leak into output.
 const BASE_ENV = {
   OPENAI_API_KEY: null,
+  CODEX_HOME: null,
   IMPECCABLE_CONTEXT_DIR: null,
   IMPECCABLE_CATALOG_DIR: null,
   IMPECCABLE_API_URL: null,
