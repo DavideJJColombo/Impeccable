@@ -36,6 +36,9 @@ npx impeccable detect https://example.com
 
 # JSON output for CI/tooling
 npx impeccable detect --json src/
+
+# GitHub Actions annotations
+npx impeccable detect --github src/
 ```
 
 `npx impeccable skills <command>` is the legacy namespace and still works.
@@ -65,7 +68,7 @@ npx impeccable detect --json src/
 - `1`: at least one requested target could not be scanned
 - `2`: scan completed with primary findings
 
-Operational failure takes precedence when a multi-target scan is partial. In JSON mode, stdout remains a findings array and diagnostics are written to stderr.
+Operational failure takes precedence when a multi-target scan is partial. In JSON mode, stdout remains a findings array and diagnostics are written to stderr. With `--github`, stdout is one GitHub Actions annotation per finding.
 
 ## Options
 
@@ -73,6 +76,7 @@ Operational failure takes precedence when a multi-target scan is partial. In JSO
 impeccable detect [options] [file-or-dir-or-url...]
 
   --json      Output findings as JSON
+  --github    Write GitHub Actions annotations for each finding
   --scope     Only report rules in a design domain (type, layout)
   --help      Show help
 ```

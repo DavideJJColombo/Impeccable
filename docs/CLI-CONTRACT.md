@@ -94,6 +94,7 @@ Notation: `stdout>` / `stderr>` are literal writes; `exit N`; template strings u
 |---|---|
 | `--json` | JSON output to **stdout** |
 | `--quiet` | text mode prints only summary line(s) to stderr |
+| `--github` | GitHub Actions workflow commands to **stdout**, one per finding (`::warning` / `::notice` / `::error file=…,line=…,title=…::[id] snippet%0Adescription`). Paths are relative to `GITHUB_WORKSPACE` when set, else cwd. `line` is omitted when the finding has no line (`0` / NaN). Regex-only and design-system notes are skipped, same as `--json`. Combined with `--json` → `stderr> Error: --github cannot be used with --json\n`, `exit 1`. Evaluated after `--help` (so `--github --help` prints usage). Exit codes are unchanged |
 | `--help` | print usage (stdout) and `exit 0` — evaluated *after* scope/viewport parsing (so a bad `--scope` still errors first) |
 | `--no-advisory` | drop findings with `advisory === true` before output/exit-code |
 | `--no-consent-hiding` | URL scans only (Rust engine): leave known consent managers' banners on the page instead of hiding them before the scan (see **Consent banners** under URL scans). No effect on file scans |
@@ -118,6 +119,8 @@ Scan files or URLs for UI anti-patterns and design quality issues.
 Options:
   --json              Output results as JSON
   --quiet             In text mode, only print the final findings count
+  --github            Write GitHub Actions annotations for each
+                      finding. Cannot be used with --json
   --scope <name>      Only report rules in the given design domain
                       (type, layout). Comma-separated.
   --viewport <WxH>    Browser viewport for URL scans (default 1280x800),
@@ -150,6 +153,7 @@ Advisory findings:
 Output streams:
   Human-readable findings go to stderr so stdout stays available for structured
   output. Use --json for JSON on stdout, or redirect text with 2> findings.txt.
+  --github writes Actions annotations to stdout (no human findings).
 
 Exit status:
   0  Scan completed with no primary findings (advisories may still be listed)
@@ -184,6 +188,7 @@ Examples:
   impeccable detect https://example.com
   impeccable detect --cdp 9222 --target "My App" --json
   impeccable detect --json .
+  impeccable detect --github src/
   impeccable detect --no-config src/
 ```
 
