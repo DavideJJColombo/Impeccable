@@ -131,6 +131,20 @@ fn push_rendered_text(dom: &dyn Dom, el: ElId, out: &mut String) {
     }
 }
 
+/// Whether any of the text `el` sets on its lines does not paint: text in a
+/// box whose computed `visibility` is `hidden` or `collapse`. Such text still
+/// takes its room on a line box, so `Dom::text_line_rects` measures it and
+/// `words` reads it, and the rules would judge a line, or name a word, the
+/// visitor never sees. `visibility` inherits, so each box's own computed
+/// value is the one its text paints with; a child set `visible` again shows.
+fn sets_unpainted_text(dom: &dyn Dom, el: ElId) -> bool {
+    let hidden = matches!(js::to_lower_case(&dom.style(el, "visibility")).as_str(), "hidden" | "collapse");
+    dom.child_nodes(el).into_iter().any(|child| match child {
+        DomChild::Text(text) => hidden && !text.trim().is_empty(),
+        DomChild::Element(c) => !renders_no_text(dom, c) && sets_unpainted_text(dom, c),
+    })
+}
+
 /// The words of `el`'s rendered text. Soft hyphens and zero-width spaces
 /// paint nothing unless the line breaks at them, so they are dropped:
 /// `re&shy;turn.` is the word "return.".
@@ -179,7 +193,11 @@ fn check_straggler(dom: &dyn Dom, el: ElId) -> Option<RuleHit> {
         return None;
     }
     let words = words(dom, el);
-    if words.len() < MIN_WORDS || is_cjk_text(&words.join(" ")) || !sets_one_face(dom, el) {
+    if words.len() < MIN_WORDS
+        || is_cjk_text(&words.join(" "))
+        || !sets_one_face(dom, el)
+        || sets_unpainted_text(dom, el)
+    {
         return None;
     }
     let chars_per_px = chars_per_px(dom, el, &widths)?;
@@ -215,7 +233,7 @@ fn check_unbalanced_heading(dom: &dyn Dom, el: ElId) -> Option<RuleHit> {
     }
     let tail = widths[widths.len() - 1];
     let above = widths[widths.len() - 2];
-    if tail >= above * HEADING_MIN_TAIL_RATIO || words(dom, el).len() < MIN_WORDS {
+    if tail >= above * HEADING_MIN_TAIL_RATIO || words(dom, el).len() < MIN_WORDS || sets_unpainted_text(dom, el) {
         return None;
     }
     // A heading with mixed faces gives no character count to trust, and is
@@ -463,6 +481,33 @@ mod tests {
         let hits = check_element_line_breaks_dom(&d, p);
         assert_eq!(hits.len(), 1, "{hits:?}");
         assert!(hits[0].snippet.starts_with("\"text.\" alone"), "{}", hits[0].snippet);
+    }
+
+    /// Text in a `visibility: hidden` box keeps its room on the line, so
+    /// the last line may hold only words nobody sees. Neither rule judges
+    /// such a block; a child set `visible` again paints and is read as before.
+    #[test]
+    fn invisible_text_on_the_lines_stands_both_rules_down() {
+        let mut d = FakeDom::new();
+        let (_h, body) = d.with_page();
+        let p = block(&mut d, body, "p", PROSE, &[560.0, 560.0, 40.0]);
+        inline(&mut d, p, "span", " more", &[("visibility", "hidden")]);
+        assert!(ids(&d, p).is_empty(), "hidden tail");
+
+        let collapsed = block(&mut d, body, "p", PROSE, &[560.0, 560.0, 40.0]);
+        inline(&mut d, collapsed, "span", " more", &[("visibility", "collapse")]);
+        assert!(ids(&d, collapsed).is_empty(), "collapsed tail");
+
+        let shown = block(&mut d, body, "p", PROSE, &[560.0, 560.0, 40.0]);
+        let wrap = inline(&mut d, shown, "span", "", &[("visibility", "hidden")]);
+        inline(&mut d, wrap, "span", " more", &[("visibility", "visible")]);
+        let hits = check_element_line_breaks_dom(&d, shown);
+        assert_eq!(hits.len(), 1, "visible again: {hits:?}");
+        assert!(hits[0].snippet.starts_with("\"more\" alone"), "{}", hits[0].snippet);
+
+        let h = block(&mut d, body, "h2", "Design that holds up under real content and real", &[856.0, 110.0]);
+        inline(&mut d, h, "span", " people", &[("visibility", "hidden")]);
+        assert!(ids(&d, h).is_empty(), "hidden heading tail");
     }
 
     /// An inline image or a run in another face widens a line without the
