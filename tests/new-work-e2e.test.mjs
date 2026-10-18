@@ -451,15 +451,29 @@ describe('new-work-e2e: serve-question decision page', () => {
         window.__advanceDecisionClock = (ms) => { offset += ms; };
       });
       const page = await context.newPage();
+      const T0 = Date.now();
+      const plog = (...a) => console.error('[probe +' + (Date.now() - T0) + 'ms]', ...a);
+      page.on('console', (m) => plog('console', m.type(), m.text()));
+      page.on('pageerror', (e) => plog('pageerror', e.message));
+      page.on('framenavigated', (f) => { if (f === page.mainFrame()) plog('navigated', f.url()); });
+      page.on('requestfinished', async (r) => { const res = await r.response().catch(() => null); plog('req', r.method(), r.url().replace(url.split('?')[0], '/'), res?.status()); });
+      page.on('requestfailed', (r) => plog('reqfailed', r.url(), r.failure()?.errorText));
+      const dump = async (tag) => plog(tag, JSON.stringify(await page.evaluate(() => ({
+        now: Date.now(), perf: Math.round(performance.now()),
+        cards: [...document.querySelectorAll('.card')].map((c) => ({ id: c.dataset.id, cls: c.className, media: [...c.querySelectorAll('.media')].map((m) => m.className + ' pip=' + !!m.querySelector('.pip img') + ' box=' + JSON.stringify(m.getBoundingClientRect())) })),
+      }))));
       // Missing comps intentionally keep polling; load need not settle while
       // these requests are in flight. Assert the rendered UI instead.
       await page.goto(url, { waitUntil: 'domcontentloaded' });
       await page.waitForSelector('.card[data-id="assigned"] .media.comp-pending');
-
+      await dump('before-advance');
+      const iv = setInterval(() => { dump('tick').catch(() => {}); }, 1500);
+      try {
       await page.evaluate(() => window.__advanceDecisionClock(241000));
       await page.waitForFunction(() => ['assigned', 'kept-only', 'body-only', 'plain-body'].every((id) =>
         !document.querySelector(`.card[data-id="${id}"] .media`)), null, { timeout: 6000 });
-      await page.waitForSelector('.card[data-id="board-only"] .media.stand-in');
+      await page.waitForSelector('.card[data-id="board-only"] .media.stand-in', { timeout: 15000 });
+      } finally { clearInterval(iv); await dump('final').catch(() => {}); }
 
       const faceClass = await page.getAttribute('.card[data-id="assigned"] .face.front', 'class');
       const back = await page.$('.card[data-id="assigned"] .face.back');
