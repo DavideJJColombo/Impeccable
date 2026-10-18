@@ -93,6 +93,7 @@ pub struct Limits {
 pub fn serve(dir: &Path, port: u16, io: &mut Io, limits: Limits, stop: Option<&AtomicBool>) -> Result<i32, String> {
     store::read(&dir.join("current.json"))?;
     let server = tiny_http::Server::http(("127.0.0.1", port)).map_err(|e| e.to_string())?;
+    let _pool_nudge = crate::http_pool::keep_pool_moving(&server);
     let actual = server
         .server_addr()
         .to_ip()

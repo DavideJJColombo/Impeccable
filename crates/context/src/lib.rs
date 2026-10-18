@@ -6,6 +6,7 @@ pub mod jsp;
 pub mod util;
 pub mod url;
 pub mod http;
+pub mod http_pool;
 pub mod provider;
 pub mod hook_markers;
 pub mod target_args;

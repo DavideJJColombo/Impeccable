@@ -1535,6 +1535,7 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
         }
     };
     let actual_port = server.server_addr().to_ip().map(|a| a.port()).unwrap_or(port);
+    let _pool_nudge = crate::http_pool::keep_pool_moving(&server);
     let url = format!("http://127.0.0.1:{}/", actual_port);
     if a.has("detached-serve") {
         let _ = std::fs::create_dir_all(&qdir);
