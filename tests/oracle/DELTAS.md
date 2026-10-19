@@ -7122,3 +7122,17 @@ Re-recorded 2026-10-19 after merging main (with #1042 and #1043): the eight dire
 The branch added two browser fixtures, `low-contrast-pixel-reads.html` and `low-contrast-settled-states.html`, with their own per-fixture cases, but the directory and no-advisory sweeps were not re-recorded with them. They are now. Re-recorded from the binary and reviewed by hand: the directory sweeps (json, text and quiet) and the no-advisory sweeps (json and text) gain exactly the five findings the per-fixture goldens hold, in path order (on `low-contrast-pixel-reads.html` two `low-contrast` at 2.8:1 for `#fbfaf8` on `#979797` and two `dark-glow` for the `#f472b6` glow; on `low-contrast-settled-states.html` one `low-contrast` at 1.2:1 for `#ededed` on `#ffffff`), and the count moves from 950 to 955. No other fixture's output moved, and the scope sweeps did not change.
 
 Re-recorded 2026-10-19 after merging main (with #1042, #1043 and #1040): the five directory and no-advisory sweeps, from a binary built from the merged tree and reviewed by hand. Each gains exactly those five findings on top of main and loses none: failures move from 977 to 982, advisory notes stay at 173, exit codes unchanged; the scope sweeps still do not move.
+
+
+## Recorded 2026-10-19: one media environment for static HTML (#988)
+
+Per the [approved policy](https://github.com/pbakaus/impeccable/issues/988#issuecomment-6194496662), static HTML scans use screen, light color scheme, and the default 1280 × 800 viewport. Inline/local linked stylesheet media attributes and nested `@media` blocks are filtered before declarations, custom properties, keyframes, and CSS pattern checks. Unsupported queries are excluded, even when negated. This does not change plain CSS/JS text scans or the frozen function-level vectors.
+
+The following CLI goldens were regenerated from the native build and reviewed as finding-by-finding JSON changes and line-by-line text changes. Exit codes remain 2; no unrelated findings or advisory counts change.
+
+- `detect-fixture-json-linked-url-patterns-html`, `detect-fixture-text-linked-url-patterns-html`: remove only the contrast finding on `div.inactive-media-stripes`, whose gradient is inside `(max-width: 1px)`. The inactive `@supports` case remains; this PR does not evaluate supports conditions. The fixture count changes from 12 to 11.
+- `detect-fixture-json-pulsing-dot-html`, `detect-fixture-text-pulsing-dot-html`: remove only the `.rec-mark` pulsing-dot finding. Its animation is inside `(prefers-reduced-motion: no-preference)`, which this static environment does not evaluate. Both reduced-motion branches are excluded. The fixture count changes from 5 to 4; the rendered/browser path remains unchanged.
+- `detect-fixture-json-static-media-environment-html`, `detect-fixture-text-static-media-environment-html`: new fixture with four real low-contrast findings under matching screen/light/width/list queries and five passing cases under print/dark/narrow/unknown/negated-unknown queries.
+- `detect-dir-json-all-fixtures`, `detect-dir-text-all-fixtures`, `detect-dir-quiet-all-fixtures`, `detect-no-advisory-json`, `detect-no-advisory-text`: the same two removals plus the four new fixture findings. The total changes from 982 to 984; the 173 advisory notes are unchanged. Scope-filtered goldens do not change.
+
+`tests/oracle/vectors/calls/` and the historical `collectStaticCssRules` collector are unchanged. Runtime filtering occurs before that collector.
