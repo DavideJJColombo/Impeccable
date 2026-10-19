@@ -111,7 +111,7 @@ border-inline-end: 1px solid; /* Not border-right */
 
 **Arabic-script specifics** (Arabic, Persian, Urdu, Pashto, Kurdish):
 - Preserve Zero-Width Non-Joiner (U+200C). Persian and Kurdish use ZWNJ between compound-word parts to break cursive joining while keeping the word together. A filter or sanitizer that strips it changes meaning. Never normalize it away.
-- Handle Yeh and Kaf variants. Persian uses ی (U+06CC) and ک (U+06A9), not the Arabic ي (U+064A) and ك (U+0643). Search, sort, and validation that treats them as identical will miss matches or reject valid input.
+- Handle Yeh and Kaf variants. Persian uses ی (U+06CC) and ک (U+06A9), while Arabic uses ي (U+064A) and ك (U+0643). Preserve the original form in storage. For search and validation, treat the corresponding letters as equivalent so that Arabic-keyboard input matches Persian text. Rejecting one variant locks out users whose keyboard sends the other.
 - Support locale-aware digits. Persian (`fa-IR`) and Arabic locales use Eastern Arabic-Indic numerals (۰-۹ and ٠-٩). Use `Intl.NumberFormat` with the correct locale rather than hardcoding Western digits.
 
 ```javascript
