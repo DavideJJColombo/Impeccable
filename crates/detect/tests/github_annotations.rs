@@ -283,3 +283,37 @@ fn github_conflicts_with_list_rules() {
     }
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+// The prompt reads the process's real stdin, so only the suppressed path is
+// driven here; a regression would read stdin (EOF under cargo test < /dev/null
+// or CI) and print the "Found 51 files" banner this test rejects.
+fn run_tty(dir: &Path, args: &[&str]) -> (i32, String, String) {
+    let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    let (mut io, cap) = Io::captured("", dir.to_path_buf(), HashMap::new());
+    io.stdin_is_tty = true;
+    let html = CannedHtml(vec![]);
+    let engines = Engines { html: &html, url: None };
+    let code = run_detect(&argv, &mut io, &engines);
+    let out = String::from_utf8(cap.stdout.borrow().clone()).unwrap();
+    let err = String::from_utf8(cap.stderr.borrow().clone()).unwrap();
+    (code, out, err)
+}
+
+fn stage_many(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("impeccable-gh-many-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for i in 0..51 {
+        std::fs::write(dir.join(format!("f{i}.css")), "body { margin: 0; }\n").unwrap();
+    }
+    dir
+}
+
+#[test]
+fn github_skips_the_large_scan_prompt() {
+    let dir = stage_many("gh");
+    let (code, _out, err) = run_tty(&dir, &["--no-config", "--github", "."]);
+    assert_eq!(code, 0, "{err}");
+    assert!(!err.contains("Found 51 files"), "{err}");
+    assert!(!err.contains("Continue?"), "{err}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
