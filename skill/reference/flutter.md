@@ -14,20 +14,20 @@ A Flutter app's most common tell is default-ness: screens that read as if an AI 
 - **`overused-font`**: `fontFamily: 'Inter'` and friends, and `GoogleFonts.inter()` (Inter, Geist, Space Grotesk, Plus Jakarta Sans, …). Roboto is excluded on purpose: it is the Android system face, not a drift tell. Theme a brand face through the `TextTheme` roles rather than per-screen `fontFamily`.
 - **`ai-color-palette`**: `LinearGradient(colors: [Colors.deepPurple, Colors.blueAccent])`-style purple gradient lists, and a purple literal on heading-size text (`headlineLarge`, the `display` roles, `titleLarge`, or `fontSize` ≥ 22 in the surrounding `TextStyle`).
 - **`cream-palette`**: `scaffoldBackgroundColor: Color(0xFFFDF6EC)` and the like: the warm off-white default surface. Derive the scheme, don't default it.
-- **`side-tab`**: `Border(left: BorderSide(color: …, width: 4))` (or `start`), the one-sided accent stripe on a non-rounded container. Accent, yes. Spread it along a Divider, an ink fill, or the container's own material tint, not a hard stripe on one side.
+- **`side-tab`**: a one-sided chromatic `Border`/`BorderDirectional` stripe (`left`, `right`, `start`, `end`) on a card **rounded away from it**, at 2px or more. It is the Dart twin of `border-left: 4px solid` on a rounded card; a square card's side rule is a classic accent and stays quiet. Accent cleanly instead: spread it along a Divider, an ink fill, or the container's own material tint, not a hard stripe down one edge of a rounded surface.
 
 Anything the rules above cannot see stays with the LLM checks: nested `Card`/`Container` stacks, touch-target sizes, contrast pairs, and the type scale. The text engine reads lines, not geometry. `// impeccable-disable <rule>: <reason>` waives findings inline, exactly as in web files.
 
 ## Layout & structure
 
-- **Material navigation, matched to size.** `NavigationBar` on compact width; `NavigationRail` or `Drawer` on expanded width. The `android-layout-adaptive-nav` rule names the same duty for Android, and `MediaQuery` gets most of the way by default.
+- **Material navigation, matched to size (Material apps).** `NavigationBar` on compact width; `NavigationRail` or `Drawer` on expanded width. The `android-layout-adaptive-nav` rule names the same duty for Android, and `MediaQuery` gets most of the way by default. A Cupertino app keeps the iOS navigation [ios.md](ios.md) specifies instead; never swap it for a Material bar.
 - **One screen one `Scaffold`.** Nested `Scaffold`s fight the inset and snack-bar plumbing; reach for `NestedScrollView` or a plain `Builder` instead.
 - **48×48 dp minimum** for every touch target. `IconButton` defaults there; custom `GestureDetector`s rarely do. A hit box smaller than the visual is the usual Flutter give-away.
 - **Insets over fixed paddings.** `SafeArea` and `MediaQuery.paddingOf` beat hand-coded `EdgeInsets`, and `MediaQuery.viewInsetsOf` for the keyboard beats an estimated one.
 
 ## Color & theming
 
-- **`ColorScheme.fromSeed`, one source of truth.** Component colors read from `Theme.of(context).colorScheme` roles (`primary`, `surfaceContainerHighest`, `onSurfaceVariant`, `error`, …), never a raw `Color(0x…)` per widget. Raw hex is exactly what the `android-color-role-tokens` rule calls the last mile.
+- **`ColorScheme.fromSeed` in a Material app, one source of truth.** Component colors read from `Theme.of(context).colorScheme` roles (`primary`, `surfaceContainerHighest`, `onSurfaceVariant`, `error`, …), never a raw `Color(0x…)` per widget. Raw hex is exactly what the `android-color-role-tokens` rule calls the last mile. A Cupertino app themes through `CupertinoTheme` and the semantic colors [ios.md](ios.md) names.
 - **Dark mode is a scheme, not an `if`.** A quick `Color(0xFF121212)` inversion reads as one. Test both schemes from the widget tree, not the paint calls.
 
 ## Motion

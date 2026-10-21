@@ -69,6 +69,15 @@ class CleanDashboard extends StatelessWidget {
               thickness: 0.5,
               color: scheme.outline,
             ),
+            // A square card's side rule is a classic accent, not the tell.
+            Container(
+              decoration: const BoxDecoration(
+                border: Border(
+                  left: BorderSide(color: Colors.teal, width: 4),
+                ),
+              ),
+              child: const Text('Square edge'),
+            ),
           ],
         ),
       ),

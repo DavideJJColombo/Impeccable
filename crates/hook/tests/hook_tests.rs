@@ -81,6 +81,44 @@ fn build_completion_reminder_skips_native_projects() {
 }
 
 #[test]
+fn native_flutter_projects_still_scan_dart_edits() {
+    // Flutter UI is Dart, and the Dart pass is platform-blind: a project that
+    // recorded `android` in PRODUCT.md must still surface widget findings.
+    let t = Tmp::new();
+    t.write("PRODUCT.md", "# P\n\n## Platform\nandroid\n");
+    let file = t.write(
+        "lib/a.dart",
+        "import 'package:flutter/material.dart';\nWidget b() => const Text('x', style: TextStyle(fontFamily: 'Inter'));\n",
+    );
+    let r = rt(&t.path());
+    let (mut io, capture) = Io::captured("", t.0.clone(), HashMap::new());
+    hook::run(&r, &edit_event(&t.path(), &file, "owner"), &mut io);
+    let post = String::from_utf8(capture.stdout.borrow().clone()).unwrap();
+    // Not a native skip: the per-edit pass read the file and acked it.
+    assert!(post.contains("scanned lib/a.dart"), "dart edit went unscanned: {post}");
+    // `overused-font` rides the deferred tier, so the Stop pass names it.
+    let stop = hook::run_stop_hook(&r, &stop_event(&t.path(), "owner"));
+    assert!(stop.stdout.contains("overused-font"), "stop pass lost the dart finding: {}", stop.stdout);
+}
+
+#[test]
+fn native_projects_still_skip_web_sources() {
+    let t = Tmp::new();
+    t.write("PRODUCT.md", "# P\n\n## Platform\nios\n");
+    let file = t.write(
+        "src/a.tsx",
+        "export const A = () => <div className=\"bg-gradient-to-r from-purple-500 to-blue-500\" />;\n",
+    );
+    let r = rt(&t.path());
+    let (mut io, capture) = Io::captured("", t.0.clone(), HashMap::new());
+    hook::run(&r, &edit_event(&t.path(), &file, "owner"), &mut io);
+    assert!(
+        capture.stdout.borrow().is_empty(),
+        "a native project's .tsx edit must keep skipping"
+    );
+}
+
+#[test]
 fn session_start_respects_disabled_hook_config() {
     let t = Tmp::new();
     let env_path = t.write("session.env", "");

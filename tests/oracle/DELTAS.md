@@ -7130,3 +7130,15 @@ Re-recorded 2026-10-19 after merging main (with #1042, #1043 and #1040): the fiv
 New cases from the two fixtures `tests/fixtures/antipatterns/dart-should-flag.dart` and `dart-should-pass.dart`, recorded from the binary and reviewed by hand: `detect-fixture-{json,text}-dart-should-flag-dart` (7 findings across the five rule ids, one advisory, exit 2) and `detect-fixture-{json,text}-dart-should-pass-dart` (no findings, exit 0). The flag fixture's seven are lines 10–47 in path order; the pass fixture's negative shapes — a commented-out `Curves.bounceOut`, a URL inside a string, `fontFamilyFallback`, a chromatic `Border.all`, a purple-only gradient with a neutral second token, a cool off-white, and `GoogleFonts.robotoTextTheme()` — are all quiet.
 
 The directory, scope and no-advisory sweeps were re-recorded from the same binary: the pack (`detect-dir-json-all-fixtures`) moves from 1,155 to 1,162 findings, with the only additions on `dart-should-flag.dart`, and `detect-fixture-text-…` gains the regex-only `.dart` note line; text sweeps add the same six findings plus seven advisory-bearing forms; failures and exit codes move only through the flag fixture.
+
+## Recorded 2026-10-21: Dart pass corrections (ownership groups, rounded cards, parser fixes)
+
+Follow-up to the Dart entry above, from PR review and a detector run against a real Flutter app. Behavior changes, all inside `crates/detect/src/dart.rs` plus the hook's native-platform gate:
+
+- `side-tab` keeps the web engines' pinned condition instead of inverting it: a stripe reports only on a card rounded away from it (`BorderRadius` resolved corner by corner, `BorderDirectional` included), at 2px when rounded. A square card's side rule is quiet; a rounded card's stripe is the tell. The test's old `Border(start:)` shape is invalid Flutter and is replaced by `BorderDirectional(start:)`.
+- String contents are blanked for every rule except the font matchers, so UI copy that quotes a tell stays quiet.
+- Context rules read the owning group (`TextStyle`/`copyWith`, the gradient call, the `Border` and its `BoxDecoration`) instead of a ±4-line window.
+- Nested block comments, raw strings containing `${`, and fractional `BorderSide` widths parse correctly. `fontSize` is compared numerically, so 30/31/40/41 count as headings. `Colors.purple` agrees with its hex.
+- The design hook scans `.dart` targets on native PRODUCT.md platforms (`ios`/`android`/`adaptive`); other files keep skipping.
+
+Re-recorded from the binary and reviewed by hand: `detect-fixture-{json,text}-dart-should-flag-dart`, plus the sweeps that contain the fixture (`detect-dir-{json,text}-all-fixtures`, `detect-no-advisory-{json,text}`). The finding set is unchanged — seven findings, one advisory, exit 2 — and `side-tab`/the gradient shift one line because the fixture's stripe now sits on a `borderRadius`. Every non-Dart row in those sweeps is byte-identical. The pass fixture stays at zero findings; it gained a square one-sided border as a negative shape, which emits nothing.

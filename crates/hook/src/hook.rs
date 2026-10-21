@@ -125,7 +125,7 @@ pub fn run_hook(rt: &Runtime, stdin: &str) -> RunResult {
     let project_cwd =
         resolve_cache_cwd(rt, primary_files.first().map(String::as_str), &session_cwd);
     audit.insert("cwd".into(), Value::String(project_cwd.clone()));
-    let target_files = expand_scan_targets(rt, &primary_files, &project_cwd);
+    let mut target_files = expand_scan_targets(rt, &primary_files, &project_cwd);
     let session_value = session_id_of(&event);
     audit.insert(
         "session".into(),
@@ -158,14 +158,20 @@ pub fn run_hook(rt: &Runtime, stdin: &str) -> RunResult {
 
     let platform = resolve_project_platform(rt, &project_cwd);
     if is_native_platform(platform.as_deref()) {
-        return result(
-            &audit,
-            vec![
-                ("skipped", Value::from("native-platform")),
-                ("platform", Value::String(platform.unwrap_or_default())),
-                ("durationMs", ms_since(started)),
-            ],
-        );
+        // Flutter UI is Dart, and the Dart pass runs on every platform. Keep
+        // the `.dart` targets and skip the rest of a native project's files,
+        // which have no browser-DOM or CSS scan to contribute.
+        target_files.retain(|f| is_dart_path(f));
+        if target_files.is_empty() {
+            return result(
+                &audit,
+                vec![
+                    ("skipped", Value::from("native-platform")),
+                    ("platform", Value::String(platform.unwrap_or_default())),
+                    ("durationMs", ms_since(started)),
+                ],
+            );
+        }
     }
 
     let mut cache = read_cache(&project_cwd);
@@ -741,7 +747,14 @@ pub fn run_stop_hook(rt: &Runtime, stdin: &str) -> RunResult {
             ],
         );
     }
-    if let Some(skip) = native_skip(&audit, &project_cwd, &mut platform_memo) { return skip; }
+    // Native projects skip this pass, Flutter files aside: `.dart` is UI
+    // source the Dart pass reads on any platform, so a touched widget file
+    // still scans while the project's other files stay out.
+    let native = native_skip(&audit, &project_cwd, &mut platform_memo);
+    let dart_only = native.is_some();
+    if dart_only && !touched.iter().any(|f| is_dart_path(f)) {
+        return native.unwrap_or_else(|| result(&audit, vec![]));
+    }
     let mut scans = HashMap::new();
 
     let mut fresh_groups: Vec<Group> = Vec::new();
@@ -761,6 +774,9 @@ pub fn run_stop_hook(rt: &Runtime, stdin: &str) -> RunResult {
             continue;
         }
         let ext = js::to_lower_case(&jsp::extname(file_path));
+        if dart_only && ext != ".dart" {
+            continue;
+        }
         let configured = match_configured_extension(file_path, &config.extensions);
         if !ALLOWED_EXTS.contains(&ext.as_str()) && configured.is_none() {
             continue;

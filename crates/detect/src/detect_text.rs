@@ -2137,7 +2137,10 @@ class Sloppy extends StatelessWidget {
       backgroundColor: const Color(0xFFFDF6EC),
       body: AnimatedContainer(
         curve: Curves.bounceOut,
-        border: Border(left: BorderSide(color: Color(0xFF8B5CF6), width: 4)),
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(12),
+          border: Border(left: BorderSide(color: Color(0xFF8B5CF6), width: 4)),
+        ),
         child: Text('Go', style: TextStyle(fontFamily: 'Inter')),
       ),
     );

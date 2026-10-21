@@ -375,6 +375,13 @@ pub fn is_native_platform(platform: Option<&str>) -> bool {
     matches!(platform, Some("ios" | "android" | "adaptive"))
 }
 
+///`.dart` sources are Flutter UI, and the Dart pass in `detect_text` is
+/// platform-blind: a native project still scans them, while every other
+/// web-shaped file keeps skipping (`native-platform`).
+pub fn is_dart_path(p: &str) -> bool {
+    js::to_lower_case(&jsp::extname(p)) == ".dart"
+}
+
 // ── config ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]

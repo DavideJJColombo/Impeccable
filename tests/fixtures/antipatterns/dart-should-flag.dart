@@ -33,6 +33,7 @@ class SlopLanding extends StatelessWidget {
               duration: const Duration(milliseconds: 320),
               curve: Curves.bounceOut,
               decoration: const BoxDecoration(
+                borderRadius: BorderRadius.circular(12),
                 border: Border(
                   left: BorderSide(color: Color(0xFF8B5CF6), width: 4),
                 ),

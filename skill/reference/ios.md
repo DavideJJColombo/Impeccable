@@ -1,6 +1,6 @@
 # iOS platform
 
-For native iOS / iPadOS apps: SwiftUI, UIKit, React Native, Expo, Flutter shipping to Apple hardware.
+For native iOS / iPadOS apps: SwiftUI, UIKit, React Native, Expo, Flutter shipping to Apple hardware. A Flutter app is native here: obey this reference through its Dart widgets, plus the Dart-specific tells and detector notes in [flutter.md](flutter.md).
 
 On native, the visitor mode narrows what expression may override. HIG conformance governs structure, navigation, and interaction in every mode; brand expresses through the layer the platform leaves open (tint, type, motion, content).
 

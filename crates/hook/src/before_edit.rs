@@ -793,7 +793,9 @@ fn main_flow(rt: &Runtime, stdin: &str) -> Out {
         return skip(&audit, "config-disabled");
     }
     let platform = resolve_project_platform(rt, &cwd);
-    if is_native_platform(platform.as_deref()) {
+    // A `.dart` write is Flutter UI source: the Dart pass runs on every
+    // platform, so the native gate must not swallow it.
+    if is_native_platform(platform.as_deref()) && !is_dart_path(&file_path) {
         return allow(
             ext(
                 &audit,
