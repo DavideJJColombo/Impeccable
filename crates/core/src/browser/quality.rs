@@ -107,7 +107,65 @@ fn is_in_control(dom: &dyn Dom, el: ElId) -> bool {
     }
     false
 }
-const FURNITURE: &str = "nav, [role=\"navigation\"], td, th, [role=\"gridcell\"], [role=\"cell\"], caption, figcaption, dt, dd, footer, [class*=\"meta\" i], [class*=\"label\" i], [class*=\"badge\" i], [class*=\"chip\" i], [class*=\"pill\" i], [class*=\"tag\" i], [class*=\"kicker\" i], [class*=\"eyebrow\" i], [class*=\"breadcrumb\" i], [class*=\"timestamp\" i], [class*=\"category\" i], [class*=\"caption\" i], [class*=\"nav\" i]";
+/// Whether a class token names a button: `btn` itself, or a name ending in
+/// `-btn`, `__btn` or `_btn` (`features-demo__btn`). A wrapper that holds
+/// buttons (`btn-group`, `hero-btns`) does not.
+fn class_names_button(class: &str) -> bool {
+    class.split_ascii_whitespace().any(|token| {
+        let t = js::to_lower_case(token);
+        t == "btn" || t.ends_with("-btn") || t.ends_with("_btn")
+    })
+}
+
+/// How many boxes up, the text's own box included, a button class is read.
+const BUTTON_BOX_LEVELS: usize = 3;
+
+/// Whether `el` is drawn as a button by its class: the class is on the
+/// text's own box, or on a box around it holding no more text than one
+/// control does ([`FOCUSABLE_CONTROL_MAX_CHARS`]). smartbi.ca's
+/// `span.features-demo__btn` is a pill with no role. A section that holds a
+/// button and its copy is not one.
+fn is_button_box(dom: &dyn Dom, el: ElId) -> bool {
+    let mut cur = Some(el);
+    for _ in 0..BUTTON_BOX_LEVELS {
+        let Some(c) = cur else { return false };
+        if c != el && utf16_len(js::trim(&collapse_ws(&dom.text_content(c)))) > FOCUSABLE_CONTROL_MAX_CHARS {
+            return false;
+        }
+        if dom.attr(c, "class").is_some_and(|cls| class_names_button(&cls)) {
+            return true;
+        }
+        cur = dom.parent(c);
+    }
+    false
+}
+const FURNITURE_ELEMENTS: &str = "nav, [role=\"navigation\"], td, th, [role=\"gridcell\"], [role=\"cell\"], caption, figcaption, dt, dd, footer";
+const FURNITURE_CLASSES: &str = "[class*=\"meta\" i], [class*=\"label\" i], [class*=\"badge\" i], [class*=\"chip\" i], [class*=\"pill\" i], [class*=\"tag\" i], [class*=\"kicker\" i], [class*=\"eyebrow\" i], [class*=\"breadcrumb\" i], [class*=\"timestamp\" i], [class*=\"category\" i], [class*=\"caption\" i], [class*=\"nav\" i]";
+
+/// Whether `el` is, or sits in, page furniture: navigation, a table cell, a
+/// caption, a footer, or a box whose class names one (a label, a chip, a
+/// breadcrumb). The class markers are not read off `html`, which holds the
+/// page's script state flags: schlittermann.de's `html.js-nav-ready` made
+/// every element on the page navigation, a 10px sentence among them.
+/// `body` is still read: letour.fr's `body.has-breadcrumb` is a state flag
+/// too, but the 10px team names it reaches in the ranking rows are ones both
+/// judges called harmful (run 35, 218586).
+fn is_furniture(dom: &dyn Dom, el: ElId) -> bool {
+    if matches_or_closest(dom, el, FURNITURE_ELEMENTS) {
+        return true;
+    }
+    let mut cur = Some(el);
+    while let Some(c) = cur {
+        if tag_lower(dom, c) == "html" {
+            return false;
+        }
+        if matches_or_false(dom, c, FURNITURE_CLASSES) {
+            return true;
+        }
+        cur = dom.parent(c);
+    }
+    false
+}
 const SMALLPRINT: &str = "small, footer, [class*=\"legal\" i], [class*=\"copyright\" i], [class*=\"fineprint\" i], [class*=\"fine-print\" i], [class*=\"smallprint\" i], [class*=\"small-print\" i], [class*=\"disclaimer\" i], [class*=\"disclosure\" i], [class*=\"footnote\" i]";
 const TEXT_EDGE_QUERY: &str =
     "a, button, code, dd, dt, figcaption, h1, h2, h3, h4, h5, h6, li, p, pre, span, td, th";
@@ -671,7 +729,7 @@ fn rendered_line_widths(dom: &dyn Dom, el: ElId) -> Option<Vec<f64>> {
     )
 }
 
-static COMBINING_OR_FORMAT_RE: Lazy<Regex> =
+pub(crate) static COMBINING_OR_FORMAT_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"[\p{M}\p{Cf}]").expect("COMBINING_OR_FORMAT_RE"));
 
 /// The running count of [`rendered_text_len`], fed one text node at a time.
@@ -819,7 +877,7 @@ const REPLACED_TAGS: [&str; 11] =
     ["img", "svg", "video", "canvas", "iframe", "object", "embed", "input", "select", "textarea", "button"];
 
 /// An atomic inline box: a replaced element or an `inline-*` display.
-fn is_atomic_inline(dom: &dyn Dom, el: ElId) -> bool {
+pub(crate) fn is_atomic_inline(dom: &dyn Dom, el: ElId) -> bool {
     REPLACED_TAGS.contains(&tag_lower(dom, el).as_str())
         || js::to_lower_case(&dom.style(el, "display")).trim().starts_with("inline-")
 }
@@ -881,10 +939,88 @@ fn feed_rendered_text(dom: &dyn Dom, el: ElId, out: &mut RenderedTextCount) {
 /// (a `pre-wrap` span inside a normal paragraph keeps its spaces, which are
 /// on the line), and combining marks and format characters (zero-width
 /// joiners, soft hyphens) are left out.
-fn rendered_text_len(dom: &dyn Dom, el: ElId) -> usize {
+pub(crate) fn rendered_text_len(dom: &dyn Dom, el: ElId) -> usize {
     let mut count = RenderedTextCount::default();
     feed_rendered_text(dom, el, &mut count);
     count.total()
+}
+
+/// How deep into `el`'s box an edge is drawn on each side, `[top, right,
+/// bottom, left]`, by an inset `box-shadow` (a visible inset layer's spread,
+/// moved by its offset: `inset 1px 0 0 1px` draws 2px on the left, 1px on the
+/// top and bottom and nothing on the right) or by an outline a negative
+/// `outline-offset` pulls inside the box (the offset's depth on every side).
+/// Infinite when the capture recorded neither value, so callers keep their
+/// base reading.
+fn drawn_inner_edge(dom: &dyn Dom, el: ElId) -> [f64; 4] {
+    let shadow = dom.style(el, "boxShadow");
+    let offset = dom.style(el, "outlineOffset");
+    if shadow.is_empty() || offset.is_empty() {
+        return [f64::INFINITY; 4];
+    }
+    let mut depth = [0.0f64; 4];
+    if shadow != "none" {
+        // Layers split on commas outside parentheses.
+        let mut layers = Vec::new();
+        let (mut level, mut start) = (0i32, 0usize);
+        for (i, c) in shadow.char_indices() {
+            match c {
+                '(' => level += 1,
+                ')' => level -= 1,
+                ',' if level == 0 => {
+                    layers.push(&shadow[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        layers.push(&shadow[start..]);
+        for layer in layers {
+            if !layer.split_whitespace().any(|w| w == "inset") {
+                continue;
+            }
+            // The colour is the one function or keyword in the layer; the
+            // lengths are, in order, x, y, blur and spread.
+            let colour_end = layer.rfind(')').map_or(0, |i| i + 1);
+            let colour = &layer[..colour_end];
+            if !colour.is_empty() && css_color_is_transparent(Some(colour.trim())) {
+                continue;
+            }
+            let lengths: Vec<f64> = layer[colour_end..]
+                .split_whitespace()
+                .filter(|w| w.ends_with("px"))
+                .map(parse_float)
+                .collect();
+            // The shadow is the padding box shrunk by the spread and moved
+            // by the offset; what it leaves uncovered is drawn. An offset
+            // deepens one side and thins the other.
+            let (Some(&x), Some(&y), Some(&spread)) =
+                (lengths.first(), lengths.get(1), lengths.get(3))
+            else {
+                continue;
+            };
+            for (side, d) in [spread + y, spread - x, spread - y, spread + x].into_iter().enumerate() {
+                if d.is_finite() && d > 0.0 {
+                    depth[side] = js::math_max(depth[side], d);
+                }
+            }
+        }
+    }
+    let offset = parse_float(&offset);
+    let width = parse_float(&dom.style(el, "outlineWidth"));
+    let style = dom.style(el, "outlineStyle");
+    if offset.is_finite()
+        && offset < 0.0
+        && width.is_finite()
+        && width > 0.0
+        && !matches!(style.as_str(), "" | "none" | "hidden")
+        && !css_color_is_transparent(Some(&dom.style(el, "outlineColor")))
+    {
+        for d in &mut depth {
+            *d = js::math_max(*d, -offset);
+        }
+    }
+    depth
 }
 
 /// JS: checks.mjs#textDescendantsFlushSides(el, rect) → [top, right, bottom, left]
@@ -922,10 +1058,46 @@ pub fn text_descendants_flush_sides(dom: &dyn Dom, el: ElId, rect: &Rect) -> [bo
         }
         js::math_min(4.0, font_size * SMALL_CHIP_AIR_EM) * scale
     };
+    // How deep an edge is drawn into the box on each side, `[top, right,
+    // bottom, left]`: a border, an inset `box-shadow` ring (Tailwind's
+    // `ring-inset`) or an outline pulled inside by a negative
+    // `outline-offset`. A transparent one is drawn nowhere. A side whose
+    // border, shadow or outline offset the capture did not record reads as
+    // drawn without limit, which keeps the threshold's edge flush there as
+    // it always was.
+    let inner_edge = drawn_inner_edge(dom, el);
+    let border_drawn: [f64; 4] = std::array::from_fn(|i| {
+        let side = ["Top", "Right", "Bottom", "Left"][i];
+        let width = parse_float(&dom.style(el, &format!("border{side}Width")));
+        let color = dom.style(el, &format!("border{side}Color"));
+        let border = if !width.is_finite() || color.is_empty() {
+            f64::INFINITY
+        } else if width > 0.0 && !css_color_is_transparent(Some(&color)) {
+            width
+        } else {
+            0.0
+        };
+        js::math_max(border, inner_edge[i])
+    });
     let candidates = dom.query_all(Some(el), TEXT_EDGE_QUERY).unwrap_or_default();
     for node in candidates {
         let tag_name = dom.tag_name(node);
         if !TEXT_EDGE_TAGS.contains(&tag_name.as_str()) || !has_meaningful_direct_text(dom, node) {
+            continue;
+        }
+        // Text set under a pixel paints nothing: `font-size: 0` image
+        // replacement, whose visible label is a sprite or a pseudo-element
+        // (auction.co.kr's menu links). The Range has no rect for it, and the
+        // fallback to the link's box put its "text" on the wrapper's edges.
+        // Text a transform draws at a readable size (0.8px under
+        // `scale(20)`) has a measured rect of its own and stays.
+        let node_font = parse_float(&dom.style(node, "fontSize"));
+        if node_font.is_finite()
+            && node_font < 1.0
+            && !dom
+                .direct_text_rect(node)
+                .is_some_and(|r| r.all_finite() && r.width >= 1.0 && r.height >= 1.0)
+        {
             continue;
         }
         let br = dom.rect(node);
@@ -974,12 +1146,21 @@ pub fn text_descendants_flush_sides(dom: &dyn Dom, el: ElId, rect: &Rect) -> [bo
         // not held against it: it runs out of the box (a block parked 64px
         // to the left of its column until its scroll reveal brings it in).
         let land = land_threshold(node);
-        let lands = |gap: f64| gap <= land && gap >= -edge_threshold;
+        // The gap runs from the outer edge of `el`'s box. A child insulates
+        // a side at 4px or more, so text exactly the threshold off an edge
+        // where nothing is drawn is air, not flush (midilibre.fr's footer
+        // band read both ways at 4.0). A drawn border is not air: measured
+        // from its inner edge the same text sits strictly inside the
+        // threshold and stays flush (jyes.com.tw's table frame holds its
+        // headings 4px off the outer edge of a 1px border, 3px of air).
+        let lands = |gap: f64, side: usize| {
+            gap <= land && gap - border_drawn[side] * scale < land && gap >= -edge_threshold
+        };
         let sides = [
-            lands(nr.top - rect.top),
-            !cut_right && lands(rect.right - right),
-            lands(rect.bottom - nr.bottom),
-            !cut_left && lands(left - rect.left),
+            lands(nr.top - rect.top, 0),
+            !cut_right && lands(rect.right - right, 1),
+            lands(rect.bottom - nr.bottom, 2),
+            !cut_left && lands(left - rect.left, 3),
         ];
         // The remaining tests run only for text that reached an edge.
         if !sides.iter().any(|s| *s) {
@@ -1369,13 +1550,25 @@ pub fn body_text_gutter_floor(viewport_width: f64) -> f64 {
     }
 }
 
+/// Whether a `<header>` is a site header, a bar across the top of the page,
+/// rather than a wrapper around the first screen: it is no taller than the
+/// viewport. screen.movie's Framer page wraps its whole first screen,
+/// testimonial included, in a 1,411px `<header>` on an 844px phone, and the
+/// testimonial's lines run past both sides of the screen. A header whose
+/// height or viewport was not measured counts as a site header, as before.
+fn is_site_header(dom: &dyn Dom, header: ElId) -> bool {
+    let height = dom.rect(header).height;
+    let viewport = dom.inner_height();
+    !(height.is_finite() && viewport.is_finite() && viewport > 0.0 && height > viewport)
+}
+
 /// Where a paragraph's body text starts and ends on the x axis, as
 /// `body-text-viewport-edge` reads it, or `None` when the rule does not
 /// measure it: not a `<p>` or `<li>` (or prose written straight into a
 /// generic block, [`is_prose_block`]) of more than 40 characters, inside a
-/// `<nav>` or `<header>`, on its own fill, positioned, half the viewport wide
-/// or less, cut by a scroller or a moving track rather than the page, or
-/// wholly past either side of the viewport.
+/// `<nav>` or a site header ([`is_site_header`]), on its own fill,
+/// positioned, half the viewport wide or less, cut by a scroller or a moving
+/// track rather than the page, or wholly past either side of the viewport.
 ///
 /// Measured on the text where it can be: a centred or padded paragraph
 /// spans the viewport with its box while its glyphs keep a gutter, and a
@@ -1399,13 +1592,18 @@ fn body_text_edge_span(dom: &dyn Dom, q: &QualityInput) -> Option<(f64, f64)> {
     if !((has_direct_text || edge_prose) && q.text_len > 40 && (is_edge_tag || prose_block) && viewport_width > 0.0) {
         return None;
     }
-    let in_nav_header = closest_or_none(dom, el, "nav").is_some() || closest_or_none(dom, el, "header").is_some();
+    let in_nav_header = closest_or_none(dom, el, "nav").is_some()
+        || closest_or_none(dom, el, "header").is_some_and(|h| is_site_header(dom, h));
     let bg = st("backgroundColor");
     let has_own_bg = !bg.is_empty() && bg != "rgba(0, 0, 0, 0)" && bg != "transparent";
     let pos = st("position");
     let is_positioned = pos == "fixed" || pos == "absolute";
     let width_ratio = rect.width / viewport_width;
     if in_nav_header || has_own_bg || is_positioned || !(width_ratio > 0.5) {
+        return None;
+    }
+    // Nor does text in a box caught part way through a move that ends.
+    if super::painted::moves_mid_animation(dom, el) {
         return None;
     }
     let (left, right) = match phrasing_text_extent(dom, el) {
@@ -1454,6 +1652,14 @@ fn body_text_edge_span(dom: &dyn Dom, q: &QualityInput) -> Option<(f64, f64)> {
         None if has_direct_text && !prose_block => (rect.left, rect.right),
         None => return None,
     };
+    // Text in a fixed bar laid over the page (a consent bar, a notice) is
+    // chrome, as the element's own fixed position is, and its gutter is the
+    // bar's business, unless the words reach the screen's edge itself.
+    if in_a_fixed_bar(dom, el)
+        && js::math_min(left, viewport_width - right) >= FIXED_BAR_EDGE_FLOOR_PX
+    {
+        return None;
+    }
     // Text wholly past either side of the viewport meets no edge a reader
     // sees: a desktop column laid out past a phone viewport, a list parked
     // 800px to the right.
@@ -1462,6 +1668,45 @@ fn body_text_edge_span(dom: &dyn Dom, q: &QualityInput) -> Option<(f64, f64)> {
     } else {
         None
     }
+}
+
+/// How close to the screen's edge text in a fixed bar may sit and still be
+/// left to the bar: nearer than this, the words touch the edge and report.
+const FIXED_BAR_EDGE_FLOOR_PX: f64 = 4.0;
+
+/// The share of the viewport's height under which a fixed ancestor is a bar
+/// laid over the page rather than a layer that holds it.
+const FIXED_BAR_MAX_VIEWPORT_SHARE: f64 = 0.5;
+
+/// Whether an ancestor of `el` is a fixed bar: `position: fixed`, measured,
+/// and shorter than half the viewport's height. klimaschutz-niedersachsen.de
+/// (a cookiefirst bar, 196px of an 800px window) and lockheedmartin.com
+/// (`#cookie-bar`, 92px of 844px) set their consent copy in a `<p>` inside a
+/// fixed bar that runs to the window's sides. A fixed layer as tall as the
+/// window is how a smooth-scroll library holds the whole page, so its prose
+/// is still measured, and so is a fixed ancestor the capture did not measure
+/// or a window whose height is unknown. A sticky ancestor is not taken: a
+/// sticky panel holds reading prose in scroll-driven layouts.
+fn in_a_fixed_bar(dom: &dyn Dom, el: ElId) -> bool {
+    let vh = dom.inner_height();
+    if !(vh.is_finite() && vh > 0.0) {
+        return false;
+    }
+    let body = dom.body();
+    let mut cur = dom.parent(el);
+    while let Some(c) = cur {
+        if Some(c) == body {
+            break;
+        }
+        if dom.style(c, "position") == "fixed" {
+            let r = dom.rect(c);
+            if r.all_finite() && r.height > 0.0 && r.height < vh * FIXED_BAR_MAX_VIEWPORT_SHARE {
+                return true;
+            }
+        }
+        cur = dom.parent(c);
+    }
+    false
 }
 
 /// The hit, at advisory severity when `advisory` holds.
@@ -2003,7 +2248,22 @@ pub fn check_quality(dom: &dyn Dom, q: &QualityInput) -> Vec<RuleHit> {
                     let lines = text_line_count(bottom - text_rect.top, lh, font_size);
                     is_bold_title_leading(weight, Some(lines), clamped)
                 };
+                // Preformatted monospace text is drawn line by line, not
+                // set as prose: box-drawing art in a `<pre>` (`┌───┐`)
+                // needs its rows to touch, and a code sample keeps the
+                // leading its editor gives it. The run has to sit in a
+                // `pre`, `code` or `samp`, or draw with box characters: a
+                // chat transcript set in a monospace face at `pre-wrap` is
+                // prose, and `pre-line` keeps no spaces to align.
+                let is_code_run = || {
+                    let ws = st("whiteSpace");
+                    crate::checks::text_rules::is_monospace_family(&st("fontFamily"))
+                        && ((ws.starts_with("pre") && ws != "pre-line") || ws == "break-spaces")
+                        && (closest_or_none(dom, el, "pre, code, samp").is_some()
+                            || direct_text(dom, el).chars().any(|c| ('\u{2500}'..='\u{257F}').contains(&c)))
+                };
                 if wraps
+                    && !is_code_run()
                     && !is_non_rendered_text(dom, el, tag)
                     && !is_visually_hidden(dom, el)
                     && !is_heading_text(dom, el)
@@ -2049,7 +2309,12 @@ pub fn check_quality(dom: &dyn Dom, q: &QualityInput) -> Vec<RuleHit> {
     // terminal mock), which is code whatever its class names.
     if has_direct_text && text_len > 20 && font_size < 12.0 {
         let skip_tags = ["sub", "sup", "code", "kbd", "samp", "var", "caption", "figcaption"];
-        let in_ui_context = closest_or_none(dom, el, TINY_TEXT_UI_CONTEXT).is_some();
+        // A label drawn as a button is UI, unless it is fine print, which
+        // stays tiny-text's advisory (r5-p27).
+        let button_label = || {
+            is_button_box(dom, el) && !*fine_print.get_or_init(|| super::text_context::is_fine_print_dom(dom, el))
+        };
+        let in_ui_context = closest_or_none(dom, el, TINY_TEXT_UI_CONTEXT).is_some() || button_label();
         let is_uppercase = st("textTransform") == "uppercase"
             || typed_caps_label(dom, el, q.line_height_px, true);
         let is_code_run = crate::checks::text_rules::is_monospace_family(&st("fontFamily"))
@@ -2095,7 +2360,7 @@ pub fn check_quality(dom: &dyn Dom, q: &QualityInput) -> Vec<RuleHit> {
             let is_exempt_context = is_code_run || matches_or_closest(dom, el, EXEMPT_CONTEXT);
             if !is_exempt_context && !is_visually_hidden(dom, el) {
                 let is_interactive = is_in_control(dom, el);
-                let is_furniture = matches_or_closest(dom, el, FURNITURE);
+                let is_furniture = is_furniture(dom, el);
                 let is_smallprint = matches_or_closest(dom, el, SMALLPRINT);
                 let floor = if !is_interactive && is_smallprint {
                     SMALLPRINT_TEXT_FLOOR_PX
@@ -2105,8 +2370,15 @@ pub fn check_quality(dom: &dyn Dom, q: &QualityInput) -> Vec<RuleHit> {
                 // Fluid type a hair under the floor (10.9688px against 11px)
                 // is not smaller text to a reader: the floor keeps a 0.1px
                 // tolerance under each value.
+                // A box whose class names a button (smartbi.ca's
+                // `span.features-demo__btn`, no role) is drawn as one, so its
+                // label is functional text at any length, and tiny-text
+                // leaves it to this rule. Fine print is not a label: it
+                // stays tiny-text's advisory (r5-p27).
+                let drawn_as_button = is_button_box(dom, el)
+                    && !*fine_print.get_or_init(|| super::text_context::is_fine_print_dom(dom, el));
                 if is_under_ui_text_floor(font_size, floor)
-                    && (is_interactive || is_furniture || dt_len <= 20)
+                    && (is_interactive || is_furniture || drawn_as_button || dt_len <= 20)
                 {
                     let excerpt = slice_utf16_prefix(&dt, 40);
                     // A label with no reading job (taste call r5-p3) and
@@ -2161,9 +2433,8 @@ pub fn check_quality(dom: &dyn Dom, q: &QualityInput) -> Vec<RuleHit> {
                     // it as plainly and take the same exemption, at any
                     // length and over any number of lines (mialight.app's
                     // caption that wraps on a phone). Every letter has to be
-                    // a capital for that, so a CJK line with one Latin
-                    // acronym in it stays running text unless it is a short
-                    // label on one line.
+                    // a capital for that: a line with one Latin acronym in
+                    // it is not a capitals label.
                     // A link or button label is read at a glance too
                     // (lpga.or.jp's bold CJK "Instagram" link), held to the
                     // same size on one line.
@@ -2175,7 +2446,23 @@ pub fn check_quality(dom: &dyn Dom, q: &QualityInput) -> Vec<RuleHit> {
                     let caps_label = st("textTransform") == "uppercase"
                         || (!lowered
                             && (typed_caps_text(dom, el) || typed_caps_label(dom, el, q.line_height_px, false)));
-                    if !caps_label && !control_label {
+                    // Han, kana and Hangul sit in square cells and are set
+                    // with open tracking by convention, as the crushed
+                    // tracking check below already reads them
+                    // (weathernews.jp's FAQ titles at 0.10em). The script
+                    // is read from the element's own text, not a child's
+                    // (an English line with a hidden Japanese translation
+                    // keeps its finding); only text with no letters of its
+                    // own is read from the whole run.
+                    let cjk = {
+                        let own = collapse_ws(js::trim(&direct_text(dom, el)));
+                        if own.chars().any(char::is_alphabetic) {
+                            is_cjk_text(&own)
+                        } else {
+                            is_cjk_text(&collapse_ws(js::trim(&dom.text_content(el))))
+                        }
+                    };
+                    if !caps_label && !control_label && !cjk {
                         findings.push(RuleHit::new(
                             "wide-tracking",
                             format!("letter-spacing: {}em on body text", to_fixed(tracking_em, 2)),
@@ -2256,6 +2543,36 @@ fn quality_input(dom: &dyn Dom, el: ElId, line_max: f64) -> QualityInput {
     }
 }
 
+/// The elements whose text is code or markup, never shown as words.
+const CODE_TEXT_SELECTOR: &str = "script, style, template, noscript";
+
+/// `el`'s `textContent` without the text of `script`, `style`, `template`
+/// and `noscript` descendants. munsifdaily.in writes the Islamic date into
+/// an h5 with an inline `<script>`, so the heading's text content starts
+/// with `document.write(...)`, which no reader sees.
+fn text_without_code(dom: &dyn Dom, el: ElId) -> String {
+    if dom.query_all(Some(el), CODE_TEXT_SELECTOR).unwrap_or_default().is_empty() {
+        return dom.text_content(el);
+    }
+    // Node by node, so a script's text is dropped where the script sits and
+    // the same words shown elsewhere in the heading stay.
+    fn walk(dom: &dyn Dom, el: ElId, out: &mut String) {
+        for child in dom.child_nodes(el) {
+            match child {
+                DomChild::Text(text) => out.push_str(&text),
+                DomChild::Element(c) => {
+                    if !dom.matches(c, CODE_TEXT_SELECTOR).unwrap_or(false) {
+                        walk(dom, c, out);
+                    }
+                }
+            }
+        }
+    }
+    let mut out = String::new();
+    walk(dom, el, &mut out);
+    out
+}
+
 /// What counts as the page's footer for `skipped-heading`: the element, the
 /// landmark role, or the conventional id.
 pub const FOOTER_SELECTOR: &str = "footer, [role=\"contentinfo\"], #footer";
@@ -2281,7 +2598,7 @@ pub fn check_page_quality_from_doc(dom: &dyn Dom) -> Vec<RuleHit> {
         // JS `parseInt(h.tagName[1])`
         let level = js::parse_int(&tag.chars().nth(1).map(|c| c.to_string()).unwrap_or_default(), 10);
         let level = if level.is_nan() { 0 } else { level as i64 };
-        let text = slice_utf16_prefix(&collapse_ws(js::trim(&dom.text_content(h))), 60);
+        let text = slice_utf16_prefix(&collapse_ws(js::trim(&text_without_code(dom, h))), 60);
         let footer = dom.closest(h, FOOTER_SELECTOR).ok().flatten();
         let opens_footer = footer.is_some() && footer != prev_footer;
         let into_footer = footer.is_some() && (opens_footer || prev_opens_footer);
@@ -2763,6 +3080,29 @@ mod tests {
         d.add_text(nav_link, "[7]");
         d.add_selector(nav_link, INTERACTIVE);
         assert!(ui(&d, nav_link));
+    }
+
+    /// schlittermann.de: `html.js-nav-ready` is a script state flag, not
+    /// navigation around every element on the page.
+    #[test]
+    fn furniture_class_markers_are_not_read_off_html() {
+        let undersized = |d: &FakeDom, el: ElId| {
+            check_element_quality_dom(d, el, &BrowserConfig::default())
+                .iter()
+                .any(|h| h.id == "undersized-ui-text")
+        };
+        let mut d = FakeDom::new();
+        let (html, body) = d.with_page();
+        d.add_selector(html, FURNITURE_CLASSES);
+        let note = text_el(&mut d, body, "p", "For mails we never asked for and will never read", "10px");
+        d.set_rect(note, 40.0, 400.0, 600.0, 14.0);
+        assert!(!undersized(&d, note), "a sentence under html.js-nav-ready");
+        // A box inside the page whose class names navigation still counts.
+        let nav = d.add(Some(body), "div");
+        d.add_selector(nav, FURNITURE_CLASSES);
+        let item = text_el(&mut d, nav, "span", "Linux support and consulting since 1997", "10px");
+        d.set_rect(item, 40.0, 500.0, 300.0, 14.0);
+        assert!(undersized(&d, item));
     }
 
     fn text_el(d: &mut FakeDom, body: ElId, tag: &str, text: &str, font: &str) -> ElId {
@@ -3279,6 +3619,96 @@ mod tests {
         );
     }
 
+    /// observations-47 row 13: auction.co.kr's menu links set their text at
+    /// `font-size: 0` and show a sprite instead. The Range has no rect for
+    /// that text, and the fallback to the link's box put it on the wrapper's
+    /// edges.
+    #[test]
+    fn flush_skips_text_set_under_a_pixel() {
+        let mut d = FakeDom::new();
+        let (row, button) = accordion_row(&mut d);
+        d.set_style(button, "fontSize", "0px");
+        assert!(check_element_quality_dom(&d, row, &BrowserConfig::default()).is_empty());
+        // The control: real text the Dom cannot measure stands on its box.
+        d.set_style(button, "fontSize", "16px");
+        let hits = check_element_quality_dom(&d, row, &BrowserConfig::default());
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        // Text under a pixel that a transform draws at a readable size has a
+        // measured rect, and is measured there (review): 0.8px under
+        // `scale(20)` crowds the border as 16px text would.
+        d.set_style(button, "fontSize", "0.8px");
+        d.set_text_rect(button, 24.0, 4.0, 300.0, 50.0);
+        let hits = check_element_quality_dom(&d, row, &BrowserConfig::default());
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        // A zero-size text rect is still the sprite's hidden label.
+        d.set_text_rect(button, 24.0, 4.0, 0.0, 0.0);
+        assert!(check_element_quality_dom(&d, row, &BrowserConfig::default()).is_empty());
+    }
+
+    /// observations-47 row 13: midilibre.fr's footer band holds its text
+    /// exactly 4px off its fill's edge. A child 4px in insulates its side, so
+    /// 4px of air beside a fill is not flush. A drawn border is not air:
+    /// jyes.com.tw's table frame holds its headings 4px off the outer edge
+    /// of a 1px border (confirmed harmful on run 28), 3px off its inner edge.
+    #[test]
+    fn flush_needs_text_strictly_inside_the_threshold() {
+        let mut d = FakeDom::new();
+        let (row, button) = accordion_row(&mut d);
+        let flush = |d: &FakeDom| -> Vec<String> {
+            check_element_quality_dom(d, row, &BrowserConfig::default())
+                .into_iter()
+                .map(|h| h.snippet)
+                .collect()
+        };
+        // 4px off the outer edge of a 1px border is 3px of air.
+        d.set_text_rect(button, 24.0, 4.0, 300.0, 50.0);
+        assert_eq!(
+            flush(&d),
+            vec!["<div> \"border\": children flush against border on top/bottom (no inset)".to_string()]
+        );
+        // A fill, with no border drawn: 4px is air.
+        for side in ["Top", "Right", "Bottom", "Left"] {
+            d.set_style(row, &format!("border{side}Width"), "0px");
+        }
+        d.set_styles(row, &[("backgroundColor", "rgb(240, 240, 240)"), ("boxShadow", "none"), ("outlineOffset", "0px")]);
+        assert!(flush(&d).is_empty(), "{:?}", flush(&d));
+        // An inset ring (Tailwind's `ring-1 ring-inset`) draws the edge a
+        // border would: 4px off the box is 3px off the line.
+        d.set_style(row, "boxShadow", "rgb(229, 231, 235) 0px 0px 0px 1px inset");
+        assert_eq!(flush(&d).len(), 1, "an inset ring");
+        d.set_style(row, "boxShadow", "rgba(0, 0, 0, 0) 0px 0px 0px 1px inset");
+        assert!(flush(&d).is_empty(), "a transparent ring draws nothing");
+        // An offset moves the edge: `inset 0 8px 0 1px` draws 9px along
+        // the top and nothing along the bottom, and `inset 1px 0 0 1px`
+        // still draws 1px along the top and bottom.
+        d.set_style(row, "boxShadow", "rgb(229, 231, 235) 0px 8px 0px 1px inset");
+        assert_eq!(
+            flush(&d),
+            vec!["<div> \"border\": children flush against bg on top (no inset)".to_string()],
+            "only the top is drawn"
+        );
+        d.set_style(row, "boxShadow", "rgb(229, 231, 235) 1px 0px 0px 1px inset");
+        assert_eq!(flush(&d).len(), 1, "a sideways offset keeps the top and bottom edges");
+        d.set_style(row, "boxShadow", "rgb(0, 0, 0) 0px 4px 12px 0px");
+        assert!(flush(&d).is_empty(), "an outer shadow draws no inner edge");
+        d.set_style(row, "boxShadow", "none");
+        // So does an outline pulled inside the box.
+        d.set_styles(row, &[("outlineWidth", "1px"), ("outlineStyle", "solid"), ("outlineColor", "rgb(0, 0, 0)"), ("outlineOffset", "-1px")]);
+        assert_eq!(flush(&d).len(), 1, "an inset outline");
+        d.set_styles(row, &[("outlineWidth", "0px"), ("outlineStyle", "none"), ("outlineOffset", "0px")]);
+        assert!(flush(&d).is_empty());
+        d.set_text_rect(button, 24.0, 3.5, 300.0, 51.0);
+        assert_eq!(
+            flush(&d),
+            vec!["<div> \"border\": children flush against bg on top/bottom (no inset)".to_string()]
+        );
+        // A border the capture did not record keeps the edge flush.
+        d.set_text_rect(button, 24.0, 4.0, 300.0, 50.0);
+        d.set_style(row, "borderTopWidth", "");
+        d.set_style(row, "borderBottomWidth", "");
+        assert_eq!(flush(&d).len(), 1, "unrecorded borders");
+    }
+
     /// freenet.de (218500, 218548) and sona8.com (217614, 217742, 217750,
     /// 217758): text the wrapper's padding does not place, or that a scroll
     /// reveal has not brought in yet.
@@ -3487,8 +3917,10 @@ mod tests {
     /// label on a 20px `normal` line 2px off its edges; the glyphs' em box
     /// sits 5px off. haraj.com.sa's 28px price chip holds a 19px content
     /// area 4px off inside a 24px line box 2px off and keeps the content-area
-    /// measure, so it reports as it did before the decision (its em box, 5.5px
-    /// off, would not).
+    /// measure (its em box, 5.5px off, would not). Since observations-47 row
+    /// 13 a gap of exactly 4px beside a fill with no border is air, so the
+    /// case below sets the content area 3.5px off to keep the 28px bound
+    /// pinned.
     #[test]
     fn cramped_padding_measures_small_chips_by_their_glyphs() {
         let mut d = FakeDom::new();
@@ -3499,7 +3931,7 @@ mod tests {
         let price = |height: f64| -> Vec<String> {
             let mut d = FakeDom::new();
             let (c, label) = chip(&mut d, height, "16px", "24px", (2.0, 24.0));
-            d.set_text_rect(label, 628.0, 104.0, 41.0, 19.0);
+            d.set_text_rect(label, 628.0, 103.5, 41.0, 19.0);
             cramped(&d, c)
         };
         assert_eq!(price(28.0), top, "28px is not under 28px");
@@ -4345,6 +4777,51 @@ mod tests {
         assert!(snippets(&d, li, "body-text-viewport-edge").is_empty());
     }
 
+    /// klimaschutz-niedersachsen.de (10046611) and lockheedmartin.com
+    /// (10046701): consent copy in a `<p>` inside a fixed bar at the window's
+    /// sides. A fixed layer as tall as the window (a smooth-scroll page)
+    /// still measures its prose, and so does a bar the capture did not
+    /// measure.
+    #[test]
+    fn viewport_edge_skips_text_in_a_fixed_bar() {
+        let copy = "We use cookies to measure how the site is used and to improve it for every visitor.";
+        let len = utf16_len(copy);
+        let mut d = FakeDom::new();
+        let (_h, body) = d.with_page();
+        d.inner_width = 1280.0;
+        d.inner_height = 800.0;
+        let bar = d.add(Some(body), "div");
+        d.set_style(bar, "position", "fixed");
+        d.set_rect(bar, 0.0, 604.0, 1280.0, 196.0);
+        let p = text_el(&mut d, bar, "p", copy, "12px");
+        d.set_style(p, "lineHeight", "16px");
+        d.set_rect(p, 15.0, 672.0, 716.0, 34.0);
+        d.set_text_rect(p, 15.0, 673.0, 700.0, 32.0);
+        assert!(snippets(&d, p, "body-text-viewport-edge").is_empty(), "consent bar");
+        // Words that touch the screen's edge report inside a bar too.
+        d.set_rect(p, 0.0, 672.0, 716.0, 34.0);
+        d.set_text_rect(p, 2.0, 673.0, 700.0, 32.0);
+        assert_eq!(
+            snippets(&d, p, "body-text-viewport-edge"),
+            vec![format!("<p> with {len}-char body bleeds to viewport edge (left 0px)")],
+            "touching"
+        );
+        d.set_rect(p, 15.0, 672.0, 716.0, 34.0);
+        d.set_text_rect(p, 15.0, 673.0, 700.0, 32.0);
+        // The same copy in a window-tall fixed layer reports.
+        d.set_rect(bar, 0.0, 0.0, 1280.0, 800.0);
+        let want = vec![format!("<p> with {len}-char body bleeds to viewport edge (left 15px)")];
+        assert_eq!(snippets(&d, p, "body-text-viewport-edge"), want, "page layer");
+        // So does a bar with no measured box, and a static wrapper.
+        d.set_rect(bar, 0.0, 0.0, 0.0, 0.0);
+        assert_eq!(snippets(&d, p, "body-text-viewport-edge"), want, "unmeasured");
+        d.set_rect(bar, 0.0, 604.0, 1280.0, 196.0);
+        d.set_style(bar, "position", "static");
+        assert_eq!(snippets(&d, p, "body-text-viewport-edge"), want, "static");
+        d.set_style(bar, "position", "sticky");
+        assert_eq!(snippets(&d, p, "body-text-viewport-edge"), want, "sticky");
+    }
+
     /// Taste call r3-34: at 480px or less the gutter floor is 12px, above it
     /// 16px. rtx.com keeps a consistent 12px at 390px; text 8px from a
     /// phone's edge still reports.
@@ -4381,6 +4858,172 @@ mod tests {
         );
         assert_eq!(at(&mut d, 1280.0, 12.0).len(), 1);
         assert!(at(&mut d, 1280.0, 16.0).is_empty());
+    }
+
+    /// screen.movie miss 437: a Framer page sets its whole first screen,
+    /// testimonial included, in a `<header>` 1,411px tall on an 844px phone.
+    /// That is not a site header, and its body text is measured. Text in a
+    /// header no taller than the viewport (a bar across the top) is not.
+    #[test]
+    fn viewport_edge_measures_text_in_a_header_taller_than_the_screen() {
+        let copy = "I have purchased dozens of screen recording tools over the years and this is the one I kept.";
+        let len = utf16_len(copy);
+        let mut d = FakeDom::new();
+        let (_h, body) = d.with_page();
+        d.inner_width = 390.0;
+        d.inner_height = 844.0;
+        let header = d.add(Some(body), "header");
+        d.set_rect(header, 0.0, 0.0, 390.0, 1411.0);
+        let p = text_el(&mut d, header, "p", copy, "16px");
+        d.set_styles(p, &[("lineHeight", "24px"), ("paddingLeft", "8px"), ("paddingRight", "8px")]);
+        d.set_rect(p, 0.0, 1227.0, 390.0, 96.0);
+        d.set_text_rect(p, 8.0, 1229.0, 374.0, 92.0);
+        assert_eq!(
+            snippets(&d, p, "body-text-viewport-edge"),
+            vec![format!("<p> with {len}-char body bleeds to viewport edge (left 8px / right 8px)")]
+        );
+        d.set_rect(header, 0.0, 0.0, 390.0, 844.0);
+        assert!(snippets(&d, p, "body-text-viewport-edge").is_empty(), "a header one screen tall");
+        d.set_rect(header, 0.0, 0.0, 390.0, 1411.0);
+        d.inner_height = f64::NAN;
+        assert!(snippets(&d, p, "body-text-viewport-edge").is_empty(), "no viewport height");
+    }
+
+    /// elevancehealth.com (324856): a quote caught part way through its
+    /// one-shot slide in from the right, 79px past a 390px viewport.
+    #[test]
+    fn text_in_a_box_mid_slide_is_not_measured_against_the_viewport() {
+        use impeccable_foundation::browser::dom::KeyframeFrame;
+        let copy = "Our care teams meet people where they are, and that changes what health looks like.";
+        let frame = |decls: &[(&str, &str)]| KeyframeFrame {
+            decls: decls.iter().map(|(p, v)| (p.to_string(), v.to_string())).collect(),
+        };
+        // `mover` takes the animation (or transition) and its running
+        // properties; `wrapper` says whether a wrapper holds the quote.
+        let run_t = |running: Option<Vec<&str>>, styles: &[(&str, &str)], on_wrapper: bool, wrapper_transform: &str| {
+            let mut d = FakeDom::new();
+            let (html, body) = d.with_page();
+            d.inner_width = 390.0;
+            d.set_rect(html, 0.0, 0.0, 390.0, 2400.0);
+            d.el_mut(html).client_width = 390.0;
+            d.el_mut(html).scroll_width = 469.0;
+            d.set_rect(body, 0.0, 0.0, 390.0, 2400.0);
+            d.keyframes.insert(
+                "quote-appear-right".into(),
+                vec![frame(&[("opacity", "0"), ("right", "-96%")]), frame(&[("opacity", "1"), ("right", "0px")])],
+            );
+            d.keyframes.insert("drift".into(), vec![frame(&[("right", "0px")]), frame(&[("right", "8px")])]);
+            d.keyframes.insert(
+                "fade-up".into(),
+                vec![frame(&[("opacity", "0"), ("transform", "translateY(20px)")]), frame(&[("opacity", "1"), ("transform", "none")])],
+            );
+            d.keyframes.insert(
+                "fade-up-offset".into(),
+                vec![
+                    frame(&[("opacity", "0"), ("transform", "translateX(40px) translateY(20px)")]),
+                    frame(&[("opacity", "1"), ("transform", "translate(40px, 0px)")]),
+                ],
+            );
+            d.keyframes.insert(
+                "grow-tall".into(),
+                vec![
+                    frame(&[("transform", "matrix(1, 0, 0, 1.2, 40, 0)")]),
+                    frame(&[("transform", "translateX(40px)")]),
+                ],
+            );
+            d.keyframes.insert(
+                "grow-in-place".into(),
+                vec![
+                    frame(&[("transform", "matrix(1.2, 0, 0, 1.2, 40, 0)")]),
+                    frame(&[("transform", "matrix(1, 0, 0, 1, 40, 0)")]),
+                ],
+            );
+            d.keyframes.insert(
+                "slide-in".into(),
+                vec![frame(&[("transform", "translateX(120px)")]), frame(&[("transform", "translateX(0px)")])],
+            );
+            let wrapper = d.add(Some(body), "main");
+            d.set_rect(wrapper, 0.0, 0.0, 390.0, 2400.0);
+            d.set_style(wrapper, "transform", wrapper_transform);
+            let quote = d.add(Some(wrapper), "div");
+            d.set_style(quote, "position", "relative");
+            d.set_rect(quote, 119.0, 700.0, 350.0, 320.0);
+            let mover = if on_wrapper { wrapper } else { quote };
+            d.set_styles(mover, styles);
+            d.el_mut(mover).running_animations = running.map(|r| r.into_iter().map(String::from).collect());
+            let p = text_el(&mut d, quote, "p", copy, "16px");
+            d.set_style(p, "lineHeight", "24px");
+            d.set_rect(p, 143.0, 724.0, 310.0, 96.0);
+            d.set_text_rect(p, 143.0, 724.0, 310.0, 96.0);
+            check_page_overflow_dom(&d).len()
+        };
+        let run = |running: Option<Vec<&str>>, styles: &[(&str, &str)], on_wrapper: bool| {
+            run_t(running, styles, on_wrapper, "none")
+        };
+        let run_skewed =
+            |running: Option<Vec<&str>>, styles: &[(&str, &str)]| run_t(running, styles, false, "matrix(1, 0, 0.2, 1, 0, 0)");
+        let slide = [("animationName", "quote-appear-right"), ("animationIterationCount", "1")];
+        assert_eq!(run(Some(vec!["right", "opacity"]), &slide, false), 0);
+        // A transition that names the property traces it too.
+        let eased = [("transitionProperty", "left"), ("transitionDuration", "0.4s")];
+        assert_eq!(run(Some(vec!["left"]), &eased, false), 0);
+        // At rest, or in a loop, the box stands where it was measured.
+        assert_eq!(run(Some(vec!["opacity"]), &slide, false), 1);
+        let looped = [("animationName", "quote-appear-right"), ("animationIterationCount", "infinite")];
+        assert_eq!(run(Some(vec!["right"]), &looped, false), 1);
+        // Half an iteration still ends.
+        let half = [("animationName", "quote-appear-right"), ("animationIterationCount", "0.5")];
+        assert_eq!(run(Some(vec!["right"]), &half, false), 0);
+        // A one-shot entrance beside an infinite drift on the same property:
+        // the capture cannot tell which one moves it, and the drift never
+        // stops.
+        let mixed = [
+            ("animationName", "quote-appear-right, drift"),
+            ("animationIterationCount", "1, infinite"),
+        ];
+        assert_eq!(run(Some(vec!["right"]), &mixed, false), 1);
+        // A recording that did not read running animations.
+        assert_eq!(run(None, &slide, false), 1);
+        // A fade-up on an ancestor moves the text vertically only: the
+        // overflow is real whatever frame the entrance was caught at.
+        let fade_up = [("animationName", "fade-up"), ("animationIterationCount", "1"), ("transform", "matrix(1, 0, 0, 1, 0, 12)")];
+        assert_eq!(run(Some(vec!["transform", "opacity"]), &fade_up, true), 1);
+        // A fade-up that keeps the same x offset in every frame moves only
+        // on y (review): the sideways offset the capture read is where the
+        // box ends, and the overflow is real.
+        let held = [("animationName", "fade-up-offset"), ("animationIterationCount", "1"), ("transform", "matrix(1, 0, 0, 1, 40, 12)")];
+        assert_eq!(run(Some(vec!["transform", "opacity"]), &held, false), 1);
+        // A transform slide that changes x is still a move that ends.
+        let slide_x = [("animationName", "slide-in"), ("animationIterationCount", "1"), ("transform", "matrix(1, 0, 0, 1, 79, 0)")];
+        assert_eq!(run(Some(vec!["transform"]), &slide_x, false), 0);
+        // A matrix that keeps x at 40px but scales moves what the box holds
+        // sideways (review): still a move that ends.
+        let grow = [("animationName", "grow-in-place"), ("animationIterationCount", "1"), ("transform", "matrix(1.1, 0, 0, 1.1, 40, 0)")];
+        assert_eq!(run(Some(vec!["transform"]), &grow, false), 0);
+        // One that scales only y keeps x where it is (review): the overflow
+        // stays after the animation.
+        let tall = [("animationName", "grow-tall"), ("animationIterationCount", "1"), ("transform", "matrix(1, 0, 0, 1.1, 40, 0)")];
+        assert_eq!(run(Some(vec!["transform"]), &tall, false), 1);
+        // Under a wrapper that skews what it holds, a change of y moves the
+        // text sideways on screen (review): still a move that ends.
+        let tall_skewed = [
+            ("animationName", "grow-tall"),
+            ("animationIterationCount", "1"),
+            ("transform", "matrix(1, 0, 0, 1.1, 40, 0)"),
+        ];
+        assert_eq!(run_skewed(Some(vec!["transform"]), &tall_skewed), 0);
+        // A wrapper that only scales, even unequally, carries no move on y
+        // into x (review): the overflow stays.
+        assert_eq!(run_t(Some(vec!["transform"]), &tall_skewed, false, "matrix(2, 0, 0, 1, 0, 0)"), 1);
+        // Under a perspective tilt (`perspective(500px) rotateX(30deg)`), a
+        // move on y shifts the text sideways on screen too (review).
+        let tilted = "matrix3d(1, 0, 0, 0, 0, 0.866025, 0.5, -0.001, 0, -0.5, 0.866025, -0.00173205, 0, 0, 0, 1)";
+        assert_eq!(run_t(Some(vec!["transform"]), &tall_skewed, false, tilted), 0);
+        assert_eq!(run_t(Some(vec!["transform"]), &tall_skewed, false, "matrix3d(2, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1)"), 1);
+        // A transform moved by script (a Web Animations loop) with no CSS
+        // animation or transition to trace it is unknown.
+        let untraced = [("transform", "matrix(1, 0, 0, 1, -40, 0)")];
+        assert_eq!(run(Some(vec!["transform"]), &untraced, false), 1);
     }
 
     /// Taste call r4-p20 (observations-25 issue 8): text past the viewport
@@ -4956,8 +5599,9 @@ mod tests {
         assert_eq!(ids, vec!["wide-tracking"]);
         d.set_style(s, "textTransform", "none");
 
-        // A long line of Hangul with one Latin acronym in capitals is running
-        // text: the short-label reading needs one line inside the label length.
+        // A long line of Hangul with one Latin acronym in capitals is not a
+        // capitals label, but it is CJK text, which takes open tracking by
+        // convention (observations-47 row 21): no finding.
         let long = text_el(
             &mut d,
             body,
@@ -4969,9 +5613,30 @@ mod tests {
         d.set_styles(long, &[("lineHeight", "26px"), ("letterSpacing", "2px")]);
         d.els[long as usize].direct_text_rect = Some(Rect::from_xywh(40.0, 300.0, 600.0, 52.0));
         let hits = check_element_quality_dom(&d, long, &BrowserConfig::default());
+        assert!(hits.iter().all(|h| h.id != "wide-tracking"), "{hits:?}");
+        // The same run in Latin letters is running text, tracked wide.
+        let latin = text_el(
+            &mut d,
+            body,
+            "p",
+            "Support hours run Monday to Friday, from nine in the morning until six (KST)",
+            "16px",
+        );
+        d.set_rect(latin, 40.0, 500.0, 600.0, 52.0);
+        d.set_styles(latin, &[("lineHeight", "26px"), ("letterSpacing", "2px")]);
+        d.els[latin as usize].direct_text_rect = Some(Rect::from_xywh(40.0, 500.0, 600.0, 52.0));
+        let hits = check_element_quality_dom(&d, latin, &BrowserConfig::default());
         let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
         assert_eq!(ids, vec!["wide-tracking"], "{hits:?}");
         assert_eq!(hits[0].snippet, "letter-spacing: 0.13em on body text");
+        // A longer Japanese translation in a hidden child does not make the
+        // English line CJK text (review): the script is read from its own.
+        let hidden = d.add(Some(latin), "span");
+        d.add_text(hidden, &"サポートの受付時間は月曜日から金曜日の午前九時から午後六時までです。".repeat(3));
+        d.set_style(hidden, "display", "none");
+        let ids: Vec<String> =
+            check_element_quality_dom(&d, latin, &BrowserConfig::default()).into_iter().map(|h| h.id).collect();
+        assert_eq!(ids, vec!["wide-tracking"]);
     }
 
     /// Uppercase costs reading only when the run is long enough to be read as
@@ -5308,6 +5973,34 @@ mod tests {
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].type_, "skipped-heading");
         assert_eq!(f[0].detail, "<h1> \"Title here\" followed by <h3> \"Sub\" (missing h2)");
+
+        // munsifdaily.in (10046594): the h5 writes its date with an inline
+        // script, whose source is not a word on the page.
+        let mut d = FakeDom::new();
+        let (_h, body) = d.with_page();
+        let h2 = d.add(Some(body), "h2");
+        d.add_text(h2, "E-Paper");
+        let h5 = d.add(Some(body), "h5");
+        let script = d.add(Some(h5), "script");
+        d.add_text(script, "document.write(writeIslamicDate(-1));");
+        d.add_text(h5, "28 Rabi-uthani 1448 AH");
+        let f = check_page_quality_dom(&d);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].detail, "<h2> \"E-Paper\" followed by <h5> \"28 Rabi-uthani 1448 AH\" (missing h3)");
+
+        // Script source that repeats a shown word removes the script's
+        // copy, not the word.
+        let mut d = FakeDom::new();
+        let (_h, body) = d.with_page();
+        let h1 = d.add(Some(body), "h1");
+        d.add_text(h1, "Title");
+        let h3 = d.add(Some(body), "h3");
+        d.add_text(h3, "true facts");
+        let script = d.add(Some(h3), "script");
+        d.add_text(script, "true");
+        let f = check_page_quality_dom(&d);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].detail, "<h1> \"Title\" followed by <h3> \"true facts\" (missing h2)");
     }
 
     /// r5-p29: a skip into the footer is chrome; a skip in the content, and
@@ -5395,6 +6088,98 @@ mod tests {
         assert!(is_non_rendered_text(&d, s, "script"));
         d.set_style(s, "visibility", "collapse");
         assert!(is_non_rendered_text(&d, s, "span"));
+    }
+
+    /// observations-1004 row 14 (smartbi.ca 10048026): a 10px label in a
+    /// box whose class names a button is functional text, not body copy,
+    /// at any length. Review of round 11: the class is read as a token on
+    /// the text's box or a control-sized box around it, so a wrapper of
+    /// buttons and copy (`hero-btns`) changes nothing, and fine print stays
+    /// tiny-text's advisory (r5-p27).
+    #[test]
+    fn button_class_labels_are_functional_text() {
+        let found = |d: &FakeDom, el: ElId| -> Vec<String> {
+            check_element_quality_dom(d, el, &BrowserConfig::default())
+                .into_iter()
+                .filter(|h| h.id == "tiny-text" || h.id == "undersized-ui-text")
+                .map(|h| format!("{}{}: {}", h.id, if h.is_advisory() { " (advisory)" } else { "" }, h.snippet))
+                .collect()
+        };
+        let mut d = FakeDom::new();
+        let (_h, body) = d.with_page();
+        let label = text_el(&mut d, body, "span", "View the full analysis", "10px");
+        d.set_rect(label, 40.0, 100.0, 140.0, 14.0);
+        assert_eq!(found(&d, label), vec!["tiny-text: 10px body text"], "no class: body text");
+        d.set_attr(label, "class", "features-demo__btn features-demo__btn--p");
+        assert_eq!(
+            found(&d, label),
+            vec!["undersized-ui-text: 10px functional text \"View the full analysis\" (below 11px floor)"]
+        );
+        // The class on a control-sized box around the text counts too.
+        let pill = d.add(Some(body), "div");
+        d.set_attr(pill, "class", "btn");
+        let inner = text_el(&mut d, pill, "span", "Download the full report", "10px");
+        d.set_rect(inner, 40.0, 200.0, 140.0, 14.0);
+        assert_eq!(found(&d, inner).len(), 1);
+        assert!(found(&d, inner)[0].starts_with("undersized-ui-text"));
+
+        // A wrapper that holds buttons and copy names no button.
+        let hero = d.add(Some(body), "div");
+        d.set_attr(hero, "class", "hero-btns btn-group");
+        let note = text_el(&mut d, hero, "p", "Free for individual developers working on open source projects, with fair use limits.", "10px");
+        d.set_rect(note, 40.0, 300.0, 400.0, 14.0);
+        assert_eq!(found(&d, note), vec!["tiny-text: 10px body text"], "wrapper prose");
+        // Fine print in a button box stays tiny-text's advisory.
+        let cta = d.add(Some(body), "div");
+        d.set_attr(cta, "class", "cta-btn");
+        let legal = text_el(&mut d, cta, "small", "*Offer valid for new customers only.", "9px");
+        d.set_rect(legal, 40.0, 400.0, 300.0, 12.0);
+        let got = found(&d, legal);
+        assert_eq!(got, vec!["tiny-text (advisory): 9px body text"], "fine print in a button box");
+    }
+
+    /// observations-1004 row 22 (v0-saa-s-landing-page 10047450): box art
+    /// in a monospace `pre` is drawn line by line, and its rows touch on
+    /// purpose. Prose in a proportional face, or with its white space
+    /// collapsed, keeps the finding.
+    #[test]
+    fn tight_leading_skips_preformatted_monospace_runs() {
+        const ART: &str = "  ┌───┐  │ ◉ │  └─┬─┘    │    a box drawn in characters that runs long";
+        let leading = |d: &FakeDom, el: ElId| -> usize {
+            check_element_quality_dom(d, el, &BrowserConfig::default())
+                .into_iter()
+                .filter(|h| h.id == "tight-leading")
+                .count()
+        };
+        let mut d = FakeDom::new();
+        let (_h, body) = d.with_page();
+        let pre = text_el(&mut d, body, "pre", ART, "12px");
+        d.set_style(pre, "lineHeight", "15px");
+        d.set_rect(pre, 40.0, 100.0, 240.0, 75.0);
+        d.el_mut(pre).direct_text_rect = Some(Rect::from_xywh(40.0, 100.0, 240.0, 75.0));
+        assert_eq!(leading(&d, pre), 1, "no face recorded: as before");
+        d.set_styles(pre, &[("fontFamily", "ui-monospace, monospace"), ("whiteSpace", "pre")]);
+        assert_eq!(leading(&d, pre), 0, "box art in a monospace pre");
+        d.set_style(pre, "whiteSpace", "normal");
+        assert_eq!(leading(&d, pre), 1, "white space collapsed: set as prose");
+        d.set_styles(pre, &[("fontFamily", "Inter, sans-serif"), ("whiteSpace", "pre-wrap")]);
+        assert_eq!(leading(&d, pre), 1, "a proportional face");
+        // Review of round 11: a chat message in a monospace face at
+        // pre-wrap, outside any pre or code, is prose.
+        let msg = text_el(&mut d, body, "div", "Thanks, that worked. Could you also check why the second deploy failed last night?", "12px");
+        d.set_styles(msg, &[("lineHeight", "15px"), ("fontFamily", "ui-monospace, monospace"), ("whiteSpace", "pre-wrap")]);
+        d.set_rect(msg, 40.0, 300.0, 240.0, 75.0);
+        d.el_mut(msg).direct_text_rect = Some(Rect::from_xywh(40.0, 300.0, 240.0, 75.0));
+        assert_eq!(leading(&d, msg), 1, "a monospace chat message");
+        // The same run in a pre stays out; at pre-line it is prose again.
+        d.set_styles(pre, &[("fontFamily", "ui-monospace, monospace"), ("whiteSpace", "pre-line")]);
+        d.add_selector(pre, "pre, code, samp");
+        assert_eq!(leading(&d, pre), 1, "pre-line");
+        d.set_style(pre, "whiteSpace", "pre");
+        assert_eq!(leading(&d, pre), 0, "box art in a pre, by its ancestor too");
+        // break-spaces keeps its spaces as pre-wrap does.
+        d.set_style(pre, "whiteSpace", "break-spaces");
+        assert_eq!(leading(&d, pre), 0, "box art at break-spaces");
     }
 }
 

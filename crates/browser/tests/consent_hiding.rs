@@ -110,6 +110,8 @@ const KEEP: ScanOptions = ScanOptions {
     rule_pack: None,
     keep_consent_banners: true,
     keep_overlays: false,
+    unreported_rules: Vec::new(),
+    ignored_linked_stylesheet: None,
 };
 
 #[test]

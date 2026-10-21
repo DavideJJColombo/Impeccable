@@ -687,8 +687,8 @@ fn text_clipped_by_an_ancestor(el: &StaticElement<'_>) -> bool {
     for _ in 0..MAX_ANCESTORS {
         let Some(c) = cur else { return false };
         let style = c.style();
-        if js::trim(sv(style, "webkitBackgroundClip")) == "text"
-            || js::trim(sv(style, "backgroundClip")) == "text"
+        if impeccable_core::checks::rules::background_clips_to_text(sv(style, "webkitBackgroundClip"))
+            || impeccable_core::checks::rules::background_clips_to_text(sv(style, "backgroundClip"))
         {
             return true;
         }
@@ -1847,6 +1847,10 @@ pub fn check_element_clipped_overflow(el: &StaticElement<'_>, style: &StyleValue
 /// Only resolved, visible box shadows participate; reference assets and class
 /// names do not establish whether a neobrutalist treatment is intentional.
 pub fn check_element_hard_offset_shadow(el: &StaticElement<'_>) -> Vec<RuleHit> {
+    let box_shadow = sv(el.style(), "boxShadow");
+    if !impeccable_core::checks::hard_offset_shadow::has_shadow(box_shadow) {
+        return Vec::new();
+    }
     let mut current = Some(*el);
     while let Some(node) = current {
         if node.get_attribute("hidden").is_some() || sv(node.style(), "display") == "none" {
@@ -1856,6 +1860,6 @@ pub fn check_element_hard_offset_shadow(el: &StaticElement<'_>) -> Vec<RuleHit> 
     }
     if matches!(sv(el.style(), "visibility"), "hidden" | "collapse") { return Vec::new(); }
     impeccable_core::checks::hard_offset_shadow::check_hard_offset_shadow(
-        sv(el.style(), "boxShadow"), sv(el.style(), "color"), static_effective_opacity(el),
+        box_shadow, sv(el.style(), "color"), static_effective_opacity(el),
     )
 }

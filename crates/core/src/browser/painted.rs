@@ -71,7 +71,7 @@ pub enum Unpainted {
     /// The box has no width or no height, and none of its content shows past
     /// that edge.
     NoArea,
-    /// A text measurement's text is set at a font size under 1px, and no
+    /// A text measurement's text is set at a font size of 1px or less, and no
     /// descendant sets it larger: a Slick dot's `font-size: 0` label, a link
     /// laid over a card whose words only a screen reader reads.
     NoFontSize,
@@ -141,9 +141,11 @@ pub const PAINT_GATED_TEXT_RULES: &[&str] = &[
     "justified-text",
     "line-length",
     "low-contrast",
+    "straggler",
     "text-overflow",
     "tight-leading",
     "tiny-text",
+    "unbalanced-heading",
     "undersized-ui-text",
     "wide-tracking",
 ];
@@ -177,8 +179,12 @@ pub const PAINT_GATED_BOX_RULES: &[&str] = &["ai-color-palette", "bounce-easing"
 /// declared: such a finding reports only when at least one element the
 /// selector matches is painted at capture. The match is tested on the base
 /// predicate alone, with no area test, because the selector may name a
-/// pseudo-element (`.node::after`) whose host has no box of its own.
-pub const PAINT_GATED_PAGE_FORMS: &[&str] = &["bounce-easing", "dark-glow", "gradient-text", "pulsing-dot", "repeating-stripes-gradient"];
+/// pseudo-element (`.node::after`) whose host has no box of its own. A
+/// stripe declared for cards none of which renders (fastsocial.co's
+/// `.pricing .tier-card::before`, every host in a `display: none` grid) is
+/// one of them: `side-tab`.
+pub const PAINT_GATED_PAGE_FORMS: &[&str] =
+    &["bounce-easing", "dark-glow", "gradient-text", "pulsing-dot", "repeating-stripes-gradient", "side-tab"];
 
 /// Which gate a rule's findings pass through, or `None` for an ungated rule.
 pub fn paint_gate(rule_id: &str) -> Option<PaintGate> {
@@ -252,6 +258,35 @@ pub fn text_shown_across(dom: &dyn Dom, el: ElId) -> bool {
 /// Whether a visitor sees `el` painted at rest, counting its own opacity.
 pub fn painted_at_capture(dom: &dyn Dom, el: ElId) -> bool {
     unpainted_at_capture(dom, el, OwnOpacity::Counts).is_none()
+}
+
+/// Whether `sib`, a later sibling of `el` under `parent` that the caller has
+/// already found drawn over `el` in tree order (both at `z-index: auto`, and
+/// `sib` positioned or `el` not), still paints after it once CSS `order` is
+/// counted. A flex or grid container paints its children in order-modified
+/// document order, so there a later sibling paints after `el` only when its
+/// `order` is not lower. An absolutely positioned child counts as `order: 0`
+/// (CSS Flexbox 5.4); for any other child the capture has to have recorded
+/// `order`, and one it did not record answers no. A positioned `sib` over an
+/// unpositioned `el` paints in a later phase whatever the `order`, and any
+/// other parent paints in tree order.
+pub(crate) fn later_sibling_paints_after(dom: &dyn Dom, parent: ElId, el: ElId, sib: ElId) -> bool {
+    if !matches!(dom.style(parent, "display").as_str(), "flex" | "inline-flex" | "grid" | "inline-grid") {
+        return true;
+    }
+    let position = |e: ElId| dom.style(e, "position");
+    let positioned = |e: ElId| !matches!(position(e).as_str(), "static" | "");
+    if positioned(sib) && !positioned(el) {
+        return true;
+    }
+    let order = |e: ElId| {
+        if matches!(position(e).as_str(), "absolute" | "fixed") {
+            return Some(0.0);
+        }
+        let v = js::parse_float(&dom.style(e, "order"));
+        v.is_finite().then_some(v)
+    };
+    matches!((order(el), order(sib)), (Some(a), Some(b)) if b >= a)
 }
 
 /// Why `el` is not painted at capture, or `None` when it is (or when the Dom
@@ -395,7 +430,9 @@ fn unpainted_walk(
             }
         }
         OwnOpacity::Counts => {
-            if effective_opacity_dom(dom, el) <= TRANSPARENT_FLOOR {
+            // A box a scroll timeline holds at 0 at the top of the page is
+            // read at the opacity a visitor who scrolls to it meets.
+            if effective_opacity_scrolled(dom, el) <= TRANSPARENT_FLOOR {
                 return Some(Unpainted::Transparent);
             }
         }
@@ -512,6 +549,12 @@ fn unpainted_walk(
         if viewport_w > 0.0 && misses_axis(band.left, band.right, band.width, 0.0, viewport_w) {
             return Some(Unpainted::OutsideDocument);
         }
+        // Nor is a text measurement shown when the viewport's sides leave
+        // under its visible share of it (momoshop.com.tw's fixed side tab,
+        // 6 of its label's 40px on screen): no scroll brings the rest in.
+        if viewport_w > 0.0 && vis.cut(0.0, viewport_w, || true) {
+            return Some(Unpainted::OutsideDocument);
+        }
         return None;
     }
     // The document's edges are the outermost clip, above any container.
@@ -519,6 +562,35 @@ fn unpainted_walk(
         return None;
     }
     outside_document(dom, &band, vis, viewport_w)
+}
+
+/// The ancestors of `el`, below the body, whose overflow can clip it, by
+/// the placement rules of [`unpainted_inside`]'s walk: an in-flow box is
+/// clipped by every ancestor, an absolute box only from its containing
+/// block up, a fixed box only from a containing ancestor up. An undecided
+/// ancestor is not taken as the containing block.
+pub(crate) fn clipping_ancestors(dom: &dyn Dom, el: ElId) -> Vec<ElId> {
+    let body = dom.body();
+    let root = dom.document_element();
+    let mut placement = Placement::of(dom, el);
+    let mut out = Vec::new();
+    let mut cur = dom.parent(el);
+    while let Some(p) = cur {
+        if Some(p) == body || Some(p) == root {
+            break;
+        }
+        let containment = if placement == Placement::InFlow {
+            Containment::DoesNot
+        } else {
+            contains_fixed(dom, p)
+        };
+        if placement.clipped_by(dom, p, containment) {
+            out.push(p);
+            placement = Placement::of(dom, p);
+        }
+        cur = dom.parent(p);
+    }
+    out
 }
 
 /// How an element's box is placed, which decides which ancestors clip it.
@@ -646,7 +718,7 @@ pub fn fixed_box_clippable_by(dom: &dyn Dom, el: ElId, container: ElId) -> bool 
 /// removes it: the screen-reader-only utility. Its content is laid out, and
 /// can overlap the pixel the box keeps, but none of it is seen. The rect is
 /// read first, so the common case costs one read.
-fn is_visually_hidden_box(dom: &dyn Dom, el: ElId) -> bool {
+pub(crate) fn is_visually_hidden_box(dom: &dyn Dom, el: ElId) -> bool {
     let r = dom.rect(el);
     if !r.all_finite() || r.width > 1.0 || r.height > 1.0 {
         return false;
@@ -683,37 +755,161 @@ fn no_text(dom: &dyn Dom, el: ElId) -> Option<Unpainted> {
 /// the resource fails to load, which a capture does not record.
 const FALLBACK_HOST_TAGS: &[&str] = &["audio", "canvas", "iframe", "video"];
 
-/// A text measurement whose text is set under 1px: the element's computed
-/// font size parses below 1px, and no descendant that carries text of its own
-/// sets a size of 1px or more (the gap-collapsing `font-size: 0` on a row of
-/// inline blocks, whose children set their own). A size that does not parse
-/// keeps the finding. The subtree is read only once the element's own size
-/// is under 1px.
+/// A text measurement whose text is set at 1px or less: the element's
+/// computed font size parses to 1px or under, and no descendant that carries
+/// text of its own sets a larger size (the gap-collapsing `font-size: 0` on a
+/// row of inline blocks, whose children set their own). A glyph a pixel tall
+/// is a dot, not a letter: uni-hannover.de hides a "Die LUH auf Mastodon"
+/// link with an inline `font-size: 1px` in a static 9x1 box that no clip
+/// removes. A size that does not parse keeps the finding. The subtree is read
+/// only once the element's own size is that small. A size a transform draws
+/// larger is read at the drawn size ([`drawn_enlargement`]): `font-size: 1px`
+/// under `transform: scale(16)` paints 16px letters.
 fn no_font_size(dom: &dyn Dom, el: ElId) -> Option<Unpainted> {
-    if !under_1px(&dom.style(el, "fontSize")) {
+    if !at_most_1px(&dom.style(el, "fontSize")) {
+        return None;
+    }
+    let drawn = js::parse_float(&dom.style(el, "fontSize")) * drawn_enlargement(dom, el);
+    if !(drawn <= 1.0) {
         return None;
     }
     let sized_text = dom.query_all(Some(el), "*").unwrap_or_default().into_iter().any(|d| {
-        has_direct_text_longer_than(dom, d, 0) && !under_1px(&dom.style(d, "fontSize"))
+        has_direct_text_longer_than(dom, d, 0) && !at_most_1px(&dom.style(d, "fontSize"))
     });
     (!sized_text).then_some(Unpainted::NoFontSize)
 }
 
-/// A computed `font-size` that parses to a size under 1px.
-pub fn under_1px(font_size: &str) -> bool {
+/// A computed individual `scale` as its x and y factors: `none` or an empty
+/// value is (1, 1), one value scales both axes, and a percentage is read
+/// over 100. `None` for anything else.
+fn individual_scale(value: &str) -> Option<(f64, f64)> {
+    let v = js::trim(value);
+    if v.is_empty() || v == "none" {
+        return Some((1.0, 1.0));
+    }
+    let parts: Vec<f64> = v
+        .split_ascii_whitespace()
+        .map(|p| match p.strip_suffix('%') {
+            Some(n) => js::parse_float(n) / 100.0,
+            None => js::parse_float(p),
+        })
+        .collect();
+    if parts.is_empty() || parts.len() > 3 || !parts.iter().all(|n| n.is_finite()) {
+        return None;
+    }
+    Some((parts[0], *parts.get(1).unwrap_or(&parts[0])))
+}
+
+/// A computed individual `rotate` as a turn about z, in radians: `none` or
+/// an empty value is 0, and an angle alone, `z <angle>` or `0 0 1 <angle>`
+/// turns about z. `None` for a turn about another axis or a value that does
+/// not parse.
+fn individual_rotate_z(value: &str) -> Option<f64> {
+    let v = js::to_lower_case(js::trim(value));
+    if v.is_empty() || v == "none" {
+        return Some(0.0);
+    }
+    let parts: Vec<&str> = v.split_ascii_whitespace().collect();
+    let angle = match parts.as_slice() {
+        [a] => *a,
+        ["z", a] => *a,
+        [x, y, z, a] if js::parse_float(x) == 0.0 && js::parse_float(y) == 0.0 && js::parse_float(z) > 0.0 => *a,
+        _ => return None,
+    };
+    let (n, per_unit) = if let Some(n) = angle.strip_suffix("deg") {
+        (n, std::f64::consts::PI / 180.0)
+    } else if let Some(n) = angle.strip_suffix("grad") {
+        (n, std::f64::consts::PI / 200.0)
+    } else if let Some(n) = angle.strip_suffix("rad") {
+        (n, 1.0)
+    } else if let Some(n) = angle.strip_suffix("turn") {
+        (n, std::f64::consts::TAU)
+    } else {
+        return None;
+    };
+    let n = js::parse_float(n);
+    n.is_finite().then_some(n * per_unit)
+}
+
+/// How much larger than its layout size `el`'s letters are drawn: the
+/// computed `transform`s and individual `scale`s and `rotate`s of `el` and
+/// its ancestors multiplied, and the
+/// shorter of the drawn lengths of a unit step along x and along y, when
+/// that enlarges by more than a twentieth; else 1. A rotation draws both
+/// steps at their own length, so it enlarges nothing, and a stretch on one
+/// axis (`scaleX(2)`) leaves the letters as thin as they were the other way;
+/// `rotate(90deg) scale(16)` draws 16px letters. A transform that does not
+/// read as a matrix, an individual `rotate` about another axis than z, or a
+/// chain deeper than the walk reads counts as no enlargement.
+fn drawn_enlargement(dom: &dyn Dom, el: ElId) -> f64 {
+    const MAX_ANCESTORS: usize = 64;
+    let mut total = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    let mut cur = Some(el);
+    for _ in 0..MAX_ANCESTORS {
+        let Some(c) = cur else { break };
+        let t = dom.style(c, "transform");
+        let t = js::trim(&t);
+        if !(t.is_empty() || t == "none") {
+            let Some(m) = linear_part(t) else { return 1.0 };
+            total = multiply(&rows(&m), &total);
+        }
+        // The individual `scale` property composes outside `transform`
+        // (the element's matrix is translate, rotate, scale, then transform,
+        // left to right), so it multiplies after it.
+        let Some((sx, sy)) = individual_scale(&dom.style(c, "scale")) else { return 1.0 };
+        if sx != 1.0 || sy != 1.0 {
+            total = multiply(&[[sx, 0.0, 0.0], [0.0, sy, 0.0], [0.0, 0.0, 1.0]], &total);
+        }
+        // The individual `rotate` composes outside `scale`. A turn about an
+        // axis other than z, or one that does not parse, claims nothing.
+        let Some(turn) = individual_rotate_z(&dom.style(c, "rotate")) else { return 1.0 };
+        if turn != 0.0 {
+            let (sin, cos) = turn.sin_cos();
+            total = multiply(&[[cos, -sin, 0.0], [sin, cos, 0.0], [0.0, 0.0, 1.0]], &total);
+        }
+        cur = dom.parent(c);
+    }
+    if cur.is_some() {
+        return 1.0;
+    }
+    let x = (total[0][0] * total[0][0] + total[1][0] * total[1][0]).sqrt();
+    let y = (total[0][1] * total[0][1] + total[1][1] * total[1][1]).sqrt();
+    let scale = x.min(y);
+    if scale.is_finite() && scale > 1.05 { scale } else { 1.0 }
+}
+
+/// A computed `font-size` that parses to 1px or less: a size no glyph can be
+/// read at.
+pub fn at_most_1px(font_size: &str) -> bool {
     let n = js::parse_float(font_size);
-    n.is_finite() && n < 1.0
+    n.is_finite() && n <= 1.0
 }
 
 /// Whether `node` is a face turned away under `backface-visibility: hidden`:
 /// its own `transform` is a 3D matrix that points its front away from the
-/// viewer (a negative z scale, as `rotateY(180deg)` gives), and nothing above
-/// it rotates in 3D, which could turn it back (a flip card's inner box on
-/// hover). A property the capture did not record, an individual `rotate` or
-/// `scale` on the face, or a 3D transform above it keeps the element. The
+/// viewer (a negative z scale, as `rotateY(180deg)` gives), and the
+/// transforms above it do not turn it back. The linear parts of the face's
+/// transform and of every ancestor's are multiplied, and the face is away
+/// when the product's normal (the third row of its inverse, which is what a
+/// browser tests: Chromium's `IsBackFaceVisible` takes the sign of
+/// `cofactor33 * det`) points away from the viewer. A book tilted a few
+/// degrees towards the viewer (cochat.ai's page-flip mockup, `m33` 0.99)
+/// leaves the back of each leaf facing away.
+///
+/// The capture records neither `transform-style` nor how far a 3D context
+/// reaches, so the product assumes one context, and every case that
+/// assumption could get wrong keeps the element: a second matrix in the
+/// chain that flips on its own (`m33` below 0; a flat ancestor could undo or
+/// redo the flip, as a flip card inside a mirrored wrapper does), a chain
+/// deeper than the walk reads, a property the capture did not record, an
+/// individual `rotate` or `scale` on the face or above it, a transform that does not parse as a matrix, a perspective term
+/// inside one, and a normal close to edge-on ([`FACING_AWAY_MIN`], or
+/// [`FACING_AWAY_MIN_UNDER_PERSPECTIVE`] under an ancestor that sets
+/// `perspective`, where a face off to the side can show past edge-on). The
 /// walk calls this for the element and each ancestor, so a face hides its
 /// whole subtree; only a face found reads the chain above it.
 fn turned_away(dom: &dyn Dom, node: ElId) -> bool {
+    const MAX_ANCESTORS: usize = 256;
     if dom.style(node, "backfaceVisibility") != "hidden" || !faces_away(&dom.style(node, "transform")) {
         return false;
     }
@@ -721,14 +917,109 @@ fn turned_away(dom: &dyn Dom, node: ElId) -> bool {
     if !(individual_none(node, "rotate") && individual_none(node, "scale")) {
         return false;
     }
+    let Some(face) = linear_part(&dom.style(node, "transform")) else {
+        return false;
+    };
+    // Row-major products: `total = ancestor_n * ... * ancestor_1 * face`.
+    let mut total = rows(&face);
+    let mut perspective = false;
     let mut up = dom.parent(node);
+    let mut steps = 0;
     while let Some(a) = up {
-        if dom.style(a, "transform").starts_with("matrix3d(") || !individual_none(a, "rotate") {
+        steps += 1;
+        if steps > MAX_ANCESTORS || !individual_none(a, "rotate") || !individual_none(a, "scale") {
             return false;
+        }
+        let p = dom.style(a, "perspective");
+        perspective |= !(p.is_empty() || p == "none");
+        let t = dom.style(a, "transform");
+        let t = js::trim(&t);
+        if !(t.is_empty() || t == "none") {
+            let Some(m) = linear_part(t) else { return false };
+            if m[2][2] < 0.0 {
+                return false;
+            }
+            total = multiply(&rows(&m), &total);
         }
         up = dom.parent(a);
     }
-    true
+    let Some(inverse) = invert(&total) else { return false };
+    let normal = inverse[2];
+    let length = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
+    let floor = if perspective { FACING_AWAY_MIN_UNDER_PERSPECTIVE } else { FACING_AWAY_MIN };
+    length > 0.0 && normal[2] / length < -floor
+}
+
+/// How far past edge-on a face's normal has to point away from the viewer
+/// (the z component of the unit normal) to count as turned away.
+const FACING_AWAY_MIN: f64 = 0.1;
+
+/// The same under an ancestor that sets `perspective`, which the capture
+/// does not model: a face off to the side of the perspective origin shows
+/// although its normal points a little away.
+const FACING_AWAY_MIN_UNDER_PERSPECTIVE: f64 = 0.3;
+
+/// A column-major linear part (`m[c][r]`) as rows.
+fn rows(m: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
+    let mut r = [[0.0; 3]; 3];
+    for (c, col) in m.iter().enumerate() {
+        for (i, v) in col.iter().enumerate() {
+            r[i][c] = *v;
+        }
+    }
+    r
+}
+
+fn multiply(a: &[[f64; 3]; 3], b: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
+    let mut out = [[0.0; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            out[i][j] = (0..3).map(|k| a[i][k] * b[k][j]).sum();
+        }
+    }
+    out
+}
+
+/// The inverse of a 3x3 matrix, `None` when it is singular.
+fn invert(m: &[[f64; 3]; 3]) -> Option<[[f64; 3]; 3]> {
+    let c = |r0: usize, r1: usize, c0: usize, c1: usize| m[r0][c0] * m[r1][c1] - m[r0][c1] * m[r1][c0];
+    let cof = [
+        [c(1, 2, 1, 2), -c(1, 2, 0, 2), c(1, 2, 0, 1)],
+        [-c(0, 2, 1, 2), c(0, 2, 0, 2), -c(0, 2, 0, 1)],
+        [c(0, 1, 1, 2), -c(0, 1, 0, 2), c(0, 1, 0, 1)],
+    ];
+    let det = m[0][0] * cof[0][0] + m[0][1] * cof[0][1] + m[0][2] * cof[0][2];
+    if !det.is_finite() || det.abs() < 1e-12 {
+        return None;
+    }
+    // inverse = adjugate / det, the adjugate being the cofactors transposed.
+    let mut inv = [[0.0; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            inv[i][j] = cof[j][i] / det;
+        }
+    }
+    Some(inv)
+}
+
+/// The linear part of a computed `transform` (`matrix()` or `matrix3d()`),
+/// column by column, or `None` for anything else, or for a `matrix3d()`
+/// carrying a perspective term.
+fn linear_part(transform: &str) -> Option<[[f64; 3]; 3]> {
+    let parse = |body: &str| -> Option<Vec<f64>> {
+        let values: Vec<f64> = body.split(',').map(|v| js::parse_float(js::trim(v))).collect();
+        values.iter().all(|v| v.is_finite()).then_some(values)
+    };
+    if let Some(body) = transform.strip_prefix("matrix3d(").and_then(|b| b.strip_suffix(')')) {
+        let v = parse(body)?;
+        if v.len() != 16 || v[3] != 0.0 || v[7] != 0.0 || v[11] != 0.0 {
+            return None;
+        }
+        return Some([[v[0], v[1], v[2]], [v[4], v[5], v[6]], [v[8], v[9], v[10]]]);
+    }
+    let body = transform.strip_prefix("matrix(").and_then(|b| b.strip_suffix(')'))?;
+    let v = parse(body)?;
+    (v.len() == 6).then(|| [[v[0], v[1], 0.0], [v[2], v[3], 0.0], [0.0, 0.0, 1.0]])
 }
 
 /// Whether a computed `transform` is a 3D matrix whose z axis points away
@@ -763,7 +1054,7 @@ fn no_area(dom: &dyn Dom, el: ElId) -> Option<Unpainted> {
 }
 
 /// `overflow-x` / `overflow-y`, from the shorthand when neither was recorded.
-fn overflow_axes(dom: &dyn Dom, el: ElId) -> (String, String) {
+pub(crate) fn overflow_axes(dom: &dyn Dom, el: ElId) -> (String, String) {
     let ox = dom.style(el, "overflowX");
     let oy = dom.style(el, "overflowY");
     if ox.is_empty() && oy.is_empty() {
@@ -775,7 +1066,7 @@ fn overflow_axes(dom: &dyn Dom, el: ElId) -> (String, String) {
 }
 
 /// `overflow` does not apply to boxes that generate no block of their own.
-fn clips_contents(display: &str) -> bool {
+pub(crate) fn clips_contents(display: &str) -> bool {
     !matches!(display, "contents" | "inline" | "table-row" | "table-row-group")
 }
 
@@ -803,7 +1094,7 @@ fn misses_axis(start: f64, end: f64, extent: f64, lo: f64, hi: f64) -> bool {
     }
 }
 
-fn clips(value: &str) -> bool {
+pub(crate) fn clips(value: &str) -> bool {
     matches!(value, "hidden" | "clip" | "auto" | "scroll")
 }
 
@@ -907,6 +1198,73 @@ fn is_script_scroll_frame(dom: &dyn Dom, p: ElId, cr: &Rect, viewport_h: f64) ->
         && cr.height >= fold - 1.0
         && has_overflow(dom.scroll_height(p), dom.client_height(p))
         && !capped_by_max_height(dom, p, cr, js::math_max(fold, viewport_h))
+        && content_runs_past(dom, p, cr)
+}
+
+/// How many descendants [`content_runs_past`] reads before it stops and
+/// answers yes.
+const IN_FLOW_WALK_BUDGET: usize = 2000;
+
+/// The share of the frame's height an absolutely placed box has to take to
+/// count as content a script moves through the frame.
+const PLACED_CONTENT_MIN_SHARE: f64 = 0.5;
+
+/// Whether content a script could scroll through `p` runs past its bottom
+/// edge (`frame`): a descendant in `p`'s flow whose box ends more than a
+/// pixel below it, or an absolutely placed box that starts inside it, runs
+/// past it, and is at least half as tall as it. A scroll library moves one
+/// wrapper that holds the page, in flow or placed; incredible.one's pinned
+/// stage (a sticky section at `overflow: hidden`) holds a placed screen,
+/// 707px of its 800, that it lifts into view as the page scrolls. A map
+/// holds its markers as small absolutely placed boxes: chefsspecial.app's
+/// Mapbox box (896x800, `overflow: hidden`) records a scroll height of 1,626
+/// from markers placed below its edge, and those are clipped, not scrolled
+/// to. A placed box under half the frame's height is not read further; a
+/// taller one (a wrapper at `inset: 0`) is read like the frame's own flow,
+/// and a fixed one adds nothing.
+/// A box the capture did not measure, text of `p`'s own, or a walk past
+/// [`IN_FLOW_WALK_BUDGET`] answers yes, which keeps the frame.
+fn content_runs_past(dom: &dyn Dom, p: ElId, frame: &Rect) -> bool {
+    // Text of its own may be what runs past; the capture measures no text
+    // node, so that keeps the frame too.
+    if has_direct_text_longer_than(dom, p, 0) {
+        return true;
+    }
+    let bottom = frame.bottom;
+    let mut stack = dom.children(p);
+    let mut read = 0usize;
+    while let Some(c) = stack.pop() {
+        read += 1;
+        if read > IN_FLOW_WALK_BUDGET {
+            return true;
+        }
+        let r = dom.rect(c);
+        if !r.all_finite() {
+            return true;
+        }
+        match dom.style(c, "position").as_str() {
+            "fixed" => continue,
+            "absolute" => {
+                if r.height < frame.height * PLACED_CONTENT_MIN_SHARE {
+                    continue;
+                }
+                if r.top < bottom - 1.0 && r.bottom > bottom + 1.0 {
+                    return true;
+                }
+                // A placed wrapper that fills the frame (`position: absolute;
+                // inset: 0`, as some smooth-scroll setups hold the page) holds
+                // the content in its own flow: read it.
+                stack.extend(dom.children(c));
+                continue;
+            }
+            _ => {}
+        }
+        if r.bottom > bottom + 1.0 {
+            return true;
+        }
+        stack.extend(dom.children(c));
+    }
+    false
 }
 
 /// Whether a box stands at its `max-height`: a "read more" panel held at
@@ -1049,6 +1407,7 @@ fn is_state_layer(dom: &dyn Dom, el: ElId) -> bool {
         || lazy_raster_pending(dom, el)
         || opacity_in_motion(dom, el)
         || awaits_class_reveal(dom, el)
+        || inside_a_reveal_in_progress(dom, el)
     {
         return true;
     }
@@ -1061,6 +1420,61 @@ fn is_state_layer(dom: &dyn Dom, el: ElId) -> bool {
         return false;
     }
     declares_animation(dom, el) || marks_lazy_loading(dom, el) || in_crossfade_stack(dom, el)
+}
+
+/// Whether a box above `el` is caught part way through a reveal: below full
+/// opacity, displaced (a `transform` other than the identity, or a
+/// `translate`, `scale` or `rotate` that moves it), declaring a transition
+/// that names `opacity` itself (`all` does not count: utility CSS and
+/// hover styles declare it everywhere), and showing that the frame is one
+/// between two values. That last is either an `opacity` the capture saw
+/// running on the box, or an opacity off the 0.01 grid authors write
+/// (fastsocial.co's `[data-reveal]` cards at `opacity: 0.600778; transform:
+/// scale(0.99568) translateY(3.74px)` with a 0.7s opacity transition, an
+/// image inside fading in with them). A watermark held at `opacity: .08`
+/// and centred with a transform, or a dimmed carousel slide at `.5`, is a
+/// value at rest. The raster's own transform is not asked: a picture held
+/// faint that also floats would read the same.
+fn inside_a_reveal_in_progress(dom: &dyn Dom, el: ElId) -> bool {
+    const MAX_ANCESTORS: usize = 64;
+    let mut cur = dom.parent(el);
+    for _ in 0..MAX_ANCESTORS {
+        let Some(c) = cur else { return false };
+        if Some(c) == dom.body() || Some(c) == dom.document_element() {
+            return false;
+        }
+        let opacity = js::parse_float(&dom.style(c, "opacity"));
+        if opacity.is_finite()
+            && opacity < 0.999
+            && declares_transition_naming(dom, c, "opacity")
+            && super::element_checks::visibly_displaced(dom, c)
+            && (opacity_in_motion(dom, c) || off_authored_grid(opacity))
+        {
+            return true;
+        }
+        cur = dom.parent(c);
+    }
+    false
+}
+
+/// Whether an opacity lies off the hundredths an author writes: a value
+/// interpolated between two states (0.600778), not one set (0.6, .08).
+fn off_authored_grid(opacity: f64) -> bool {
+    let hundredths = opacity * 100.0;
+    (hundredths - hundredths.round()).abs() > 0.01
+}
+
+/// Whether `el` declares a transition of `property` by name, with a duration
+/// above 0. `all` does not count.
+fn declares_transition_naming(dom: &dyn Dom, el: ElId, property: &str) -> bool {
+    let props = dom.style(el, "transitionProperty");
+    let durations = dom.style(el, "transitionDuration");
+    let durations: Vec<&str> = durations.split(',').map(js::trim).collect();
+    props
+        .split(',')
+        .map(js::trim)
+        .enumerate()
+        .any(|(i, p)| p == property && css_time_seconds(durations[i % durations.len()]) > 0.0)
 }
 
 /// Whether an animation or transition running on the element at capture
@@ -1333,6 +1747,313 @@ pub(crate) fn loops_in_motion(dom: &dyn Dom, el: ElId) -> bool {
     })
 }
 
+/// Whether `el` is held part way through a loop that takes it out of sight
+/// every cycle, by a paused animation: the box's only animation setting
+/// `opacity` is paired with an `infinite` iteration count and
+/// `animation-play-state: paused`, a keyframe takes it to
+/// [`LOOP_VANISH_OPACITY`] or under, and the capture read it below full
+/// opacity. iubcr.vercel.app pauses its notification rows (`notif-cycle 9s
+/// infinite`) while their section is off screen and plays them once a
+/// visitor reaches it; the capture read a row at 0.21, a frame of the loop
+/// and not the state it shows. A paused box is not running, so
+/// [`loops_in_motion`] never sees it. A box at full opacity, a loop that
+/// only breathes, a loop that adds to or accumulates on the box's own
+/// opacity, and keyframes the capture could not read answer no.
+pub(crate) fn paused_mid_loop(dom: &dyn Dom, el: ElId) -> bool {
+    let opacity = js::parse_float(&dom.style(el, "opacity"));
+    if !(opacity.is_finite() && opacity < 0.999) {
+        return false;
+    }
+    // Under `add` or `accumulate` the frames combine with the box's own
+    // opacity, so a frame at 0 does not take it out of sight.
+    sole_opacity_entry(dom, el).is_some_and(|entry| {
+        entry.iterations == "infinite"
+            && entry.play_state == "paused"
+            && (entry.composition.is_empty() || entry.composition == "replace")
+            && dom
+                .keyframes(&entry.name)
+                .is_some_and(|frames| frames.iter().filter_map(frame_opacity).any(|o| o <= LOOP_VANISH_OPACITY))
+    })
+}
+
+/// Whether `el` or an ancestor is caught part way through a sideways move
+/// that ends: the capture saw an animation or transition running on the box
+/// that moves it on the x axis (`left`, `right`, `margin-left`,
+/// `margin-right`, an `inset-inline` longhand, or a `transform` or
+/// `translate` whose current x offset is not 0), and the page traces that
+/// move to something that stops: CSS animations whose keyframes set the
+/// property, every one finite, on the document timeline and not paused, or
+/// a transition that names it. elevancehealth.com's quote slides in from the
+/// right (`quote-appear-right`, one run, `right` from -96% to 0) and the
+/// capture caught it 79px past the viewport's edge, where no visitor finds
+/// it once the slide ends.
+///
+/// A vertical move (a fade-up's `translateY`, `top`) cannot change where
+/// text meets the side of the viewport and does not count. A running
+/// property the page does not trace (a Web Animations API loop, which a
+/// marquee library starts from script) is unknown, and the box stands where
+/// it was measured, as it does where the recording did not read running
+/// animations.
+pub(crate) fn moves_mid_animation(dom: &dyn Dom, el: ElId) -> bool {
+    const MAX_ANCESTORS: usize = 64;
+    let mut cur = Some(el);
+    for _ in 0..MAX_ANCESTORS {
+        let Some(c) = cur else { return false };
+        if Some(c) == dom.body() || Some(c) == dom.document_element() {
+            return false;
+        }
+        if let Some(props) = dom.running_animation_properties(c) {
+            if props.iter().any(|p| moves_sideways(dom, c, p) && traced_to_an_end(dom, c, p)) {
+                return true;
+            }
+        }
+        cur = dom.parent(c);
+    }
+    false
+}
+
+/// Whether `el` or an ancestor is caught part way through a change of width
+/// that ends: the capture saw an animation or transition running on the box
+/// that sets `width`, `min-width`, `max-width` or an inline-size longhand,
+/// and the page traces it to something that stops ([`traced_to_an_end`]).
+/// lockheedmartin.com's section headings type themselves out (`typing`, one
+/// run, `width` from 0 to 100%), and a capture part way through reads the
+/// heading spilling out of a box that has not finished opening.
+pub(crate) fn resizes_mid_animation(dom: &dyn Dom, el: ElId) -> bool {
+    const MAX_ANCESTORS: usize = 64;
+    let mut cur = Some(el);
+    for _ in 0..MAX_ANCESTORS {
+        let Some(c) = cur else { return false };
+        if Some(c) == dom.body() || Some(c) == dom.document_element() {
+            return false;
+        }
+        if let Some(props) = dom.running_animation_properties(c) {
+            if props.iter().any(|p| sets_width(p) && traced_to_an_end(dom, c, p)) {
+                return true;
+            }
+        }
+        cur = dom.parent(c);
+    }
+    false
+}
+
+/// Whether a running CSS property sets a box's width on the x axis.
+fn sets_width(p: &str) -> bool {
+    matches!(
+        p,
+        "width" | "min-width" | "max-width" | "inline-size" | "min-inline-size" | "max-inline-size"
+    )
+}
+
+/// Whether a running property `p` moves `el` on the x axis at capture.
+fn moves_sideways(dom: &dyn Dom, el: ElId, p: &str) -> bool {
+    match p {
+        "left" | "right" | "margin-left" | "margin-right" => true,
+        _ if p.starts_with("inset-inline") => true,
+        "transform" => {
+            let t = js::trim(&dom.style(el, "transform")).replace(' ', "");
+            let x = if let Some(body) = t.strip_prefix("matrix3d(").and_then(|b| b.strip_suffix(')')) {
+                body.split(',').nth(12).map(js::parse_float)
+            } else if let Some(body) = t.strip_prefix("matrix(").and_then(|b| b.strip_suffix(')')) {
+                body.split(',').nth(4).map(js::parse_float)
+            } else {
+                None
+            };
+            x.is_some_and(|x| x.is_finite() && x.abs() >= 1.0) && !keyframes_hold_x(dom, el, p)
+        }
+        "translate" => {
+            let t = dom.style(el, "translate");
+            t.split_whitespace().next().map(js::parse_float).is_some_and(|x| x.is_finite() && x.abs() >= 1.0)
+                && !keyframes_hold_x(dom, el, p)
+        }
+        _ => false,
+    }
+}
+
+/// Whether every animation on `el` whose keyframes set `p` (`transform` or
+/// `translate`) holds the x offset still: at least two of its frames set
+/// `p`, and each states the same x (a fade-up that keeps `translateX(40px)`
+/// in both frames and moves only `translateY`). Then the x offset the
+/// capture read is where the box ends, not part of a move. A transition
+/// that names `p`, no animation setting it, a frame whose x the engine
+/// cannot read, or a box above that turns or skews what it holds
+/// ([`ancestor_turns`]) keeps the move.
+fn keyframes_hold_x(dom: &dyn Dom, el: ElId, p: &str) -> bool {
+    if declares_transition_naming(dom, el, p) || ancestor_turns(dom, el) {
+        return false;
+    }
+    let mut any = false;
+    for e in animation_entries(dom, el) {
+        let Some(frames) = dom.keyframes(&e.name) else { return false };
+        let xs: Vec<Option<String>> = frames
+            .iter()
+            .filter_map(|f| f.decls.iter().find(|(prop, _)| prop == p).map(|(_, v)| keyframe_x(p, v)))
+            .collect();
+        if xs.is_empty() {
+            continue;
+        }
+        if xs.len() < 2 || xs.iter().any(Option::is_none) || xs.windows(2).any(|w| w[0] != w[1]) {
+            return false;
+        }
+        any = true;
+    }
+    any
+}
+
+/// Whether a box above `el` carries a move on y into x: a `transform` whose
+/// matrix maps y into x (a rotation, a `skewX`; any scale, even unequal on
+/// the two axes, does not), a 3D one that is not a flat 2D matrix (a
+/// `perspective()` projects a move on y sideways), one the engine cannot
+/// read, a `rotate` other than none or 0, or a `perspective` property. Under one, a move on y, or a scale of y, is a move
+/// sideways on screen.
+fn ancestor_turns(dom: &dyn Dom, el: ElId) -> bool {
+    const MAX_ANCESTORS: usize = 64;
+    let mut cur = dom.parent(el);
+    for _ in 0..MAX_ANCESTORS {
+        let Some(c) = cur else { return false };
+        if Some(c) == dom.body() || Some(c) == dom.document_element() {
+            return false;
+        }
+        let t = js::trim(&dom.style(c, "transform")).replace(' ', "");
+        // A 3D matrix counts only as the 2D one it may be: nothing in or
+        // out of z and no perspective row, which projects a move on y
+        // sideways too.
+        let parts: Option<Vec<f64>> = if let Some(body) = t.strip_prefix("matrix3d(").and_then(|b| b.strip_suffix(')')) {
+            let v: Vec<f64> = body.split(',').map(js::parse_float).collect();
+            let flat = v.len() == 16
+                && [2, 3, 6, 7, 8, 9, 11, 14].iter().all(|&i| v[i] == 0.0)
+                && v[10] == 1.0
+                && v[15] == 1.0;
+            flat.then(|| vec![v[0], v[1], v[4], v[5]])
+        } else if let Some(body) = t.strip_prefix("matrix(").and_then(|b| b.strip_suffix(')')) {
+            let v: Vec<f64> = body.split(',').map(js::parse_float).collect();
+            (v.len() == 6).then(|| v[..4].to_vec())
+        } else if t.is_empty() || t == "none" {
+            Some(vec![1.0, 0.0, 0.0, 1.0])
+        } else {
+            None
+        };
+        // x' = a x + c y: only `c` carries a move on y into x.
+        let keeps_directions = parts.is_some_and(|m| m[2] == 0.0);
+        let rotate = js::trim(&dom.style(c, "rotate")).to_string();
+        let unrotated = rotate.is_empty()
+            || rotate == "none"
+            || rotate.split_whitespace().last().is_some_and(|a| js::parse_float(a) == 0.0);
+        let perspective = js::trim(&dom.style(c, "perspective")).to_string();
+        let flat_view = perspective.is_empty() || perspective == "none";
+        if !keeps_directions || !unrotated || !flat_view {
+            return true;
+        }
+        cur = dom.parent(c);
+    }
+    false
+}
+
+/// The x offset a `transform` or `translate` keyframe value states, with
+/// how it maps x: `1 0 | 40px` for `translateX(40px)`, the x scale and x
+/// skew before the bar and the translations, as written, after it, `0`
+/// where none moves x. A lone `matrix()` or `matrix3d()` gives its own x
+/// row, so one that scales only y (`matrix(1, 0, 0, 1.2, 40, 0)`) maps x as
+/// `translateX(40px)` does. `None` where the value is anything else the
+/// engine cannot read: another function, a matrix beside other functions
+/// (their order decides), or a 3D matrix that maps x from z or divides by w.
+fn keyframe_x(p: &str, value: &str) -> Option<String> {
+    let value = js::to_lower_case(js::trim(value));
+    // A length in pixels (a matrix's unitless offset is one) is written
+    // `40px`; any other unit stays as written.
+    let norm = |t: &str| {
+        let t = js::trim(t);
+        let v = js::parse_float(t);
+        if v == 0.0 {
+            "0".to_string()
+        } else if v.is_finite() && (t.ends_with("px") || t.parse::<f64>().is_ok()) {
+            format!("{}px", js::number_to_string(v))
+        } else {
+            t.to_string()
+        }
+    };
+    let num = |t: &str| {
+        let v = js::parse_float(js::trim(t));
+        v.is_finite().then_some(v)
+    };
+    let key = |a: f64, c: f64, xs: Vec<String>| {
+        let xs: Vec<String> = xs.into_iter().filter(|x| x != "0").collect();
+        let t = if xs.is_empty() { "0".to_string() } else { xs.join(" ") };
+        Some(format!("{} {} | {t}", js::number_to_string(a), js::number_to_string(c)))
+    };
+    if value == "none" {
+        return key(1.0, 0.0, Vec::new());
+    }
+    if p == "translate" {
+        return key(1.0, 0.0, value.split_whitespace().next().map(norm).into_iter().collect());
+    }
+    let mut xs: Vec<String> = Vec::new();
+    let mut linear: Option<(f64, f64)> = None;
+    let mut functions = 0usize;
+    let mut rest = value.as_str();
+    while !js::trim(rest).is_empty() {
+        let r = rest.trim_start();
+        let open = r.find('(')?;
+        let close = r.find(')')?;
+        let (name, args) = (js::trim(&r[..open]), &r[open + 1..close]);
+        let args: Vec<&str> = args.split(',').collect();
+        functions += 1;
+        match name {
+            "translatex" | "translate" | "translate3d" => xs.push(norm(args[0])),
+            "translatey" | "translatez" => {}
+            "matrix" if args.len() == 6 => {
+                linear = Some((num(args[0])?, num(args[2])?));
+                xs.push(norm(args[4]));
+            }
+            // x' = a1 x + a2 y + a3 z + a4, over w = d1 x + d2 y + d3 z + d4.
+            "matrix3d" if args.len() == 16 => {
+                let w = [num(args[3])?, num(args[7])?, num(args[11])?, num(args[15])?];
+                if num(args[8])? != 0.0 || w != [0.0, 0.0, 0.0, 1.0] {
+                    return None;
+                }
+                linear = Some((num(args[0])?, num(args[4])?));
+                xs.push(norm(args[12]));
+            }
+            _ => return None,
+        }
+        rest = &r[close + 1..];
+    }
+    if linear.is_some() && functions > 1 {
+        return None;
+    }
+    let (a, c) = linear.unwrap_or((1.0, 0.0));
+    key(a, c, xs)
+}
+
+/// Whether the page traces the running property `p` on `el` to a move that
+/// stops: a transition that names `p`, or CSS animations whose keyframes set
+/// `p`, every one of them finite (a positive iteration count), on the
+/// document timeline and not paused. The capture records which properties
+/// run, not which animation runs them, so one animation that keeps `p`
+/// moving (an infinite float beside a one-shot entrance) keeps the box where
+/// it was measured, and so does an animation whose keyframes the capture
+/// could not read.
+fn traced_to_an_end(dom: &dyn Dom, el: ElId, p: &str) -> bool {
+    let mut setting = Vec::new();
+    for e in animation_entries(dom, el) {
+        let Some(frames) = dom.keyframes(&e.name) else { return false };
+        if frames.iter().any(|f| f.decls.iter().any(|(prop, _)| prop == p)) {
+            setting.push(e);
+        }
+    }
+    let ends = |e: &AnimationEntry| {
+        let count = js::parse_float(&e.iterations);
+        count.is_finite()
+            && count > 0.0
+            && (e.timeline.is_empty() || e.timeline == "auto")
+            && e.play_state != "paused"
+    };
+    if !setting.iter().all(ends) {
+        return false;
+    }
+    declares_transition_naming(dom, el, p) || !setting.is_empty()
+}
+
 /// Whether `el` (when `include_self`) or an ancestor fades out for good
 /// ([`fades_out_for_good`]). Only boxes that name an animation are asked
 /// about what runs on them.
@@ -1425,6 +2146,121 @@ pub fn opacity_held_by_scroll_timeline(dom: &dyn Dom, el: ElId, style_text: &str
         }
     }
     false
+}
+
+/// The opacity `el` shows once a visitor scrolls to it, where a scroll or
+/// view timeline holds it at 0 while the page sits at the top
+/// ([`opacity_held_by_scroll_timeline`], read from the computed
+/// `animation-timeline` alone): the opacity its end keyframe sets.
+/// opencodex.me's `p.lp-disclaimer` runs `ocx-fade-up` on `view()` and is
+/// read at 0 at capture, though a visitor who scrolls to it reads it at 1.
+/// `None` where the box is not at the transparent floor, where nothing holds
+/// it, and wherever the end frame cannot be read for certain: more than one
+/// animation setting opacity, a composition other than `replace`, a
+/// direction other than `normal` or `reverse`, an end keyframe that sets no
+/// opacity. Those keep the opacity the capture read.
+pub(crate) fn scroll_held_end_opacity(dom: &dyn Dom, el: ElId) -> Option<f64> {
+    let raw = js::parse_float(&dom.style(el, "opacity"));
+    if !(raw.is_finite() && raw <= TRANSPARENT_FLOOR) {
+        return None;
+    }
+    if !opacity_held_by_scroll_timeline(dom, el, "") {
+        return None;
+    }
+    let entry = sole_opacity_entry(dom, el)?;
+    let timeline = js::to_lower_case(js::trim(&entry.timeline));
+    if !(timeline.starts_with("scroll(") || timeline.starts_with("view(") || timeline.starts_with("--")) {
+        return None;
+    }
+    if !(entry.composition.is_empty() || entry.composition == "replace") {
+        return None;
+    }
+    let at = match entry.direction.as_str() {
+        "" | "normal" => 1.0,
+        "reverse" => 0.0,
+        _ => return None,
+    };
+    opacity_at_offset(dom, &entry.name, at).map(|o| o.clamp(0.0, 1.0))
+}
+
+/// The opacity `el` holds once a timed entrance running at capture has
+/// played, where the capture caught it at the transparent floor: the box's
+/// only animation setting `opacity` runs once on the document timeline,
+/// holds its end frame, and ends within [`ANIMATION_END_MAX_SECONDS`]
+/// ([`held_end_opacity`]). rezyco.com's call-to-action block runs
+/// `landing-actions-reveal 0.6s 2.45s forwards` and was read at 0, before
+/// its delay was out; every visitor meets it at 1. `None` for a box above the
+/// floor, one no running animation moves, a loop, a paused or scroll-driven
+/// animation, one that hands the box back to its own style when it ends,
+/// and one whose end frame sets no opacity: those keep the captured value.
+pub(crate) fn entrance_end_opacity(dom: &dyn Dom, el: ElId) -> Option<f64> {
+    let raw = js::parse_float(&dom.style(el, "opacity"));
+    if !(raw.is_finite() && raw <= TRANSPARENT_FLOOR) || !opacity_in_motion(dom, el) {
+        return None;
+    }
+    let entry = sole_opacity_entry(dom, el)?;
+    held_end_opacity(dom, &entry).map(|o| o.clamp(0.0, 1.0))
+}
+
+/// [`effective_opacity_dom`] as a visitor meets the box once it settles: a
+/// box a scroll or view timeline holds at 0 counts at its end keyframe's
+/// opacity ([`scroll_held_end_opacity`]), and so does a box a timed entrance
+/// running at capture holds at 0 ([`entrance_end_opacity`]). Every other box
+/// counts as captured.
+pub fn effective_opacity_scrolled(dom: &dyn Dom, el: ElId) -> f64 {
+    let mut o = 1.0f64;
+    let mut cur = Some(el);
+    while let Some(c) = cur {
+        let raw = dom.style(c, "opacity");
+        let v = scroll_held_end_opacity(dom, c).or_else(|| entrance_end_opacity(dom, c)).unwrap_or_else(|| {
+            if raw.is_empty() {
+                1.0
+            } else {
+                js::parse_float(&raw)
+            }
+        });
+        o *= v;
+        if o <= TRANSPARENT_FLOOR {
+            return 0.0;
+        }
+        cur = dom.parent(c);
+    }
+    o
+}
+
+/// The effective opacity `el` settles at, judged at any captured value and
+/// not only at the transparent floor: a box a scroll or view timeline holds
+/// counts at its end keyframe ([`scroll_held_end_opacity`]), and a box whose
+/// opacity an animation or transition moves at capture counts at the end
+/// frame a timed entrance holds ([`held_end_opacity`]). `None` where that end
+/// cannot be read (a transition, a loop, an entrance that hands the box back
+/// to its own style), or where a paused loop holds the box part way
+/// ([`paused_mid_loop`]): the box is not at the opacity it was captured at,
+/// and where it settles is unknown. A heading caught at 0.2 in a fade to 1
+/// settles at 1.
+pub(crate) fn settled_opacity(dom: &dyn Dom, el: ElId) -> Option<f64> {
+    let mut o = 1.0f64;
+    let mut cur = Some(el);
+    while let Some(c) = cur {
+        let v = if let Some(end) = scroll_held_end_opacity(dom, c) {
+            end
+        } else if paused_mid_loop(dom, c) {
+            return None;
+        } else if opacity_in_motion(dom, c) {
+            let entry = sole_opacity_entry(dom, c)?;
+            held_end_opacity(dom, &entry)?.clamp(0.0, 1.0)
+        } else {
+            let raw = dom.style(c, "opacity");
+            if raw.is_empty() {
+                1.0
+            } else {
+                js::parse_float(&raw)
+            }
+        };
+        o *= v;
+        cur = dom.parent(c);
+    }
+    Some(o)
 }
 
 /// Whether `el`, an absolutely positioned box with area, lies wholly outside
@@ -1911,7 +2747,7 @@ mod tests {
 
     /// jyes.com.tw's Slick dots: the label of each dot is `font-size: 0`.
     #[test]
-    fn text_set_under_1px_is_not_painted_for_text_rules() {
+    fn text_set_at_1px_or_less_is_not_painted_for_text_rules() {
         let (mut d, body) = page();
         let dot = d.add(Some(body), "button");
         d.set_style(dot, "fontSize", "0px");
@@ -1937,9 +2773,79 @@ mod tests {
         // A size that does not parse keeps the text.
         d.set_style(dot, "fontSize", "");
         assert_eq!(text(&d, dot), None);
-        assert!(under_1px("0.5px"));
-        assert!(!under_1px("1px"));
-        assert!(!under_1px(""));
+        assert!(at_most_1px("0.5px"));
+        assert!(!at_most_1px(""));
+
+        // uni-hannover.de (10046522): a link hidden with an inline
+        // `font-size: 1px` in a static 9x1 box nothing clips. Its should-flag
+        // twin is the same link at 2px, which still paints marks.
+        let hidden = d.add(Some(body), "a");
+        d.set_style(hidden, "fontSize", "1px");
+        d.set_rect(hidden, 76.0, 5895.0, 9.0, 1.0);
+        d.add_text(hidden, "Die LUH auf Mastodon");
+        assert_eq!(text(&d, hidden), Some(Unpainted::NoFontSize));
+        assert!(at_most_1px("1px"));
+        // The same 1px text drawn sixteen times larger by a transform paints
+        // readable letters, turned upright too.
+        let enlarged = d.add(Some(body), "span");
+        d.set_style(enlarged, "fontSize", "1px");
+        d.set_rect(enlarged, 76.0, 400.0, 160.0, 16.0);
+        d.add_text(enlarged, "Scaled label");
+        d.set_style(enlarged, "transform", "matrix(16, 0, 0, 16, 0, 0)");
+        assert_eq!(text(&d, enlarged), None);
+        d.set_style(enlarged, "transform", "matrix(0, 16, -16, 0, 0, 0)");
+        assert_eq!(text(&d, enlarged), None);
+        // A scale set on an ancestor counts the same.
+        let wrap = d.add(Some(body), "div");
+        let inner = d.add(Some(wrap), "span");
+        d.set_style(inner, "fontSize", "1px");
+        d.set_rect(inner, 76.0, 600.0, 160.0, 16.0);
+        d.add_text(inner, "Scaled label");
+        d.set_style(wrap, "transform", "matrix3d(16, 0, 0, 0, 0, 16, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1)");
+        assert_eq!(text(&d, inner), None);
+        // A rotation alone, and a stretch on one axis (`scaleX(2)`,
+        // `scaleY(16)`), leave the letters a pixel thin.
+        d.set_style(enlarged, "transform", "matrix(0, 1, -1, 0, 0, 0)");
+        assert_eq!(text(&d, enlarged), Some(Unpainted::NoFontSize));
+        d.set_style(enlarged, "transform", "matrix(0.707107, 0.707107, -0.707107, 0.707107, 0, 0)");
+        assert_eq!(text(&d, enlarged), Some(Unpainted::NoFontSize));
+        d.set_style(enlarged, "transform", "matrix(2, 0, 0, 1, 0, 0)");
+        assert_eq!(text(&d, enlarged), Some(Unpainted::NoFontSize));
+        d.set_style(enlarged, "transform", "matrix(1, 0, 0, 16, 0, 0)");
+        assert_eq!(text(&d, enlarged), Some(Unpainted::NoFontSize));
+        // The individual `scale` property enlarges the same, on its own or
+        // under a rotation; on one axis it does not.
+        d.set_style(enlarged, "transform", "none");
+        d.set_style(enlarged, "scale", "16");
+        assert_eq!(text(&d, enlarged), None);
+        d.set_style(enlarged, "transform", "matrix(0, 1, -1, 0, 0, 0)");
+        assert_eq!(text(&d, enlarged), None);
+        d.set_style(enlarged, "scale", "1600% 100%");
+        assert_eq!(text(&d, enlarged), Some(Unpainted::NoFontSize));
+        // An individual `rotate` composes with the scales: a uniform scale
+        // stays an enlargement under it, and a one-axis scale turned against
+        // an ancestor's stretch on the other axis does not become one.
+        d.set_styles(enlarged, &[("transform", "none"), ("scale", "16"), ("rotate", "90deg")]);
+        assert_eq!(text(&d, enlarged), None);
+        d.set_style(enlarged, "rotate", "0deg");
+        assert_eq!(text(&d, enlarged), None);
+        d.set_style(enlarged, "rotate", "z 0.25turn");
+        assert_eq!(text(&d, enlarged), None);
+        let stretched = d.add(Some(body), "div");
+        d.set_style(stretched, "transform", "matrix(1, 0, 0, 16, 0, 0)");
+        let turned = d.add(Some(stretched), "span");
+        d.set_styles(turned, &[("fontSize", "1px"), ("scale", "16 1"), ("rotate", "90deg")]);
+        d.set_rect(turned, 76.0, 800.0, 16.0, 160.0);
+        d.add_text(turned, "Turned label");
+        assert_eq!(text(&d, turned), Some(Unpainted::NoFontSize));
+        // A turn about another axis claims nothing.
+        d.set_style(enlarged, "rotate", "x 45deg");
+        assert_eq!(text(&d, enlarged), Some(Unpainted::NoFontSize));
+        d.set_styles(enlarged, &[("scale", "none"), ("rotate", "none")]);
+        d.set_style(hidden, "fontSize", "2px");
+        d.set_rect(hidden, 76.0, 5895.0, 18.0, 2.0);
+        assert_eq!(text(&d, hidden), None);
+        assert!(!at_most_1px("1.5px"));
     }
 
     /// stroq.dev's "your browser does not support video" line inside the
@@ -1970,6 +2876,28 @@ mod tests {
         d.set_rect(p, 40.0, 400.0, 300.0, 20.0);
         d.add_text(p, "The chart could not load.");
         assert_eq!(why(&d, p), None);
+    }
+
+    fn rotate_y(deg: f64) -> [[f64; 3]; 3] {
+        let (s, c) = deg.to_radians().sin_cos();
+        [[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]]
+    }
+
+    fn rotate_x(deg: f64) -> [[f64; 3]; 3] {
+        let (s, c) = deg.to_radians().sin_cos();
+        [[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]]
+    }
+
+    fn mul(a: &[[f64; 3]; 3], b: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
+        multiply(a, b)
+    }
+
+    /// A row-major linear part as the computed `matrix3d()` (column-major).
+    fn matrix3d(r: &[[f64; 3]; 3]) -> String {
+        format!(
+            "matrix3d({}, {}, {}, 0, {}, {}, {}, 0, {}, {}, {}, 0, 0, 0, 0, 1)",
+            r[0][0], r[1][0], r[2][0], r[0][1], r[1][1], r[2][1], r[0][2], r[1][2], r[2][2]
+        )
     }
 
     /// aisdr.com's guide cards: the back of each is `rotateY(180deg)` under
@@ -2010,6 +2938,62 @@ mod tests {
         d.set_style(card, "transform", "none");
         d.set_style(card, "rotate", "y 180deg");
         assert_eq!(why(&d, copy), None);
+        d.set_style(card, "rotate", "none");
+        // So may an individual `scale` above it (`scale: 1 1 -1` flips z).
+        d.set_style(card, "scale", "1 1 -1");
+        assert_eq!(why(&d, copy), None);
+        d.set_style(card, "scale", "none");
+
+        // cochat.ai's page-flip book: the whole book is tilted a few degrees
+        // towards the viewer (and scaled), which leaves the back of each leaf
+        // facing away.
+        const TILTED_BOOK: &str = "matrix3d(1.3797, -0.0286851, -0.00352209, 0, 0.0289005, 1.36941, 0.168143, 0, 0, -0.121869, 0.992546, 0, 153.3, 0, 0, 1)";
+        d.set_style(card, "transform", TILTED_BOOK);
+        assert_eq!(why(&d, copy), Some(Unpainted::TurnedAway));
+        // A 2D transform above it turns nothing towards the viewer either.
+        d.set_style(body, "transform", "matrix(0.5, 0.2, -0.2, 0.5, 10, 10)");
+        assert_eq!(why(&d, copy), Some(Unpainted::TurnedAway));
+        d.set_style(body, "transform", "none");
+        // A quarter turn about y leaves the face edge-on, which the
+        // perspective the capture does not model could show either way; a
+        // perspective term, or a transform that does not parse as a matrix,
+        // says nothing.
+        d.set_style(card, "transform", "matrix3d(0, 0, -1, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1)");
+        assert_eq!(why(&d, copy), None);
+        d.set_style(card, "transform", "matrix3d(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, -0.001, 0, 0, 0, 1)");
+        assert_eq!(why(&d, copy), None);
+        d.set_style(card, "transform", "rotateX(5deg)");
+        assert_eq!(why(&d, copy), None);
+        d.set_style(card, "transform", "none");
+
+        // Intermediate card angles over the 180-degree back: at 60 degrees
+        // the back still faces away; at 120 the card's own matrix flips,
+        // and with two flips in the chain nothing is decided.
+        d.set_style(card, "transform", &matrix3d(&rotate_y(60.0)));
+        assert_eq!(why(&d, copy), Some(Unpainted::TurnedAway));
+        d.set_style(card, "transform", &matrix3d(&rotate_y(120.0)));
+        assert_eq!(why(&d, copy), None);
+        // A flipped flip card inside a mirrored wrapper (two flips): kept,
+        // since a flat wrapper would show it.
+        d.set_style(card, "transform", FLIPPED);
+        d.set_style(body, "transform", FLIPPED);
+        assert_eq!(why(&d, copy), None);
+        d.set_style(body, "transform", "none");
+        // A non-uniform scale under a 3D rotation turns the normal, not the
+        // z axis: a face at rotateX(150deg) under rotateX(-60deg)
+        // scaleY(0.2) faces the viewer.
+        d.set_style(back, "transform", &matrix3d(&rotate_x(150.0)));
+        let squashed = mul(&rotate_x(-60.0), &[[1.0, 0.0, 0.0], [0.0, 0.2, 0.0], [0.0, 0.0, 1.0]]);
+        d.set_style(card, "transform", &matrix3d(&squashed));
+        assert_eq!(why(&d, copy), None);
+        // Under perspective, a face a little past edge-on is kept.
+        d.set_style(back, "transform", FLIPPED);
+        d.set_style(card, "transform", &matrix3d(&rotate_y(75.0)));
+        assert_eq!(why(&d, copy), Some(Unpainted::TurnedAway), "cos 255 = -0.26 past the plain floor");
+        d.set_style(body, "perspective", "1000px");
+        assert_eq!(why(&d, copy), None);
+        d.set_style(body, "perspective", "none");
+        d.set_style(card, "transform", "none");
 
         // A 2D mirror turns nothing away.
         d.set_style(card, "rotate", "none");
@@ -2055,6 +3039,61 @@ mod tests {
         assert_eq!(why(&d, label), None);
     }
 
+    /// momoshop.com.tw (324173): a fixed side tab at x 1258 on a 1280px
+    /// viewport; 6 of its label's 40px are on screen.
+    #[test]
+    fn a_viewport_layer_shows_text_only_past_its_visible_share() {
+        let (mut d, body) = page();
+        d.inner_width = 1280.0;
+        d.inner_height = 800.0;
+        let tab = d.add(Some(body), "div");
+        resolved(&mut d, tab);
+        d.set_style(tab, "position", "fixed");
+        d.set_rect(tab, 1258.0, 320.0, 72.0, 158.0);
+        let label = d.add(Some(tab), "span");
+        resolved(&mut d, label);
+        d.add_text(label, "購物車");
+        let place = |d: &mut FakeDom, x: f64| {
+            d.set_rect(label, x, 334.0, 40.0, 16.0);
+            d.set_text_rect(label, x, 334.0, 40.0, 16.0);
+        };
+        place(&mut d, 1274.0);
+        assert_eq!(unpainted_for(&d, label, PaintGate::Text), Some(Unpainted::OutsideDocument));
+        // The base predicate keeps any pixel on screen.
+        assert_eq!(why(&d, label), None);
+        // Half of it on screen is read.
+        place(&mut d, 1260.0);
+        assert_eq!(unpainted_for(&d, label, PaintGate::Text), None);
+        // Inside a horizontal scroller in a fixed bar, the scroller's range
+        // is what the share is taken of: a chip at the viewport's edge in a
+        // scroller that runs past it is scrolled into view.
+        let bar = d.add(Some(body), "div");
+        resolved(&mut d, bar);
+        d.set_style(bar, "position", "fixed");
+        d.set_rect(bar, 0.0, 760.0, 1600.0, 40.0);
+        let scroller = d.add(Some(bar), "div");
+        resolved(&mut d, scroller);
+        d.set_styles(scroller, &[("overflowX", "auto"), ("overflowY", "hidden")]);
+        d.set_rect(scroller, 0.0, 760.0, 1600.0, 40.0);
+        d.el_mut(scroller).scroll_width = 2400.0;
+        d.el_mut(scroller).client_width = 1600.0;
+        let chip = d.add(Some(scroller), "span");
+        resolved(&mut d, chip);
+        d.add_text(chip, "Weekly deals");
+        d.set_rect(chip, 1270.0, 770.0, 90.0, 20.0);
+        d.set_text_rect(chip, 1270.0, 770.0, 90.0, 20.0);
+        assert_eq!(unpainted_for(&d, chip, PaintGate::Text), None);
+        // Pinned as it stands: one unbroken run in a fixed bar more than
+        // four viewports wide shows under a quarter of itself, and the Text
+        // gate drops it.
+        let ticker = d.add(Some(tab), "span");
+        resolved(&mut d, ticker);
+        d.add_text(ticker, "Free shipping on every order, every day, everywhere");
+        d.set_rect(ticker, 0.0, 300.0, 5200.0, 16.0);
+        d.set_text_rect(ticker, 0.0, 300.0, 5200.0, 16.0);
+        assert_eq!(unpainted_for(&d, ticker, PaintGate::Text), Some(Unpainted::OutsideDocument));
+    }
+
     /// jyes.com.tw's spec table under a "read more" panel held at
     /// `max-height: 1000px`, taller than the phone's viewport.
     #[test]
@@ -2090,6 +3129,77 @@ mod tests {
         d.set_style(panel, "maxHeight", &format!("{vh}px"));
         d.set_rect(cell, 40.0, 1600.0, 195.0, 40.0);
         assert_eq!(why(&d, cell), None);
+    }
+
+    /// fastsocial.co (323161): an image at 0.057 inside a `[data-reveal]`
+    /// card caught mid-reveal (0.6 opacity, nudged by a transform, with an
+    /// opacity transition). Its own float animation moves it too, which on
+    /// its own says nothing.
+    #[test]
+    fn an_image_inside_a_reveal_in_progress_is_a_state_layer() {
+        let (mut d, body) = page();
+        let card = d.add(Some(body), "div");
+        d.set_styles(
+            card,
+            &[
+                ("opacity", "0.600778"),
+                ("transform", "matrix(0.99568, 0, 0, 0.99568, 0, 3.74421)"),
+                ("transitionProperty", "opacity, transform"),
+                ("transitionDuration", "0.7s, 0.9s"),
+            ],
+        );
+        d.set_rect(card, 25.0, 7399.0, 341.0, 182.0);
+        let img = d.add(Some(card), "img");
+        d.set_styles(img, &[("opacity", "0.0567087"), ("transform", "matrix(0.75, 0.06, -0.06, 0.75, 0, 24)")]);
+        d.set_rect(img, 158.0, 7432.0, 73.0, 78.0);
+        assert_eq!(raster(&d, img), Some(Unpainted::StateLayer));
+        // At rest: the card at full opacity, or not displaced, or with no
+        // opacity transition, leaves the image held faint.
+        for (prop, value) in [
+            ("opacity", "1"),
+            ("transform", "none"),
+            ("transitionProperty", "transform"),
+            // `all` is everywhere; it says nothing about a reveal.
+            ("transitionProperty", "all"),
+            // An authored value is a state at rest.
+            ("opacity", "0.6"),
+        ] {
+            let was = d.style(card, prop);
+            d.set_style(card, prop, value);
+            assert_eq!(raster(&d, img), None, "{prop}: {value}");
+            d.set_style(card, prop, &was);
+        }
+        // An authored value the capture saw moving is a frame of a fade.
+        d.set_style(card, "opacity", "0.6");
+        d.el_mut(card).running_animations = Some(vec!["opacity".to_string()]);
+        assert_eq!(raster(&d, img), Some(Unpainted::StateLayer));
+    }
+
+    /// The classic buried raster: a faint watermark image in a box centred
+    /// with a transform, dimmed to `opacity: .5`, with `transition: all
+    /// .3s` (a dimmed carousel slide reads the same). It is at rest.
+    #[test]
+    fn a_watermark_with_a_transition_stays_buried() {
+        let (mut d, body) = page();
+        let mark = d.add(Some(body), "div");
+        d.set_styles(
+            mark,
+            &[
+                ("position", "absolute"),
+                ("opacity", "0.5"),
+                ("transform", "matrix(1, 0, 0, 1, -200, -150)"),
+                ("transitionProperty", "all"),
+                ("transitionDuration", "0.3s"),
+            ],
+        );
+        d.set_rect(mark, 440.0, 250.0, 400.0, 300.0);
+        let img = d.add(Some(mark), "img");
+        d.set_style(img, "opacity", "0.1");
+        d.set_rect(img, 440.0, 250.0, 400.0, 300.0);
+        assert_eq!(raster(&d, img), None);
+        // Naming opacity does not make an authored .5 a frame.
+        d.set_style(mark, "transitionProperty", "opacity, transform");
+        assert_eq!(raster(&d, img), None);
     }
 
     /// zigzag.kr (`data-loaded="false"`), thairath.co.th
@@ -2428,6 +3538,74 @@ mod tests {
         d.set_rect(shell, 0.0, 0.0, 1280.0, 800.0);
         d.el_mut(shell).client_height = 800.0;
         assert_eq!(why(&d, below), None);
+    }
+
+    /// chefsspecial.app (10047562): a Mapbox box 800px tall that hides its
+    /// overflow records a scroll height of 1,626 from markers placed below
+    /// its edge. They are absolutely placed in a static canvas container of
+    /// no height, so nothing in the box's flow runs past it: the markers
+    /// below the edge are clipped. The same box around an in-flow wrapper
+    /// that runs past it is a scroll frame.
+    #[test]
+    fn a_map_whose_overflow_is_placed_markers_is_not_a_scroll_frame() {
+        let (mut d, body) = page();
+        let map = d.add(Some(body), "div");
+        d.set_styles(map, &[("display", "block"), ("position", "relative"), ("overflowX", "hidden"), ("overflowY", "hidden")]);
+        d.set_rect(map, 0.0, 0.0, 896.0, 800.0);
+        d.el_mut(map).client_height = 800.0;
+        d.el_mut(map).scroll_height = Some(1626.0);
+        let canvas_box = d.add(Some(map), "div");
+        d.set_style(canvas_box, "display", "block");
+        d.set_rect(canvas_box, 0.0, 0.0, 896.0, 0.0);
+        let canvas = d.add(Some(canvas_box), "canvas");
+        d.set_style(canvas, "position", "absolute");
+        d.set_rect(canvas, 0.0, 0.0, 896.0, 800.0);
+        let marker = d.add(Some(canvas_box), "div");
+        d.set_style(marker, "position", "absolute");
+        d.set_rect(marker, 147.0, 860.0, 56.0, 56.0);
+        // The marker's count sits in a static box inside it, which is in
+        // the marker's flow, not the map's.
+        let pin = d.add(Some(marker), "div");
+        d.set_rect(pin, 165.0, 878.0, 20.0, 20.0);
+        let count = d.add(Some(pin), "div");
+        d.set_rect(count, 165.0, 878.0, 20.0, 20.0);
+        d.add_text(count, "12");
+        assert_eq!(why(&d, count), Some(Unpainted::ClippedOut));
+
+        // An in-flow wrapper that runs past the box makes it a frame again,
+        // and the same marker is kept.
+        let content = d.add(Some(map), "div");
+        d.set_rect(content, 0.0, 0.0, 896.0, 1626.0);
+        assert_eq!(why(&d, count), None);
+        // So does one the capture did not measure.
+        d.set_rect(content, f64::NAN, f64::NAN, f64::NAN, f64::NAN);
+        assert_eq!(why(&d, count), None);
+        // incredible.one (10048156): a pinned stage lifts a placed screen,
+        // most of the frame's height, that starts inside it and runs past.
+        d.set_rect(content, 0.0, 0.0, 896.0, 400.0);
+        assert_eq!(why(&d, count), Some(Unpainted::ClippedOut));
+        // A placed wrapper the frame's own height (`absolute; inset: 0`)
+        // holding in-flow content that runs past is a smooth-scroll frame.
+        let wrapper = d.add(Some(map), "div");
+        d.set_style(wrapper, "position", "absolute");
+        d.set_rect(wrapper, 0.0, 0.0, 896.0, 800.0);
+        let sections = d.add(Some(wrapper), "div");
+        d.set_rect(sections, 0.0, 0.0, 896.0, 2100.0);
+        assert_eq!(why(&d, count), None);
+        d.set_rect(sections, 0.0, 0.0, 896.0, 600.0);
+        assert_eq!(why(&d, count), Some(Unpainted::ClippedOut));
+
+        let screen = d.add(Some(map), "div");
+        d.set_style(screen, "position", "absolute");
+        d.set_rect(screen, 0.0, 700.0, 896.0, 707.0);
+        assert_eq!(why(&d, count), None);
+        // A small placed box across the edge (a marker half under it) is
+        // not that.
+        d.set_rect(screen, 0.0, 780.0, 56.0, 56.0);
+        assert_eq!(why(&d, count), Some(Unpainted::ClippedOut));
+        // And text the box holds of its own.
+        d.add_text(map, "Loading the map of every restaurant near you");
+        assert_eq!(why(&d, count), None);
     }
 
     /// smooth-scrollbar and Locomotive Scroll: a viewport-tall wrapper that
@@ -2922,6 +4100,121 @@ mod tests {
         d.set_style(block, "animationName", "lab-rise, lab-grow");
         d.set_style(block, "animationTimeline", "view()");
         assert!(opacity_held_by_scroll_timeline(&d, block, css), "one timeline repeats for every name");
+    }
+
+    /// opencodex.me 11728: `p.lp-disclaimer` runs `ocx-fade-up` (0% at
+    /// opacity 0, 100% at 1) on `view()` and is read at 0 at the top of the
+    /// page. A visitor who scrolls to it reads it at its end keyframe, so the
+    /// Text gate and the contrast check count it there; anything the engine
+    /// cannot read for certain keeps the opacity the capture read.
+    #[test]
+    fn a_box_held_at_zero_by_a_scroll_timeline_counts_at_its_end_keyframe() {
+        let (mut d, body) = page();
+        set_keyframes(&mut d, "ocx-fade-up", &[("0%", &[("opacity", "0")]), ("100%", &[("opacity", "1")])]);
+        let wrap = d.add(Some(body), "div");
+        d.set_rect(wrap, 100.0, 3000.0, 600.0, 80.0);
+        let p = d.add(Some(wrap), "p");
+        d.set_rect(p, 124.0, 3010.0, 540.0, 58.0);
+        d.set_styles(
+            p,
+            &[
+                ("opacity", "0"),
+                ("animationName", "ocx-fade-up"),
+                ("animationTimeline", "view()"),
+                ("animationFillMode", "both"),
+                ("animationDirection", "normal"),
+                ("animationComposition", "replace"),
+            ],
+        );
+        assert_eq!(scroll_held_end_opacity(&d, p), None, "a probe that read no animations");
+        assert_eq!(effective_opacity_scrolled(&d, p), 0.0);
+        d.set_running_animations(p, &["opacity", "transform"]);
+        assert_eq!(scroll_held_end_opacity(&d, p), Some(1.0));
+        assert_eq!(effective_opacity_scrolled(&d, p), 1.0);
+        assert_eq!(effective_opacity_dom(&d, p), 0.0, "the captured opacity is unchanged");
+        assert_ne!(unpainted_at_capture(&d, p, OwnOpacity::Counts), Some(Unpainted::Transparent));
+
+        // A held wrapper fades its text the same way.
+        let child = d.add(Some(p), "span");
+        assert_eq!(effective_opacity_scrolled(&d, child), 1.0);
+
+        // A reversed run ends on its first frame, which shows nothing.
+        d.set_style(p, "animationDirection", "reverse");
+        assert_eq!(scroll_held_end_opacity(&d, p), Some(0.0));
+        assert_eq!(unpainted_at_capture(&d, p, OwnOpacity::Counts), Some(Unpainted::Transparent));
+        // A direction or composition it cannot read keeps the captured 0.
+        d.set_style(p, "animationDirection", "alternate");
+        assert_eq!(scroll_held_end_opacity(&d, p), None);
+        d.set_style(p, "animationDirection", "normal");
+        d.set_style(p, "animationComposition", "add");
+        assert_eq!(scroll_held_end_opacity(&d, p), None);
+        d.set_style(p, "animationComposition", "replace");
+        // The document timeline is a reveal that never ran, not this.
+        d.set_style(p, "animationTimeline", "auto");
+        assert_eq!(scroll_held_end_opacity(&d, p), None);
+        d.set_style(p, "animationTimeline", "view()");
+        // A box not at the transparent floor is read as captured.
+        d.set_style(p, "opacity", "0.4");
+        assert_eq!(scroll_held_end_opacity(&d, p), None);
+        // An end keyframe that sets no opacity cannot be read.
+        d.set_style(p, "opacity", "0");
+        set_keyframes(&mut d, "ocx-fade-up", &[("0%", &[("opacity", "0")]), ("100%", &[("transform", "none")])]);
+        assert_eq!(scroll_held_end_opacity(&d, p), None);
+    }
+
+    /// rezyco.com (1002344): the call-to-action block runs
+    /// `landing-actions-reveal 0.6s 2.45s forwards` (0% at opacity 0, 100% at
+    /// 1) and was read at 0, its delay not yet out. Every visitor meets it at
+    /// its end frame, so the Box and Text gates and the contrast check count
+    /// it there; an entrance that does not hold its end, a loop, a paused run
+    /// and one that ends after a minute keep the captured 0.
+    #[test]
+    fn a_timed_entrance_caught_at_zero_counts_at_its_end_frame() {
+        let (mut d, body) = page();
+        set_keyframes(
+            &mut d,
+            "landing-actions-reveal",
+            &[("0%", &[("opacity", "0")]), ("99%", &[("pointer-events", "none")]), ("100%", &[("opacity", "1")])],
+        );
+        let actions = d.add(Some(body), "div");
+        d.set_rect(actions, 480.0, 535.0, 320.0, 214.0);
+        one_shot(&mut d, actions, "landing-actions-reveal", "forwards");
+        d.set_styles(actions, &[("opacity", "0"), ("animationDuration", "0.6s"), ("animationDelay", "2.45s")]);
+        let button = d.add(Some(actions), "button");
+        d.set_rect(button, 480.0, 535.0, 320.0, 48.0);
+        assert_eq!(entrance_end_opacity(&d, actions), Some(1.0));
+        assert_eq!(effective_opacity_scrolled(&d, button), 1.0);
+        assert_eq!(effective_opacity_dom(&d, button), 0.0, "the captured opacity is unchanged");
+        assert_eq!(unpainted_for(&d, button, PaintGate::Box), None);
+
+        let gone = |d: &FakeDom| unpainted_for(d, button, PaintGate::Box) == Some(Unpainted::Transparent);
+        // Handed back to its own style at the end: what it shows then is unknown.
+        d.set_style(actions, "animationFillMode", "none");
+        assert!(gone(&d));
+        d.set_style(actions, "animationFillMode", "both");
+        assert!(!gone(&d));
+        // A loop, a paused run, a run the capture did not see moving opacity,
+        // and one that ends past a minute.
+        d.set_style(actions, "animationIterationCount", "infinite");
+        assert!(gone(&d));
+        d.set_style(actions, "animationIterationCount", "1");
+        d.set_style(actions, "animationPlayState", "paused");
+        assert!(gone(&d));
+        d.set_style(actions, "animationPlayState", "running");
+        d.set_running_animations(actions, &["transform"]);
+        assert!(gone(&d));
+        d.set_running_animations(actions, &["opacity"]);
+        d.set_style(actions, "animationDelay", "61s");
+        assert!(gone(&d));
+        d.set_style(actions, "animationDelay", "2.45s");
+        // An entrance that ends at 0 shows nothing, and one caught above the
+        // floor is read as captured.
+        set_keyframes(&mut d, "landing-actions-reveal", &[("0%", &[("opacity", "1")]), ("100%", &[("opacity", "0")])]);
+        assert!(gone(&d));
+        set_keyframes(&mut d, "landing-actions-reveal", &[("0%", &[("opacity", "0")]), ("100%", &[("opacity", "1")])]);
+        d.set_style(actions, "opacity", "0.5");
+        assert_eq!(entrance_end_opacity(&d, actions), None);
+        assert_eq!(effective_opacity_scrolled(&d, button), 0.5);
     }
 
     /// directus.io: a closed FAQ row hides its overflow at 76px and parks the
@@ -3586,6 +4879,8 @@ mod tests {
         assert!(page_form_painted(&d, "bounce-easing", &[loader, shown]));
         assert!(!page_form_painted(&d, "pulsing-dot", &[loader]));
         assert!(!page_form_painted(&d, "dark-glow", &[loader]));
+        assert!(!page_form_painted(&d, "side-tab", &[loader]));
+        assert!(page_form_painted(&d, "side-tab", &[loader, shown]));
         // Outside the list, and with nothing matched, base behavior stands.
         assert!(page_form_painted(&d, "marquee", &[loader]));
         assert!(page_form_painted(&d, "bounce-easing", &[]));

@@ -181,7 +181,12 @@ fn unfinished_comp_stop_is_owned_bounded_and_does_not_reopen_on_unrelated_turn()
 
 /// A comp build this session recorded as shipped, the way `finish` leaves it.
 fn shipped_build(t: &Tmp) {
-    t.write("index.html", "<main>Shipped</main>");
+    shipped_build_in(t, "");
+}
+
+/// `shipped_build` under `dir` (empty or ending in `/`), where `build-phase` ran.
+fn shipped_build_in(t: &Tmp, dir: &str) {
+    t.write(&format!("{dir}index.html"), "<main>Shipped</main>");
     let mut state = json!({
         "tool":"build-phase", "version":2, "startedAt":"build-one", "phase":"review",
         "sessionId":"owner", "artifact":"index.html", "capturePolicy":"native-html-v1", "phases":{}
@@ -189,10 +194,10 @@ fn shipped_build(t: &Tmp) {
     for phase in ["comps", "spec", "plates", "hero", "sections", "motion", "responsive", "review"] {
         state["phases"][phase] = json!({"status":"closed"});
     }
-    let hash = impeccable_comp_verbs::completion::artifact_hash(std::path::Path::new(&t.path()), &state).unwrap();
+    let hash = impeccable_comp_verbs::completion::artifact_hash(&t.0.join(dir), &state).unwrap();
     state["finish"] = json!({"disposition":"ship", "phaseAtFinish":"review", "artifactSha256":hash,
         "captureInputs":[{"path":"index.html","sha256":hash}]});
-    t.write(".impeccable/build/state.json", &state.to_string());
+    t.write(&format!("{dir}.impeccable/build/state.json"), &state.to_string());
 }
 
 #[test]
@@ -2326,6 +2331,203 @@ fn admin_on_writes_launcher_manifests_for_every_harness() {
     assert!(out.ends_with("Hook manifests already installed for: .claude, .agents, .cursor, .github.\n"), "{out}");
 }
 
+fn expected_user_claude_hook_command(home: &str) -> String {
+    let launcher = jsp::join(&[home, ".claude", "skills", "impeccable", "scripts", "impeccable"]);
+    let q = if cfg!(windows) {
+        serde_json::to_string(&launcher).unwrap()
+    } else {
+        format!("'{}'", launcher.replace('\'', "'\\''"))
+    };
+    format!("[ ! -f {q} ] || {q} hook")
+}
+
+#[test]
+fn admin_on_repairs_project_manifest_from_user_scope_claude_skill() {
+    let t = Tmp::new();
+    let cwd = t.path();
+    let home = t.0.join("home");
+    std::fs::create_dir_all(home.join(".claude/skills/impeccable/scripts")).unwrap();
+    std::fs::write(home.join(".claude/skills/impeccable/scripts/impeccable"), "#!/bin/sh\n").unwrap();
+    std::fs::write(home.join(".claude/settings.json"), r#"{"model":"claude-sonnet-5"}"#).unwrap();
+    t.write(
+        ".claude/settings.local.json",
+        r#"{"permissions":{"allow":["Bash(ls)"]},"hooks":{"PostToolUse":[{"matcher":"Edit","hooks":[{"type":"command","command":"node \"${CLAUDE_PROJECT_DIR}/.claude/skills/impeccable/scripts/hook.mjs\""}]}]}}"#,
+    );
+    let home_text = home.to_string_lossy().to_string();
+    let r = rt_with(&cwd, env(&[("HOME", &home_text), ("USERPROFILE", &home_text)]));
+
+    let (out, _, code) = admin_run(&r, &["on"]);
+
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("Installed or repaired hook manifests for: .claude."), "{out}");
+    let user: Value =
+        serde_json::from_str(&std::fs::read_to_string(home.join(".claude/settings.json")).unwrap()).unwrap();
+    assert_eq!(user["model"], "claude-sonnet-5");
+    let command = user["hooks"]["PostToolUse"][0]["hooks"][0]["command"].as_str().unwrap();
+    assert_eq!(command, expected_user_claude_hook_command(&home_text));
+    let local: Value = serde_json::from_str(&t.read(".claude/settings.local.json")).unwrap();
+    assert!(local.get("hooks").is_none(), "stale project hook was not pruned: {local}");
+    assert_eq!(local["permissions"]["allow"], json!(["Bash(ls)"]));
+
+    // Once the project copy is gone, a second run leaves the user file alone.
+    let before = std::fs::read_to_string(home.join(".claude/settings.json")).unwrap();
+    let (again, _, code) = admin_run(&r, &["on"]);
+    assert_eq!(code, 0, "{again}");
+    assert_eq!(std::fs::read_to_string(home.join(".claude/settings.json")).unwrap(), before);
+}
+
+#[test]
+fn admin_on_repairs_shared_project_manifest_from_user_scope_claude_skill() {
+    let t = Tmp::new();
+    let cwd = t.path();
+    let home = t.0.join("home");
+    std::fs::create_dir_all(home.join(".claude/skills/impeccable/scripts")).unwrap();
+    std::fs::write(home.join(".claude/skills/impeccable/scripts/impeccable"), "#!/bin/sh\n").unwrap();
+    let shared_original = r#"{"model":"claude-sonnet-5","hooks":{"PostToolUse":[{"matcher":"Edit","hooks":[{"type":"command","command":"node \"${CLAUDE_PROJECT_DIR}/.claude/skills/impeccable/scripts/hook.mjs\""}]}]}}"#;
+    t.write(".claude/settings.json", shared_original);
+    t.write(
+        ".claude/settings.local.json",
+        r#"{"permissions":{"allow":["Bash(ls)"]},"hooks":{"Stop":[{"hooks":[{"type":"command","command":"node old/skills/impeccable/scripts/hook.mjs"}]}]}}"#,
+    );
+    let home_text = home.to_string_lossy().to_string();
+    let r = rt_with(&cwd, env(&[("HOME", &home_text), ("USERPROFILE", &home_text)]));
+
+    let (out, _, code) = admin_run(&r, &["on"]);
+
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("Installed or repaired hook manifests for: .claude."), "{out}");
+    // The hook lands in the user's own settings, with the absolute launcher.
+    let user: Value =
+        serde_json::from_str(&std::fs::read_to_string(home.join(".claude/settings.json")).unwrap()).unwrap();
+    let command = user["hooks"]["PostToolUse"][0]["hooks"][0]["command"].as_str().unwrap();
+    assert_eq!(command, expected_user_claude_hook_command(&home_text));
+    let local: Value = serde_json::from_str(&t.read(".claude/settings.local.json")).unwrap();
+    assert!(local.get("hooks").is_none(), "local duplicate was not pruned: {local}");
+    assert_eq!(local["permissions"]["allow"], json!(["Bash(ls)"]));
+}
+
+/// Regression: a user-scope repair must never write a home path into the
+/// committed, team-shared `.claude/settings.json`.
+#[test]
+fn admin_on_user_scope_repair_leaves_committed_settings_byte_unchanged() {
+    let t = Tmp::new();
+    let cwd = t.path();
+    let home = t.0.join("home");
+    std::fs::create_dir_all(home.join(".claude/skills/impeccable/scripts")).unwrap();
+    std::fs::write(home.join(".claude/skills/impeccable/scripts/impeccable"), "#!/bin/sh\n").unwrap();
+    let shared_original = "{\n  \"hooks\": {\"PostToolUse\": [{\"matcher\": \"Edit\", \"hooks\": [{\"type\": \"command\", \"command\": \"\\\"${CLAUDE_PROJECT_DIR}/.claude/skills/impeccable/scripts/impeccable\\\" hook\"}]}]}\n}\n";
+    t.write(".claude/settings.json", shared_original);
+    let home_text = home.to_string_lossy().to_string();
+    let r = rt_with(&cwd, env(&[("HOME", &home_text), ("USERPROFILE", &home_text)]));
+
+    let (out, _, code) = admin_run(&r, &["on"]);
+
+    assert_eq!(code, 0, "{out}");
+    let shared = t.read(".claude/settings.json");
+    assert_eq!(shared, shared_original);
+    assert!(!shared.contains(&home_text), "home path leaked into the committed manifest: {shared}");
+    assert!(std::fs::read_to_string(home.join(".claude/settings.json")).unwrap().contains("impeccable"));
+}
+
+/// Regression: an unreadable `~/.claude/settings.json` is skipped, so the
+/// project hook must survive; pruning it first would leave no hook at all.
+#[test]
+fn admin_on_user_scope_keeps_project_hook_when_user_settings_are_invalid() {
+    let t = Tmp::new();
+    let cwd = t.path();
+    let home = t.0.join("home");
+    std::fs::create_dir_all(home.join(".claude/skills/impeccable/scripts")).unwrap();
+    std::fs::write(home.join(".claude/skills/impeccable/scripts/impeccable"), "#!/bin/sh\n").unwrap();
+    let broken = "{ \"model\": \"claude-sonnet-5\",, }";
+    std::fs::write(home.join(".claude/settings.json"), broken).unwrap();
+    let local_original = r#"{"hooks":{"PostToolUse":[{"matcher":"Edit","hooks":[{"type":"command","command":"\"${CLAUDE_PROJECT_DIR}/.claude/skills/impeccable/scripts/impeccable\" hook"}]}]}}"#;
+    t.write(".claude/settings.local.json", local_original);
+    let home_text = home.to_string_lossy().to_string();
+    let r = rt_with(&cwd, env(&[("HOME", &home_text), ("USERPROFILE", &home_text)]));
+
+    let (out, _, code) = admin_run(&r, &["on"]);
+
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("Skipped "), "{out}");
+    assert!(out.contains("not valid JSON"), "{out}");
+    assert_eq!(std::fs::read_to_string(home.join(".claude/settings.json")).unwrap(), broken);
+    assert_eq!(t.read(".claude/settings.local.json"), local_original);
+}
+
+/// Regression (PR #986 review): a user skill folder without its launcher is not
+/// a user-scope install `hooks on` can switch to. The project hook may still run
+/// another installation, so it stays, and `~/.claude/settings.json` is not written.
+#[test]
+fn admin_on_user_scope_without_launcher_keeps_project_hook() {
+    let t = Tmp::new();
+    let cwd = t.path();
+    let home = t.0.join("home");
+    std::fs::create_dir_all(home.join(".claude/skills/impeccable")).unwrap();
+    let local_original = r#"{"hooks":{"PostToolUse":[{"matcher":"Edit","hooks":[{"type":"command","command":"\"${CLAUDE_PROJECT_DIR}/.claude/skills/impeccable/scripts/impeccable\" hook"}]}]}}"#;
+    t.write(".claude/settings.local.json", local_original);
+    let home_text = home.to_string_lossy().to_string();
+    let r = rt_with(&cwd, env(&[("HOME", &home_text), ("USERPROFILE", &home_text)]));
+
+    let (out, _, code) = admin_run(&r, &["on"]);
+
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(t.read(".claude/settings.local.json"), local_original);
+    assert!(!home.join(".claude/settings.json").exists(), "{out}");
+}
+
+/// Regression (PR #986 review): a legacy `hook.mjs` entry already in
+/// `~/.claude/settings.json` is not a current user hook. It is replaced with
+/// the launcher form, and only then is the project hook pruned.
+#[test]
+fn admin_on_replaces_legacy_user_hook_before_pruning_project_hook() {
+    let t = Tmp::new();
+    let cwd = t.path();
+    let home = t.0.join("home");
+    std::fs::create_dir_all(home.join(".claude/skills/impeccable/scripts")).unwrap();
+    std::fs::write(home.join(".claude/skills/impeccable/scripts/impeccable"), "#!/bin/sh\n").unwrap();
+    std::fs::write(
+        home.join(".claude/settings.json"),
+        r#"{"model":"claude-sonnet-5","hooks":{"PostToolUse":[{"matcher":"Edit","hooks":[{"type":"command","command":"node \"~/.claude/skills/impeccable/scripts/hook.mjs\""}]}]}}"#,
+    )
+    .unwrap();
+    t.write(
+        ".claude/settings.local.json",
+        r#"{"permissions":{"allow":["Bash(ls)"]},"hooks":{"PostToolUse":[{"hooks":[{"type":"command","command":"\"${CLAUDE_PROJECT_DIR}/.claude/skills/impeccable/scripts/impeccable\" hook"}]}]}}"#,
+    );
+    let home_text = home.to_string_lossy().to_string();
+    let r = rt_with(&cwd, env(&[("HOME", &home_text), ("USERPROFILE", &home_text)]));
+
+    let (out, _, code) = admin_run(&r, &["on"]);
+
+    assert_eq!(code, 0, "{out}");
+    let user_text = std::fs::read_to_string(home.join(".claude/settings.json")).unwrap();
+    assert!(!user_text.contains("hook.mjs"), "legacy user hook survived: {user_text}");
+    let user: Value = serde_json::from_str(&user_text).unwrap();
+    assert_eq!(user["model"], "claude-sonnet-5");
+    let command = user["hooks"]["PostToolUse"][0]["hooks"][0]["command"].as_str().unwrap();
+    assert_eq!(command, expected_user_claude_hook_command(&home_text));
+    let local: Value = serde_json::from_str(&t.read(".claude/settings.local.json")).unwrap();
+    assert!(local.get("hooks").is_none(), "duplicate project hook survived: {local}");
+}
+
+#[test]
+fn admin_on_does_not_repair_project_manifests_from_other_user_scope_skills() {
+    let t = Tmp::new();
+    let cwd = t.path();
+    let home = t.0.join("home");
+    std::fs::create_dir_all(home.join(".cursor/skills/impeccable")).unwrap();
+    let original = r#"{"version":1,"hooks":{"preToolUse":[{"command":".cursor/skills/impeccable/scripts/impeccable hook-before-edit"}]}}"#;
+    t.write(".cursor/hooks.json", original);
+    let home_text = home.to_string_lossy().to_string();
+    let r = rt_with(&cwd, env(&[("HOME", &home_text), ("USERPROFILE", &home_text)]));
+
+    let (out, _, code) = admin_run(&r, &["on"]);
+
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("No installed provider skill folders found to repair."), "{out}");
+    assert_eq!(t.read(".cursor/hooks.json"), original);
+}
+
 #[test]
 fn admin_on_repairs_legacy_mjs_manifests_to_the_launcher_form() {
     let t = Tmp::new();
@@ -2484,6 +2686,78 @@ fn stop_cache_syncs_after_clean_scan_so_reintroductions_fire() {
     t.write("src/a.css", SIDE_TAB_CSS);
     let again = hook::run_stop_hook(&r, &stop_event(&cwd, "s1"));
     assert!(again.stdout.contains("[side-tab]"), "{}", again.stdout);
+}
+
+#[test]
+fn stop_from_a_subfolder_finds_the_root_cache() {
+    // #1088: the per-edit pass keys the cache to the project root; Stop from a
+    // subfolder, even one with its own `.impeccable/`, must still find it.
+    let t = Tmp::new();
+    t.write("package.json", "{}");
+    let cwd = t.path();
+    let css = t.write("src/a.css", SIDE_TAB_CSS);
+    let docs = jsp::join(&[&cwd, "docs"]);
+    t.write("docs/readme.txt", "x");
+    let app = jsp::join(&[&cwd, "app"]);
+    t.write("app/.impeccable/live/roots.json", "{}");
+    for (session, sub) in [("s1", &docs), ("s2", &app)] {
+        hook::run_hook(&rt(&cwd), &edit_event(&cwd, &css, session));
+        let res = hook::run_stop_hook(&rt(sub), &stop_event(sub, session));
+        assert!(res.stdout.contains("[side-tab]"), "{session}: {}", res.stdout);
+        assert_eq!(audit_str(&res.audit, "cwd"), Some(cwd.as_str()));
+    }
+}
+
+#[test]
+fn stop_from_a_subfolder_build_keeps_its_reminder_and_scans_the_root_cache() {
+    // #1088: `build-phase` keeps its state under its own cwd, so the reminder
+    // and its config stay there, while the scan still finds root edits.
+    let t = Tmp::new();
+    t.write("package.json", "{}");
+    let cwd = t.path();
+    let css = t.write("src/a.css", SIDE_TAB_CSS);
+    t.write("app/index.html", "<main>In progress</main>");
+    let build = |owner: &str| t.write("app/.impeccable/build/state.json", &json!({
+        "tool":"build-phase", "version":2, "startedAt":"build-one",
+        "sessionId":owner, "artifact":"index.html", "finish":null,
+        "phases":{"hero":{"status":"open"}}
+    }).to_string());
+    let app = jsp::join(&[&cwd, "app"]);
+    hook::run_hook(&rt(&cwd), &edit_event(&cwd, &css, "owner"));
+    build("other");
+    let res = hook::run_stop_hook(&rt(&app), &stop_event(&app, "owner"));
+    assert!(res.stdout.contains("[side-tab]"), "{}", res.stdout);
+    build("owner");
+    let res = hook::run_stop_hook(&rt(&app), &stop_event(&app, "owner"));
+    assert!(res.stdout.contains("Comp build"), "{}", res.stdout);
+    t.write("app/.impeccable/config.json", r#"{"hook":{"enabled":false}}"#);
+    let res = hook::run_stop_hook(&rt(&app), &stop_event(&app, "owner"));
+    assert_eq!(audit_str(&res.audit, "skipped"), Some("config-disabled"));
+    // The root's own config gates the scan of root edits.
+    t.write("app/.impeccable/config.json", "{}");
+    t.write("app/.impeccable/build/state.json", "{}");
+    t.write(".impeccable/config.json", r#"{"hook":{"enabled":false}}"#);
+    let res = hook::run_stop_hook(&rt(&app), &stop_event(&app, "owner"));
+    assert_eq!(audit_str(&res.audit, "skipped"), Some("config-disabled"));
+    assert_eq!(audit_str(&res.audit, "cwd"), Some(cwd.as_str()));
+}
+
+#[test]
+fn stop_from_a_subfolder_shipped_build_marks_the_build_folder_cache() {
+    // #1088: findings from a root edit over a build shipped in the subfolder
+    // carry the finish note, and its marker lands where the reminder reads it.
+    let t = Tmp::new();
+    t.write("package.json", "{}");
+    let cwd = t.path();
+    shipped_build_in(&t, "app/");
+    let css = t.write("src/a.css", SIDE_TAB_CSS);
+    hook::run_hook(&rt(&cwd), &edit_event(&cwd, &css, "owner"));
+    let app = jsp::join(&[&cwd, "app"]);
+    let res = hook::run_stop_hook(&rt(&app), &stop_event(&app, "owner"));
+    assert!(res.stdout.contains("[side-tab]"), "{}", res.stdout);
+    assert!(res.stdout.contains("finish --disposition ship recorded"), "{}", res.stdout);
+    assert!(t.read("app/.impeccable/hook.cache.json").contains("findingsAfterFinish"));
+    assert!(!t.read(".impeccable/hook.cache.json").contains("findingsAfterFinish"));
 }
 
 #[test]

@@ -258,14 +258,16 @@ const FIX_SKILLS = {
   'tight-leading':           'typeset',
   'skipped-heading':         'audit, harden',
   'justified-text':          'typeset',
+  'straggler':               'typeset',
+  'unbalanced-heading':      'typeset',
   'tiny-text':               'typeset',
   'all-caps-body':           'typeset',
   'wide-tracking':           'typeset',
 };
 
 function fixSkillFor(finding) {
-  if (isAdvisory(finding)) return '';
-  const skills = FIX_SKILLS[finding.type] || 'polish';
+  const skills = FIX_SKILLS[finding.type] || (isAdvisory(finding) ? '' : 'polish');
+  if (!skills) return '';
   // Prefix each comma-separated skill with a slash for clarity
   return skills.split(',').map(s => '/' + s.trim()).join(', ');
 }

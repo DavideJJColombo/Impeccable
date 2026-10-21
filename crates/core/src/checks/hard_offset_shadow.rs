@@ -7,6 +7,9 @@ use cssparser::{Parser, ParserInput, Token};
 /// its small offset accents. This is a review threshold, not a design standard.
 /// Negative spread and unresolved lengths/colors stay outside this first rule.
 pub fn check_hard_offset_shadow(shadow: &str, current_color: &str, opacity: f64) -> Vec<RuleHit> {
+    if !has_shadow(shadow) {
+        return Vec::new();
+    }
     let mut input = ParserInput::new(shadow);
     let mut parser = Parser::new(&mut input);
     // A malformed layer invalidates the entire CSS declaration, including a
@@ -34,6 +37,13 @@ pub fn check_hard_offset_shadow(shadow: &str, current_color: &str, opacity: f64)
         }
     }
     Vec::new()
+}
+
+/// The rule runs on every element in both engines, so an absent shadow
+/// returns before the tokenizer or an ancestor walk runs.
+pub fn has_shadow(shadow: &str) -> bool {
+    let shadow = shadow.trim();
+    !shadow.is_empty() && !shadow.eq_ignore_ascii_case("none")
 }
 
 struct ShadowLayer {

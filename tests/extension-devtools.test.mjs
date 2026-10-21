@@ -69,7 +69,7 @@ test('advisory presentation follows metadata for any rule and registry row', asy
   const context = panel();
   for (const advisory of [
     { type: 'future-rule', category: 'quality', severity: 'advisory' },
-    { type: 'bounce-easing', category: 'slop', advisory: true },
+    { type: 'future-slop-rule', category: 'slop', advisory: true },
     { id: 'future-settings-rule', category: 'quality', severity: 'advisory' },
   ]) {
     assert.equal(context.presentationCategory(advisory), 'advisory');
@@ -83,4 +83,16 @@ test('advisory presentation follows metadata for any rule and registry row', asy
   }
   assert.equal(context.presentationCategory({ type: 'hard-offset-shadow', category: 'quality' }), 'quality');
   assert.equal(context.fixSkillFor({ type: 'side-tab', advisory: false }), '/distill, /polish');
+});
+
+test('advisories keep a mapped fix command and drop only the generic fallback', async () => {
+  const context = panel();
+  assert.equal(context.fixSkillFor({ type: 'bounce-easing', category: 'slop', advisory: true }), '/animate');
+  assert.equal(context.fixSkillFor({ type: 'straggler', category: 'quality', severity: 'advisory' }), '/typeset');
+  assert.equal(context.fixSkillFor({ type: 'unbalanced-heading', category: 'quality', severity: 'advisory' }), '/typeset');
+  assert.equal(context.fixSkillFor(shadow), '');
+  const finding = { type: 'bounce-easing', category: 'slop', advisory: true, name: 'Bounce easing', detail: 'cubic-bezier' };
+  const report = await context.formatFindingsForCopy([item([finding])]);
+  assert.match(report, /## Advisories \(1\)/);
+  assert.match(report, /Suggested Impeccable skills to fix: \/animate/);
 });
