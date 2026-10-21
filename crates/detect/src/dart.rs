@@ -174,6 +174,53 @@ pub fn strip_dart_comments(content: &str) -> String {
     out
 }
 
+/// Index just past the `}` matching the `{` at `at`, skipping nested string
+/// literals and their escapes so a brace inside `'...'` cannot close the group.
+fn skip_interpolation(chars: &[char], at: usize) -> usize {
+    let n = chars.len();
+    let mut depth = 0usize;
+    let mut i = at;
+    while i < n {
+        match chars[i] {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            '\'' | '"' => {
+                let q = chars[i];
+                let triple = i + 2 < n && chars[i + 1] == q && chars[i + 2] == q;
+                i += if triple { 3 } else { 1 };
+                while i < n {
+                    if chars[i] == '\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if chars[i] == q {
+                        if triple {
+                            if i + 2 < n && chars[i + 1] == q && chars[i + 2] == q {
+                                i += 3;
+                                break;
+                            }
+                            i += 1;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    n
+}
+
 /// Blank the *contents* of every string literal, keeping the delimiters, the
 /// raw `r` marker, newlines, and the byte length. Runs on text that
 /// [`strip_dart_comments`] already produced, so no comment can open a string.
@@ -206,6 +253,17 @@ fn blank_string_contents(text: &str) -> String {
                     out.push(if c == '\n' { '\n' } else { ' ' });
                     out.push(if chars[i + 1] == '\n' { '\n' } else { ' ' });
                     i += 2;
+                    continue;
+                }
+                // `'${name.replaceAll("'", "")}'`: a quote inside the
+                // interpolation is not this literal's closing quote, so skip
+                // the whole `${...}` group before looking for it.
+                if !raw && c == '$' && i + 1 < n && chars[i + 1] == '{' {
+                    let end = skip_interpolation(&chars, i + 1);
+                    for k in i..end {
+                        out.push(if chars[k] == '\n' { '\n' } else { ' ' });
+                    }
+                    i = end;
                     continue;
                 }
                 if c == q {
@@ -450,7 +508,7 @@ re!(
 re!(
     RADIUS_NAMED_RE,
     format!(
-        "{B}({}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}){WS}*:{WS}*Radius{WS}*\\.{WS}*(?:{}{WS}*\\({WS}*([0-9]+(?:\\.[0-9]+)?)|{})",
+        "{B}({}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}){WS}*:{WS}*Radius{WS}*\\.{WS}*(?:{}{WS}*\\({WS}*([0-9]+(?:\\.[0-9]+)?)|{})",
         ci("topLeft"),
         ci("topStart"),
         ci("topRight"),
@@ -463,6 +521,8 @@ re!(
         ci("bottom"),
         ci("left"),
         ci("right"),
+        ci("start"),
+        ci("end"),
         ci("circular"),
         ci("zero")
     )
@@ -1075,6 +1135,31 @@ mod tests {
         let out = strip_dart_comments("final t = 'A ${b('x')} c'; // gone\n");
         assert!(out.contains("'A ${b('x')} c';"));
         assert!(!out.contains("gone"));
+    }
+
+    #[test]
+    fn a_quote_inside_interpolation_does_not_blank_later_code() {
+        // The inner `"'"` is a string inside `${...}`. Treating its quote as
+        // the outer literal's end desynced the pass and hid the curve below.
+        let code = "final label = '${name.replaceAll(\"'\", \"\")}';\ncurve: Curves.bounceOut,\n";
+        assert!(has_id(code, "bounce-easing"));
+        assert!(!has_id(code, "overused-font"));
+    }
+
+    #[test]
+    fn directional_radius_resolves_start_and_end() {
+        let quiet = r#"BoxDecoration(
+              border: BorderDirectional(start: BorderSide(color: Color(0xFF8B5CF6), width: 4)),
+              borderRadius: BorderRadiusDirectional.horizontal(start: Radius.circular(12)),
+            )"#;
+        // Far corners square: no tab, the stripe is not rounded away from.
+        assert!(!has_id(quiet, "side-tab"));
+        let flag = r#"BoxDecoration(
+              border: BorderDirectional(start: BorderSide(color: Color(0xFF8B5CF6), width: 4)),
+              borderRadius: BorderRadiusDirectional.horizontal(end: Radius.circular(12)),
+            )"#;
+        // Far corners rounded: the same shape the web engine flags.
+        assert!(has_id(flag, "side-tab"));
     }
 
     #[test]
