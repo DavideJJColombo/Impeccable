@@ -728,8 +728,13 @@ fn global_install_rewrites_github_project_hook_to_the_global_skill_path() {
     );
     assert_eq!(r.code, 0, "{}\n{}", r.stdout, r.stderr);
     let manifest = read(&format!("{project}/.github/hooks/impeccable.json"));
+    let expected = if cfg!(windows) {
+        format!("{}/.github/skills/impeccable/scripts/impeccable", home.replace('\\', "/"))
+    } else {
+        "$HOME/.github/skills/impeccable/scripts/impeccable".to_string()
+    };
     assert!(
-        manifest.contains("$HOME/.github/skills/impeccable/scripts/impeccable"),
+        manifest.contains(&expected),
         "global GitHub hook did not name the user-scoped launcher: {manifest}"
     );
     assert!(
