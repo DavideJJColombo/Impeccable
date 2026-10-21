@@ -17,6 +17,7 @@ pub mod design_system;
 pub mod detect_text;
 pub mod engines;
 pub mod file_system;
+pub mod github_annotations;
 pub mod ignores;
 pub mod jsp;
 pub mod list_rules;
