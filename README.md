@@ -152,10 +152,11 @@ Requires VS Code 1.109.3+, Copilot Chat access, and a trusted local workspace. O
 
 **Claude Code:**
 ```bash
-/plugin marketplace add pbakaus/impeccable
+/plugin marketplace add siddu1004/impeccable
+/plugin install impeccable@impeccable
 ```
 
-> Claude Code only. After adding the marketplace, open `/plugin` and install Impeccable from the list.
+> Claude Code only. On Claude Code 2.1.275 or later this is one step: `/plugin install impeccable --marketplace siddu1004/impeccable`.
 
 **Grok Build:**
 ```bash
