@@ -4,6 +4,8 @@ For native Android apps: Jetpack Compose, Android Views, React Native, Expo, Flu
 
 On native, the visitor mode narrows what expression may override. Material Design 3 governs structure, navigation, and interaction in every mode; brand expresses through Material's theming (color roles, type scale, shape, motion). A Material-everywhere cross-platform app that also ships to iPhone still owes iOS its OS guarantees on that hardware: safe-area insets, Reduce Motion, edge-swipe back.
 
+A Flutter app is native here: obey this reference through its Dart widgets, plus the Dart-specific tells and detector notes in [flutter.md](flutter.md).
+
 ## The Android slop test
 
 Would a fluent Android user trust this app, or trip on off-spec components? The most common tell is an iOS app wearing Android's skin: a bottom-only navigation copied from iPhone, a back arrow that ignores the system Back gesture, Cupertino-shaped switches and dialogs. Material 3 is the rulebook; follow its components and theme the brand through it.

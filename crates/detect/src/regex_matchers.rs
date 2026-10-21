@@ -1383,7 +1383,7 @@ pub struct Matcher {
     pub fmt: fn(&MatchCtx, &str) -> String,
 }
 
-fn all(re: &Regex, line: &str) -> Vec<MatchCtx> {
+pub(crate) fn all(re: &Regex, line: &str) -> Vec<MatchCtx> {
     re.captures_iter(line)
         .map(|c| MatchCtx::from_caps(&c))
         .collect()

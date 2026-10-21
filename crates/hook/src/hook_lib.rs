@@ -35,11 +35,12 @@ pub const ENVELOPE_PREFIX: &str = "[impeccable@1]";
 
 pub const ALLOWED_EXTS: &[&str] = &[
     ".tsx", ".jsx", ".html", ".htm", ".vue", ".svelte", ".astro", ".css", ".scss", ".sass",
-    ".less", ".ts", ".js",
+    ".less", ".ts", ".js", ".dart",
 ];
 
 pub const ACK_EXTS: &[&str] = &[
     ".tsx", ".jsx", ".html", ".htm", ".vue", ".svelte", ".astro", ".css", ".scss", ".sass", ".less",
+    ".dart",
 ];
 
 const WS: &str = impeccable_core::js::WS;

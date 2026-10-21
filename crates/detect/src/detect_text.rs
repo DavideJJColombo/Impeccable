@@ -864,6 +864,9 @@ fn blank_comments_for_matchers(text: &str, ext: &str) -> String {
         };
         return blank_html_and_css_comments_outside_scripts(&with_frontmatter);
     }
+    if ext == ".dart" {
+        return crate::dart::strip_dart_comments(text);
+    }
     if CSS_LIKE_EXTS.contains(&ext) {
         let without_blocks = strip_css_comments(text);
         return if ext == ".css" {
@@ -1927,6 +1930,24 @@ pub fn detect_text(content: &str, file_path: &str, options: &TextOptions) -> Vec
         Some(&sheet),
     ));
 
+    // `.dart` speaks Flutter tokens, not web tokens; the shared web matcher
+    // pass above stays web-shaped and quiet on a Dart line, and the Dart
+    // matchers carry its rules instead (`crates/detect/src/dart.rs`).
+    if ext == ".dart" {
+        let meta = ProfileMeta {
+            engine: "regex",
+            phase: "source",
+            rule_id: "dart",
+            target: file_path,
+        };
+        findings.extend(profile_findings(
+            profile,
+            meta,
+            |f: &Finding| f.antipattern.as_str(),
+            || crate::dart::dart_findings(content, file_path),
+        ));
+    }
+
     if css_like {
         findings.extend(scan_inset_stripe_css(content, file_path, 0, &sheet));
         findings.extend(pseudo_stripe_findings(content, file_path, 0, &sheet));
@@ -2103,6 +2124,56 @@ mod tests {
         let out = strip_js_comments("a // x\nb /* y */ c\nconst r = /\\/\\//; d", true);
         assert_eq!(out, "a     \nb         c\nconst r = /\\/\\//; d");
         assert_eq!(strip_css_comments("a /* é */ b"), "a         b");
+    }
+
+    #[test]
+    fn dart_files_route_through_the_dart_pass() {
+        let flag_code = r#"import 'package:flutter/material.dart';
+
+class Sloppy extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFFFDF6EC),
+      body: AnimatedContainer(
+        curve: Curves.bounceOut,
+        border: Border(left: BorderSide(color: Color(0xFF8B5CF6), width: 4)),
+        child: Text('Go', style: TextStyle(fontFamily: 'Inter')),
+      ),
+    );
+  }
+}
+"#;
+        let out = detect_text(flag_code, "widget/home.dart", &TextOptions::default());
+        let ids: Vec<&str> = out.iter().map(|f| f.antipattern.as_str()).collect();
+        assert!(ids.contains(&"bounce-easing"), "{ids:?}");
+        assert!(ids.contains(&"overused-font"), "{ids:?}");
+        assert!(ids.contains(&"cream-palette"), "{ids:?}");
+        assert!(ids.contains(&"side-tab"), "{ids:?}");
+        // Web matchers contributed nothing on the same Dart lines: every
+        // finding above must come from the Dart pass, exactly once per tell.
+        assert_eq!(out.len(), 4);
+    }
+
+    #[test]
+    fn dart_inline_ignores_waive_findings() {
+        let code = r#"import 'package:flutter/material.dart';
+
+// impeccable-disable: legacy toy screen
+
+class Pardoned extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return Text('Hi', style: TextStyle(fontFamily: 'Inter'));
+  }
+}
+"#;
+        let opts = TextOptions {
+            inline_ignores: true,
+            ..Default::default()
+        };
+        let out = detect_text(code, "widget/home.dart", &opts);
+        assert!(out.is_empty(), "waived file should be clean, got {out:?}");
     }
 
     #[test]

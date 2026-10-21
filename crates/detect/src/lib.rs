@@ -13,6 +13,7 @@
 pub mod cdp_endpoint;
 pub mod cli;
 pub mod config;
+pub mod dart;
 pub mod design_system;
 pub mod detect_text;
 pub mod engines;

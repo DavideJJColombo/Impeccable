@@ -1,6 +1,6 @@
 Run systematic **technical** quality checks on a native app (`ios` / `android` / `adaptive`) and generate a comprehensive report. Don't fix issues; document them for other commands to address.
 
-This is a code-level audit, not a design critique. Audit from source (SwiftUI / UIKit / Compose / React Native / Flutter); no browser tooling or `impeccable detect` applies. Score against the platform reference(s): [ios.md](ios.md) / [android.md](android.md), both for `adaptive`. Read them before scoring if Setup hasn't already. The report skeleton mirrors [audit.md](audit.md); keep the two in sync when changing it.
+This is a code-level audit, not a design critique. Audit from source (SwiftUI / UIKit / Compose / React Native / Flutter); no browser tooling applies. One deterministic pass survives here: a Flutter app's `.dart` files scan with the other UI sources. Run `{{scripts_path}}/impeccable detect lib/` and fold its findings into the platform-conformance score via [flutter.md](flutter.md). Score against the platform reference(s): [ios.md](ios.md) / [android.md](android.md), both for `adaptive`; for a Flutter app read [flutter.md](flutter.md) alongside them. Read them before scoring if Setup hasn't already. The report skeleton mirrors [audit.md](audit.md); keep the two in sync when changing it.
 
 ## Diagnostic Scan
 

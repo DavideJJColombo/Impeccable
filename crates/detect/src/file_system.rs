@@ -32,6 +32,7 @@ pub const SCANNABLE_EXTENSIONS: &[&str] = &[
     ".svelte",
     ".astro",
     ".blade.php",
+    ".dart",
 ];
 /// JS `HTML_EXTENSIONS`.
 pub const HTML_EXTENSIONS: &[&str] = &[".html", ".htm"];
