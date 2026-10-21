@@ -5,9 +5,26 @@ import vm from 'node:vm';
 
 // Run the shipped panel script, with extension APIs stubbed.
 function panel() {
-  const element = () => ({ addEventListener() {}, style: {}, classList: { add() {} } });
+  const elements = [];
+  const element = () => {
+    const node = {
+      children: [], listeners: {}, style: {}, dataset: {}, classList: { add() {}, remove() {} },
+      addEventListener(type, listener) { this.listeners[type] = listener; },
+      appendChild(child) { this.children.push(child); },
+      querySelector(selector) {
+        assert.equal(selector, '.finding-copy');
+        return this.copyButton ||= element();
+      },
+    };
+    elements.push(node);
+    return node;
+  };
+  const writes = [];
   const context = vm.createContext({
-    document: { getElementById: element, documentElement: element() },
+    document: { getElementById: element, createElement: element, documentElement: element() },
+    elements, writes,
+    navigator: { clipboard: { writeText: async text => { writes.push(text); } } },
+    setTimeout() {},
     window: { addEventListener() {} },
     chrome: {
       devtools: {
@@ -96,3 +113,26 @@ test('advisories keep a mapped fix command and drop only the generic fallback', 
   assert.match(report, /## Advisories \(1\)/);
   assert.match(report, /Suggested Impeccable skills to fix: \/animate/);
 });
+
+// Exercise the rendered button, not just the formatter with a complete finding.
+for (const [label, finding, expected] of [
+  ['hard offset shadow', shadow, null],
+  ['severity-only advisory', { ...shadow, type: 'future-rule', advisory: undefined }, null],
+  ['boolean-only advisory', { ...shadow, type: 'future-rule', severity: undefined }, null],
+  ['mapped advisory', { ...shadow, type: 'bounce-easing' }, '/animate'],
+  ['ordinary unmapped finding', { ...shadow, type: 'future-rule', severity: undefined, advisory: false }, '/polish'],
+]) {
+  test(`rendered single-copy button preserves advice for ${label}`, async () => {
+    const context = panel();
+    context.renderFindings([item([finding])]);
+    const buttons = context.elements.filter(node => node.copyButton).map(node => node.copyButton);
+    assert.equal(buttons.length, 1);
+    buttons[0].listeners.click({ stopPropagation() {} });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(context.writes.length, 1);
+    assert.match(context.writes[0], /Element: `#card`/);
+    assert.match(context.writes[0], /Check whether this fits the intended design direction/);
+    if (expected) assert.ok(context.writes[0].includes(`Suggested Impeccable skill(s) to fix: ${expected}`));
+    else assert.doesNotMatch(context.writes[0], /Suggested Impeccable skill|\/polish/);
+  });
+}

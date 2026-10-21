@@ -430,6 +430,7 @@ function renderFindings(findings) {
         isPageLevel: item.isPageLevel,
         isHidden: item.isHidden,
         detail: f.detail,
+        finding: f,
       });
     }
   }
@@ -451,7 +452,7 @@ function renderFindings(findings) {
       <span class="category-count">${catCount}</span>`;
     section.appendChild(catHeader);
 
-    for (const [type, group] of groups) {
+    for (const group of groups.values()) {
     const groupEl = document.createElement('div');
     groupEl.className = 'finding-group';
 
@@ -485,10 +486,9 @@ function renderFindings(findings) {
         <span class="finding-description">${escapeHtml(group.description)}</span>`;
 
       const copyBtn = itemEl.querySelector('.finding-copy');
-      const finding = { type, name: group.name, description: group.description, detail: item.detail };
       copyBtn.addEventListener('click', (e) => {
         e.stopPropagation();
-        copyToClipboard(formatSingleFindingForCopy(item, finding), copyBtn);
+        copyToClipboard(formatSingleFindingForCopy(item, item.finding), copyBtn);
       });
 
       if (!item.isPageLevel && !item.isHidden) {
