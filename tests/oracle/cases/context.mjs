@@ -94,6 +94,16 @@ const claudeStopHook = (ws, rel) => write(
   }) + '\n',
 );
 
+// A user-scope Codex Stop hook as `update --user` writes it into
+// `<dir>/hooks.json` (the absolute launcher, guarded).
+const codexUserHook = (ws, dir) => write(
+  ws,
+  path.join(dir, 'hooks.json'),
+  JSON.stringify({
+    hooks: { Stop: [{ hooks: [{ type: 'command', command: `[ ! -f '/u/.agents/skills/impeccable/scripts/impeccable' ] || '/u/.agents/skills/impeccable/scripts/impeccable' hook` }] }] },
+  }, null, 2) + '\n',
+);
+
 // Fixed mtimes so DESIGN.md-vs-sidecar age comparisons never depend on copy
 // order or filesystem timestamp granularity.
 const T_OLD = new Date('2026-01-01T00:00:00Z');
@@ -310,6 +320,23 @@ const cases = [
       write(ws, 'repos/standalone/src/App.jsx', 'export default function App() { return "standalone"; }\n');
     },
     env: env({ IMPECCABLE_PROVIDER_ID: 'claude-code' }),
+  },
+  // #1062: a user-scope Codex install writes `~/.codex/hooks.json`, which
+  // counts as coverage; a non-empty CODEX_HOME replaces that location.
+  {
+    id: 'context-codex-user-hook', verb: 'context', workspace: 'ctx-product-only',
+    setup: (ws) => codexUserHook(ws, '.oracle-home/.codex'),
+    env: env({ IMPECCABLE_PROVIDER_ID: 'codex', IMPECCABLE_NO_STALENESS_CHECK: '1' }),
+  },
+  {
+    id: 'context-codex-home-hook', verb: 'context', workspace: 'ctx-product-only',
+    setup: (ws) => codexUserHook(ws, 'codex-home'),
+    env: env({ IMPECCABLE_PROVIDER_ID: 'agents', CODEX_HOME: `${WS}/codex-home`, IMPECCABLE_NO_STALENESS_CHECK: '1' }),
+  },
+  {
+    id: 'context-codex-home-exclusive', verb: 'context', workspace: 'ctx-product-only',
+    setup: (ws) => codexUserHook(ws, '.oracle-home/.codex'),
+    env: env({ IMPECCABLE_PROVIDER_ID: 'codex', CODEX_HOME: `${WS}/codex-home`, IMPECCABLE_NO_STALENESS_CHECK: '1' }),
   },
   { id: 'context-legacy', verb: 'context', workspace: 'ctx-legacy', setup: legacySetup, env: env(), files: IMPECCABLE_FILES },
   { id: 'context-hook-disabled-env', verb: 'context', workspace: 'ctx-product-only', env: env({ IMPECCABLE_HOOK_DISABLED: 'yes' }), files: IMPECCABLE_FILES },
