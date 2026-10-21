@@ -739,6 +739,39 @@ fn global_install_rewrites_github_project_hook_to_the_global_skill_path() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_global_github_hook_uses_userprofile_when_shell_home_differs() {
+    let root = temp_root("github-global-windows-home");
+    let project = format!("{root}/project");
+    let home = format!("{root}/profile-home");
+    let shell_home = format!("{root}/git-bash-home");
+    let tmpdir = format!("{root}/tmp");
+    for dir in [&project, &home, &shell_home, &tmpdir] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    std::fs::create_dir_all(format!("{project}/.git")).unwrap();
+    let bundle_root = create_fake_universal_bundle(&project, &[".github"]);
+    let mut env = base_env(&home, &tmpdir, &bundle_root);
+    env.insert("HOME".to_string(), shell_home.clone());
+
+    let r = run_cli(
+        &["install", "-y", "--providers=github", "--scope=global"],
+        &project,
+        &env,
+    );
+    assert_eq!(r.code, 0, "{}\n{}", r.stdout, r.stderr);
+    let manifest = read(&format!("{project}/.github/hooks/impeccable.json"));
+    let expected = format!(
+        "{}/.github/skills/impeccable/scripts/impeccable",
+        home.replace('\\', "/")
+    );
+    assert!(manifest.contains(&expected), "global GitHub hook did not name USERPROFILE: {manifest}");
+    assert!(!manifest.contains("$HOME"), "global GitHub hook still depends on Git Bash HOME: {manifest}");
+    assert!(!manifest.contains(&shell_home.replace('\\', "/")), "global GitHub hook names the wrong HOME: {manifest}");
+    std::fs::remove_dir_all(&root).ok();
+}
+
 #[test]
 fn user_scope_update_writes_claude_user_settings() {
     let root = temp_root("claude-user-settings");

@@ -167,12 +167,18 @@ pub fn quoted_launcher_path(skill_root: &str, provider: &str, absolute: bool) ->
 
 /// GitHub Copilot hook manifests are project files even for a user-scoped
 /// skill install. Keep their normal project command untouched, but point a
-/// global install at the portable user path that GitHub's `bash` hook expands
-/// on every platform.
-fn quoted_github_user_launcher() -> QuotedPath {
-    let path = "$HOME/.github/skills/impeccable/scripts/impeccable".to_string();
+/// global install at the user's actual install root. On Windows, Git Bash's
+/// `$HOME` may differ from the `USERPROFILE` directory used by `os.homedir()`,
+/// so write that resolved root with Bash-compatible forward slashes.
+fn quoted_github_user_launcher(skill_root: &str, win32: bool) -> QuotedPath {
+    let path = if win32 {
+        jsp::win32::join(&[skill_root, ".github", "skills", "impeccable", "scripts", "impeccable"])
+            .replace('\\', "/")
+    } else {
+        "$HOME/.github/skills/impeccable/scripts/impeccable".to_string()
+    };
     QuotedPath {
-        posix: json_string(&path),
+        posix: if win32 { sh_single_quote(&path) } else { json_string(&path) },
         win32: json_string(&path),
         raw: path,
     }
@@ -235,7 +241,7 @@ pub fn windows_hook_command(quoted: &QuotedPath, provider: &str) -> String {
 /// JS: rewriteHookCommandsForSkillRoot(value, provider, {skillRoot, absolute})
 pub fn rewrite_hook_commands_for_skill_root(value: &Value, provider: &str, skill_root: &str, absolute: bool) -> Value {
     let quoted = if provider == ".github" && absolute {
-        Some(quoted_github_user_launcher())
+        Some(quoted_github_user_launcher(skill_root, cfg!(windows)))
     } else {
         quoted_launcher_path(skill_root, provider, absolute)
     };
@@ -249,7 +255,7 @@ pub fn rewrite_hook_commands_for_skill_root(value: &Value, provider: &str, skill
 /// (tests drive the Windows form from any host).
 pub fn rewrite_hook_commands_for_platform(value: &Value, provider: &str, skill_root: &str, absolute: bool, win32: bool) -> Value {
     let quoted = if provider == ".github" && absolute {
-        Some(quoted_github_user_launcher())
+        Some(quoted_github_user_launcher(skill_root, win32))
     } else {
         quoted_launcher_path(skill_root, provider, absolute)
     };

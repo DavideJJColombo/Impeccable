@@ -155,7 +155,11 @@ fn github_project_manifest_stays_portable_and_global_install_uses_home() {
         "[ ! -f \"$HOME/.github/skills/impeccable/scripts/impeccable\" ] || \"$HOME/.github/skills/impeccable/scripts/impeccable\" hook"
     );
     let windows = rewrite_hook_commands_for_platform(&bundle, ".github", r"C:\Users\u", true, true);
-    assert_eq!(windows["hooks"]["postToolUse"][0]["bash"], global["hooks"]["postToolUse"][0]["bash"]);
+    assert_eq!(
+        windows["hooks"]["postToolUse"][0]["bash"],
+        "[ ! -f 'C:/Users/u/.github/skills/impeccable/scripts/impeccable' ] || 'C:/Users/u/.github/skills/impeccable/scripts/impeccable' hook"
+    );
+    assert!(!windows["hooks"]["postToolUse"][0]["bash"].as_str().unwrap().contains("$HOME"));
     assert!(value_has_impeccable_hook_marker(&bundle));
 }
 
