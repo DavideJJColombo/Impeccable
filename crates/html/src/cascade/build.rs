@@ -90,14 +90,20 @@ fn resolve_linked_css_path(file_dir: &str, href: &str) -> String {
 /// resolved relative to `file_dir` (query/hash stripped), joined with `\n`.
 /// `warn` receives the JS `process.stderr.write` notice for an unreadable
 /// linked stylesheet (once per resolved path per scan).
+///
+/// Returns that text plus a second one for the page-level pattern scan: the
+/// same join minus the linked sheets `ignored` accepts (given the resolved
+/// path). The cascade keeps the full text.
 pub fn collect_static_css_text(
     doc: &StaticDocument,
     file_dir: &Path,
     profile: Option<&dyn ProfileSink>,
     file_path: &str,
     warn: Option<&dyn Fn(&str)>,
-) -> String {
+    ignored: Option<&dyn Fn(&str) -> bool>,
+) -> (String, String) {
     let mut style_texts: Vec<String> = Vec::new();
+    let mut pattern_texts: Vec<String> = Vec::new();
     let mut warned_missing_stylesheets: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     for style_el in doc.query_selector_all("style") {
@@ -105,7 +111,9 @@ pub fn collect_static_css_text(
             .get_attribute("media")
             .is_none_or(|m| m.trim().is_empty() || super::media::matches_media(m))
         {
-            style_texts.push(style_el.text_content());
+            let text = style_el.text_content();
+            pattern_texts.push(text.clone());
+            style_texts.push(text);
         }
     }
     let file_dir_str = file_dir.to_string_lossy().into_owned();
@@ -128,7 +136,13 @@ pub fn collect_static_css_text(
             || std::fs::read(&css_path),
         );
         match read {
-            Ok(bytes) => style_texts.push(String::from_utf8_lossy(&bytes).into_owned()),
+            Ok(bytes) => {
+                let text = String::from_utf8_lossy(&bytes).into_owned();
+                if !ignored.is_some_and(|f| f(&css_path)) {
+                    pattern_texts.push(text.clone());
+                }
+                style_texts.push(text);
+            }
             Err(_) => {
                 if warned_missing_stylesheets.insert(css_path.clone()) {
                     if let Some(warn) = warn {
@@ -140,7 +154,10 @@ pub fn collect_static_css_text(
             }
         }
     }
-    super::media::screen_styles(&style_texts.join("\n"))
+    (
+        super::media::screen_styles(&style_texts.join("\n")),
+        super::media::screen_styles(&pattern_texts.join("\n")),
+    )
 }
 
 static PSEUDO_RULE_RE: Lazy<Regex> = Lazy::new(|| {
