@@ -3271,6 +3271,7 @@
     const P = paramsPanelPalette || barPaletteForTheme(detectPageTheme());
     paramsPanelBody.innerHTML = '';
     for (const p of params) {
+      const value = Object.hasOwn(paramsCurrentValues, p.id) ? paramsCurrentValues[p.id] : p.default;
       const row = el('div', { display: 'flex', flexDirection: 'column', gap: '6px' });
       const labelRow = el('div', {
         display: 'flex', justifyContent: 'space-between',
@@ -3295,7 +3296,7 @@
         input.min = String(p.min != null ? p.min : 0);
         input.max = String(p.max != null ? p.max : 1);
         input.step = String(p.step != null ? p.step : 0.05);
-        input.value = String(p.default);
+        input.value = String(value);
         Object.assign(input.style, {
           width: '100%', accentColor: C.brand, cursor: 'pointer',
         });
@@ -3310,7 +3311,7 @@
         });
         row.appendChild(input);
       } else if (p.kind === 'toggle') {
-        const initial = !!p.default;
+        const initial = !!value;
         readout.textContent = initial ? 'On' : 'Off';
         const track = el('button', {
           position: 'relative', width: '36px', height: '20px',
@@ -3344,8 +3345,8 @@
         const opts = (p.options || []).map(o =>
           typeof o === 'string' ? { value: o, label: o } : o
         );
-        const activeOpt = opts.find(o => o.value === p.default) || opts[0];
-        readout.textContent = activeOpt ? activeOpt.label : String(p.default);
+        const activeOpt = opts.find(o => o.value === value) || opts[0];
+        readout.textContent = activeOpt ? activeOpt.label : String(value);
         const segRow = el('div', {
           display: 'grid',
           gridTemplateColumns: 'repeat(' + opts.length + ', 1fr)',
@@ -3354,7 +3355,7 @@
         });
         const segBtns = [];
         opts.forEach(o => {
-          const active = o.value === p.default;
+          const active = o.value === value;
           const b = el('button', {
             padding: '5px 4px', border: 'none', borderRadius: '3px',
             background: active ? C.brand : 'transparent',
@@ -4988,8 +4989,8 @@
     const variantEl = getVisibleVariantEl();
     const params = parseVariantParams(variantEl);
     if (!variantEl || params.length === 0) return;
-    // Build fresh to ensure the current variant's controls are shown.
-    applyParamDefaults(variantEl, params);
+    // Rebuild the controls from the current values. Defaults are applied
+    // when the variant is initialized, not when its Tune panel is reopened.
     buildParamsPanel(variantEl, params);
     tuneOpen = true;
     showParamsPanel();
