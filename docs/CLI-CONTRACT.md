@@ -93,8 +93,8 @@ Notation: `stdout>` / `stderr>` are literal writes; `exit N`; template strings u
 | Flag | Effect |
 |---|---|
 | `--json` | JSON output to **stdout** |
-| `--quiet` | text mode prints only summary line(s) to stderr |
-| `--list-rules` | print the built-in detector catalog and **exit 0** without scanning. Catalog goes to **stdout**. `--json` pretty-prints an array of `{id,name,category,severity,scopes,description}` (plus `advisory: true` on advisory rules). `--quiet` prints one rule id per line. `--scope` and `--no-advisory` filter the catalog the same way they filter a scan. A positional target or `--cdp` with it → `stderr> Error: --list-rules prints the rule catalog and takes no file, URL, or --cdp scan\n`, `exit 1`. Evaluated after `--help` (so `--list-rules --help` prints usage) |
+| `--quiet` | text mode prints only summary line(s) to stderr; under `--list-rules` it instead prints one rule id per line to **stdout** |
+| `--list-rules` | print every registered rule (`all_antipatterns()`: the built-ins plus any installed rule pack) and **exit 0** without scanning. Catalog goes to **stdout**. `--json` pretty-prints an array of `{id,name,category,severity,scopes,description}` (plus `advisory: true` on advisory rules). `--quiet` prints one rule id per line. `--scope` and `--no-advisory` filter the catalog the same way they filter a scan; config ignores (`ignoreRules`) are not applied, so the catalog lists rules a project has switched off. A positional target or `--cdp` with it → `stderr> Error: --list-rules prints the rule catalog and takes no file, URL, or --cdp scan\n`, `exit 1`. Evaluated after `--help` (so `--list-rules --help` prints usage) |
 | `--help` | print usage (stdout) and `exit 0` — evaluated *after* scope/viewport parsing (so a bad `--scope` still errors first) |
 | `--no-advisory` | drop findings with `advisory === true` before output/exit-code |
 | `--no-consent-hiding` | URL scans only (Rust engine): leave known consent managers' banners on the page instead of hiding them before the scan (see **Consent banners** under URL scans). No effect on file scans |

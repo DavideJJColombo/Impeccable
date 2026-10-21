@@ -1,4 +1,4 @@
-//! `impeccable detect --list-rules`: the built-in detector catalog, no scan.
+//! `impeccable detect --list-rules`: every rule in the registry (`all_antipatterns()`, built-ins plus any installed rule pack), no scan.
 
 use impeccable_core::registry::{all_antipatterns, Antipattern};
 use serde_json::{json, Value};
@@ -110,7 +110,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalog_covers_every_built_in_in_registry_order() {
+    fn catalog_covers_every_registered_rule_in_registry_order() {
         let rules = collect_catalog_rules(&[], false);
         let all: Vec<_> = all_antipatterns().collect();
         assert_eq!(rules.len(), all.len());
