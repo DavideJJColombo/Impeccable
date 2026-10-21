@@ -10,6 +10,10 @@ tests/oracle/** -text
 ui/component-review/theme.css text eol=lf
 crates/context/assets/component-review.js text eol=lf
 
+# cmd.exe can miss batch labels in LF-only scripts. Keep the launcher in CRLF
+# on every checkout so release bundles contain a native Windows batch file.
+skill/scripts/impeccable.cmd text eol=crlf
+
 # Machine-written files that a line diff cannot usefully show. `-diff` makes
 # `git diff`, `git show` and `git log -p` print "Binary files differ" instead
 # of the content; `linguist-generated` collapses them in GitHub's PR view.

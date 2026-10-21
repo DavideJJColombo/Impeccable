@@ -165,6 +165,19 @@ pub fn quoted_launcher_path(skill_root: &str, provider: &str, absolute: bool) ->
     })
 }
 
+/// GitHub Copilot hook manifests are project files even for a user-scoped
+/// skill install. Keep their normal project command untouched, but point a
+/// global install at the portable user path that GitHub's `bash` hook expands
+/// on every platform.
+fn quoted_github_user_launcher() -> QuotedPath {
+    let path = "$HOME/.github/skills/impeccable/scripts/impeccable".to_string();
+    QuotedPath {
+        posix: json_string(&path),
+        win32: json_string(&path),
+        raw: path,
+    }
+}
+
 /// JS: guardHookCommand(quotedPath, provider), launcher edition, in the
 /// shape the public build's `transformers/hooks.js` `guardedLauncher` emits:
 /// `[ ! -f X ] || X <verb>` (not `|| true`, so the launcher's exit code, and
@@ -182,7 +195,7 @@ pub fn hook_command(quoted: &QuotedPath, provider: &str, win32: bool) -> String 
     let q = match (provider, win32) {
         (".gemini", _) => return gemini_hook_command(quoted, verb, win32),
         (".grok", true) => return windows_hook_command(quoted, provider),
-        (".agents", _) | (_, false) => &quoted.posix,
+        (".agents", _) | (".github", _) | (_, false) => &quoted.posix,
         (_, true) => &quoted.win32,
     };
     format!("[ ! -f {q} ] || {q} {verb}")
@@ -221,7 +234,12 @@ pub fn windows_hook_command(quoted: &QuotedPath, provider: &str) -> String {
 
 /// JS: rewriteHookCommandsForSkillRoot(value, provider, {skillRoot, absolute})
 pub fn rewrite_hook_commands_for_skill_root(value: &Value, provider: &str, skill_root: &str, absolute: bool) -> Value {
-    let Some(quoted) = quoted_launcher_path(skill_root, provider, absolute) else {
+    let quoted = if provider == ".github" && absolute {
+        Some(quoted_github_user_launcher())
+    } else {
+        quoted_launcher_path(skill_root, provider, absolute)
+    };
+    let Some(quoted) = quoted else {
         return value.clone();
     };
     rewrite_value(value, provider, &quoted, cfg!(windows))
@@ -230,7 +248,12 @@ pub fn rewrite_hook_commands_for_skill_root(value: &Value, provider: &str, skill
 /// `rewrite_hook_commands_for_skill_root` with the platform made explicit
 /// (tests drive the Windows form from any host).
 pub fn rewrite_hook_commands_for_platform(value: &Value, provider: &str, skill_root: &str, absolute: bool, win32: bool) -> Value {
-    let Some(quoted) = quoted_launcher_path(skill_root, provider, absolute) else {
+    let quoted = if provider == ".github" && absolute {
+        Some(quoted_github_user_launcher())
+    } else {
+        quoted_launcher_path(skill_root, provider, absolute)
+    };
+    let Some(quoted) = quoted else {
         return value.clone();
     };
     rewrite_value(value, provider, &quoted, win32)
