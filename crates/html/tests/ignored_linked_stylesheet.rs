@@ -7,8 +7,11 @@ fn ids(waive_sheet: bool) -> Vec<String> {
 }
 
 fn media_ids(waive_sheet: bool, media: &str, inline: &str) -> Vec<String> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
+    let sequence = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
-        "impeccable-ignored-sheet-{}-{waive_sheet}-{media}",
+        "impeccable-ignored-sheet-{}-{sequence}",
         std::process::id()
     ));
     std::fs::create_dir_all(dir.join("vendor")).unwrap();
