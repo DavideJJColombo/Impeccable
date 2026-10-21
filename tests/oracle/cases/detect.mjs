@@ -127,6 +127,26 @@ function Thumb({ url }: { url?: string }) {
 
     // Flag surface and errors
     { id: 'detect-help', verb: 'detect', args: ['--help'] },
+    { id: 'detect-github-json', verb: 'detect', args: ['--github', '--json'] },
+    { id: 'detect-github-list-rules', verb: 'detect', args: ['--list-rules', '--github'] },
+    {
+      id: 'detect-github', verb: 'detect',
+      setup: (ws) => fs.writeFileSync(
+        path.join(ws, 'card.html'),
+        '<div style="border-left: 4px solid #ff0000; border-radius: 10px">x</div>\n',
+      ),
+      args: ['--no-config', '--github', 'card.html'],
+    },
+    {
+      id: 'detect-github-clean', verb: 'detect',
+      setup: (ws) => fs.writeFileSync(path.join(ws, 'ok.css'), 'body { margin: 0; }\n'),
+      args: ['--no-config', '--github', 'ok.css'],
+    },
+    { id: 'detect-list-rules', verb: 'detect', args: ['--list-rules'] },
+    { id: 'detect-list-rules-json', verb: 'detect', args: ['--list-rules', '--json'] },
+    { id: 'detect-list-rules-quiet', verb: 'detect', args: ['--list-rules', '--quiet'] },
+    { id: 'detect-list-rules-with-target', verb: 'detect', args: ['--list-rules', 'src/'] },
+    { id: 'detect-list-rules-with-cdp', verb: 'detect', args: ['--list-rules', '--cdp', '9222'] },
     { id: 'detect-no-args', verb: 'detect', args: [] },
     { id: 'detect-missing-file', verb: 'detect', args: ['--no-config', 'does-not-exist.html'] },
     { id: 'detect-missing-file-json', verb: 'detect', args: ['--no-config', '--json', 'does-not-exist.html'] },
@@ -224,6 +244,37 @@ function Thumb({ url }: { url?: string }) {
       },
       args: ['--json', 'index.html'],
     },
+
+    // #1087: a linked stylesheet that detector.ignoreFiles waives is not
+    // reported again under the page that links it; the page's own <style>
+    // still is.
+    ...[
+      ['detect-linked-sheet-dir-json', null, '.'],
+      ['detect-linked-sheet-dir-ignored-json', ['vendor/**'], '.'],
+      ['detect-linked-sheet-file-ignored-json', ['vendor/**'], 'index.html'],
+    ].map(([id, ignoreFiles, target]) => ({
+      id, verb: 'detect',
+      setup: (ws) => {
+        fs.writeFileSync(path.join(ws, 'package.json'), '{"name":"linked-sheet"}\n');
+        fs.mkdirSync(path.join(ws, 'vendor'));
+        fs.writeFileSync(
+          path.join(ws, 'index.html'),
+          '<!doctype html><html lang="en"><head><meta charset="utf-8"><title>mock</title>\n<style>.band { background: repeating-linear-gradient(45deg, #111 0 10px, #eee 10px 20px); }</style>\n<link rel="stylesheet" href="vendor/lib.css"></head><body><main><h1>Mock</h1></main></body></html>\n',
+        );
+        fs.writeFileSync(
+          path.join(ws, 'vendor', 'lib.css'),
+          '.unused-text { background-image: linear-gradient(90deg, #f00, #00f); background-clip: text; -webkit-background-clip: text; color: transparent; }\n',
+        );
+        if (ignoreFiles) {
+          fs.mkdirSync(path.join(ws, '.impeccable'));
+          fs.writeFileSync(
+            path.join(ws, '.impeccable', 'config.json'),
+            JSON.stringify({ detector: { ignoreFiles } }) + '\n',
+          );
+        }
+      },
+      args: ['--json', target],
+    })),
 
     // A DESIGN.md that declares a purple switches ai-color-palette's
     // purple/violet forms off for its project, in the static and the regex

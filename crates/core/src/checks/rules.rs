@@ -81,6 +81,16 @@ impl Default for DeclaredCorners {
     }
 }
 
+/// Whether a declaration's property sets a radius: its lowercase name ends in
+/// `radius`. Corner longhands round the box, so they count; a custom property
+/// (`--btn-radius`) or a preprocessor variable (`$radius`, `@radius`) only
+/// names a value and does not.
+pub fn is_radius_property(prop: &str) -> bool {
+    !prop.starts_with("--")
+        && prop.starts_with(|c: char| c.is_ascii_alphabetic() || c == '-')
+        && prop.to_ascii_lowercase().ends_with("radius")
+}
+
 impl DeclaredCorners {
     /// Every corner at once, the way the `border-radius` shorthand sets them.
     pub fn set_all(&mut self, corners: Option<Corners>) {
@@ -547,7 +557,7 @@ fn is_styled_control(opts: &ColorOpts, bg_image: &str) -> bool {
 /// Whether `check_colors` answers from `safe_tag_text_contrast` rather than
 /// from the full pass, which is the set of findings the per-page dedupe
 /// owns.
-fn scores_safe_tag_text(opts: &ColorOpts) -> bool {
+pub(crate) fn scores_safe_tag_text(opts: &ColorOpts) -> bool {
     set_has(SAFE_TAGS, opts.tag.as_str())
         && !is_styled_control(opts, opts.bg_image.as_deref().unwrap_or(""))
 }
@@ -814,6 +824,10 @@ pub fn is_declared_purple(c: &Rgba) -> bool {
     (250.0..=320.0).contains(&hue)
 }
 
+/// The HSL saturation large non-heading text needs before its violet counts
+/// as the purple-text tell.
+const PURPLE_LARGE_TEXT_MIN_SATURATION: f64 = 0.3;
+
 /// JS: checks.mjs#checkColors
 pub fn check_colors(opts: &ColorOpts) -> Vec<RuleHit> {
     let tag = opts.tag.as_str();
@@ -842,7 +856,13 @@ pub fn check_colors(opts: &ColorOpts) -> Vec<RuleHit> {
 
         if has_chroma(Some(&text_color), Some(50.0)) {
             let hue = get_hue(Some(&text_color));
-            if hue >= 260.0 && hue <= 310.0 && (is_heading_123(tag) || opts.font_size >= 20.0) {
+            // Large type that is not a heading reports only when it reads as
+            // purple: a muted lavender-gray subtitle (v0-memorial's
+            // `#7a6699`, HSL saturation 0.2) measures violet and reads as
+            // neutral secondary text.
+            let large_and_saturated = opts.font_size >= 20.0
+                && lightness_saturation(&text_color).1 >= PURPLE_LARGE_TEXT_MIN_SATURATION;
+            if hue >= 260.0 && hue <= 310.0 && (is_heading_123(tag) || large_and_saturated) {
                 findings.push(RuleHit::new(
                     "ai-color-palette",
                     format!(
@@ -1053,7 +1073,15 @@ fn safe_tag_text_contrast(opts: &ColorOpts) -> Vec<RuleHit> {
     let Some(text_color) = opts.text_color else {
         return Vec::new();
     };
-    if resolved_bg_matches_text(opts, &text_color) {
+    // The browser engine has layout, and says whether a surface in exactly
+    // the ink's colour is one the text does not sit on
+    // (`same_color_surface_is_unread`), as the full pass asks. Where the
+    // stacks confirm the text sits on it, the `1.0:1` is real: a white link
+    // on its white card (v0-memorialqrwebsitecode-90's "Start Chat"). The
+    // static engine has no layout, and the coincidence is all it has.
+    if resolved_bg_matches_text(opts, &text_color)
+        && (!opts.detector_is_browser || opts.same_color_surface_is_unread)
+    {
         return Vec::new();
     }
     contrast_findings(opts, &text_color)
@@ -2830,6 +2858,30 @@ mod tests {
     }
 
     #[test]
+    fn the_safe_tag_guard_asks_the_browser_engine() {
+        let white = Rgba::new(255.0, 255.0, 255.0, 1.0);
+        let opts = |browser: bool, guard: bool| ColorOpts {
+            tag: "a".to_string(),
+            text_color: Some(white),
+            effective_bg: Some(white),
+            font_size: 18.0,
+            font_weight: 500.0,
+            has_direct_text: true,
+            paints_own_text: true,
+            detector_is_browser: browser,
+            same_color_surface_is_unread: guard,
+            ..Default::default()
+        };
+        let flags = |o: &ColorOpts| check_colors(o).iter().any(|h| h.id == "low-contrast");
+        // A white link on a white card the stacks confirm: reported.
+        assert!(flags(&opts(true, false)));
+        // The surface is one the text does not sit on, or the engine has no
+        // layout to say: no verdict.
+        assert!(!flags(&opts(true, true)));
+        assert!(!flags(&opts(false, false)));
+    }
+
+    #[test]
     fn the_full_pass_guard_is_opt_in() {
         let white = Rgba::new(255.0, 255.0, 255.0, 1.0);
         let opts = |guard: bool| ColorOpts {
@@ -3189,6 +3241,36 @@ mod tests {
             glyph.iter().all(|h| h.id != "low-contrast" && h.id != "gray-on-color"),
             "{glyph:?}"
         );
+    }
+
+    /// observations-1004 row 24 (v0-memorial 10046886): a 20px subtitle in
+    /// a muted lavender gray (`#7a6699`, HSL saturation 0.2) is neutral
+    /// text. A saturated violet at that size, and the muted one on an h2,
+    /// keep the purple-text finding.
+    #[test]
+    fn purple_text_on_large_copy_needs_saturation() {
+        let purple = |tag: &str, ink: Rgba| {
+            check_colors(&ColorOpts {
+                tag: tag.to_string(),
+                text_color: Some(ink),
+                effective_bg: Some(Rgba::new(255.0, 255.0, 255.0, 1.0)),
+                visible_text: Some(ink),
+                font_size: 20.0,
+                font_weight: 400.0,
+                has_direct_text: true,
+                bg_clip: Some("border-box".to_string()),
+                bg_image: Some("none".to_string()),
+                ..Default::default()
+            })
+            .into_iter()
+            .filter(|h| h.id == "ai-color-palette")
+            .count()
+        };
+        let muted = Rgba::new(122.0, 102.0, 153.0, 1.0);
+        let violet = Rgba::new(124.0, 58.0, 237.0, 1.0);
+        assert_eq!(purple("p", muted), 0, "muted lavender subtitle");
+        assert_eq!(purple("p", violet), 1, "violet-600 subtitle");
+        assert_eq!(purple("h2", muted), 1, "a heading keeps its reading");
     }
 
     #[test]

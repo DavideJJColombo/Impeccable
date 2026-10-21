@@ -1238,4 +1238,52 @@ describe('live-browser source contracts', () => {
       assert.doesNotMatch(handler, /e\.key === 'Enter'(?! && !isImeKeydown\(e\))/);
     }
   });
+
+  // Issue #1055: secure-context-only APIs must not be called unguarded, or
+  // live mode dies on plain-HTTP LAN / Tailscale / custom-hostname origins.
+  it('never calls crypto.randomUUID directly in the live overlay', () => {
+    assert.doesNotMatch(SOURCE, /crypto\.randomUUID\(/);
+  });
+
+  it('guards navigator.clipboard and falls back to execCommand copy', () => {
+    const body = SOURCE.match(/function copyToClipboard\(text\) \{[\s\S]*?\n  \}/)?.[0];
+    assert.ok(body);
+    assert.match(body, /navigator\.clipboard && typeof navigator\.clipboard\.writeText === 'function'/);
+    assert.match(body, /copyTextViaSelection\(text\)/);
+    // The fallback is the modal-aware DOM helper (tests/live-top-layer.test.mjs
+    // drives it under an open dialog), not a textarea on <body>.
+    assert.doesNotMatch(SOURCE, /execCommand\('copy'\)/);
+  });
+
+  it('resets the init guard when session state cannot be created', () => {
+    const boot = SOURCE.slice(0, SOURCE.indexOf('const HIGHLIGHT_TRANSITION'));
+    assert.match(boot, /catch \(err\) \{[\s\S]*?__IMPECCABLE_LIVE_INIT__ = false;/);
+  });
+
+  it('never auto-focuses live inputs on a touch-primary device (#1067)', () => {
+    const touch = SOURCE.match(/function touchPrimary\(\) \{[\s\S]*?\n  \}/)?.[0];
+    const sync = SOURCE.match(/function syncPageChatFocus\(reason\) \{[\s\S]*?\n  \}/)?.[0];
+    assert.ok(touch && sync);
+    const run = (coarse, state) => {
+      const calls = [];
+      const fn = runInNewContext(`${touch}\n(${sync})`, {
+        window: { matchMedia: (q) => ({ matches: coarse && q === '(pointer: coarse)' }) },
+        steerFocusLog: () => {},
+        state,
+        shouldSteerAutoFocus: () => true,
+        focusConfigureInput: () => calls.push('configure'),
+        focusSteerChat: () => calls.push('steer'),
+      });
+      fn('test');
+      return calls;
+    };
+    assert.deepEqual(run(true, 'IDLE'), []);
+    assert.deepEqual(run(true, 'CONFIGURING'), []);
+    assert.deepEqual(run(false, 'IDLE'), ['steer']);
+    assert.deepEqual(run(false, 'CONFIGURING'), ['configure']);
+    const lines = SOURCE.match(/if \(!controlsLocked && !touchPrimary\(\)\) setTimeout\(\(\) => input\.focus\(\), 60\);/g);
+    assert.equal(lines?.length, 2, 'both configure rows skip auto-focus on touch');
+    assert.match(SOURCE, /if \(keepExpanded && touchPrimary\(\)\) preparePageChatInputForTyping\(\);/);
+  });
 });
+
