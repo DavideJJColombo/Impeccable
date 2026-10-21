@@ -959,7 +959,7 @@ fn scan_targets(
             continue;
         };
         if stat.is_dir() {
-            if !ctx.json_mode && !ctx.quiet_mode {
+            if !ctx.json_mode && !ctx.quiet_mode && !ctx.github_mode {
                 if let Some(fw) = detect_framework_config(&resolved) {
                     ctx.dev_server_ports.insert(fw.port);
                     let probe = is_port_listening(fw.port, Some(fw.fingerprint));
@@ -1004,7 +1004,7 @@ fn scan_targets(
                 .iter()
                 .filter(|f| uses_html_engine(f, &ctx.config.extensions))
                 .count();
-            if files.len() > 50 && ctx.stdin_tty && !ctx.json_mode && !ctx.quiet_mode && !ctx.github_mode {
+            if files.len() > 50 && ctx.stdin_tty && !ctx.json_mode && !ctx.quiet_mode {
                 ctx.io.err(&format!(
                     "\nFound {} files ({} HTML) in {}.\nScanning may take a while{}.\nTarget a specific subdirectory to narrow scope.\n",
                     files.len(),

@@ -236,3 +236,34 @@ fn github_skips_the_regex_only_note() {
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+fn stage_framework_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("impeccable-gh-fw-{tag}-{}", std::process::id()));
+    stage_card(&dir);
+    // An unlikely port keeps the probe from finding a real dev server.
+    std::fs::write(dir.join("next.config.js"), "module.exports = { port: 59871 };\n").unwrap();
+    dir
+}
+
+#[test]
+fn github_skips_the_framework_note() {
+    let dir = stage_framework_dir("gh");
+    let (code, _out, err) = run_with(
+        &dir,
+        &["--no-config", "--github", "."],
+        &CannedHtml(vec![]),
+        HashMap::new(),
+    );
+    assert_eq!(code, 0, "{err}");
+    assert!(!err.contains("project detected"), "{err}");
+    assert!(!err.contains("dev server detected"), "{err}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn text_mode_prints_the_framework_note() {
+    let dir = stage_framework_dir("text");
+    let (_code, _out, err) = run_with(&dir, &["--no-config", "."], &CannedHtml(vec![]), HashMap::new());
+    assert!(err.contains("Next.js"), "{err}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
