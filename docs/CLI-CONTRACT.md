@@ -93,7 +93,8 @@ Notation: `stdout>` / `stderr>` are literal writes; `exit N`; template strings u
 | Flag | Effect |
 |---|---|
 | `--json` | JSON output to **stdout** |
-| `--quiet` | text mode prints only summary line(s) to stderr |
+| `--quiet` | text mode prints only summary line(s) to stderr; under `--list-rules` it instead prints one rule id per line to **stdout** |
+| `--list-rules` | print every registered rule (`all_antipatterns()`: the built-ins plus any installed rule pack) and **exit 0** without scanning. Catalog goes to **stdout**. `--json` pretty-prints an array of `{id,name,category,severity,scopes,description}` (plus `advisory: true` on advisory rules). `--quiet` prints one rule id per line. `--scope` and `--no-advisory` filter the catalog the same way they filter a scan; config ignores (`ignoreRules`) are not applied, so the catalog lists rules a project has switched off. A positional target or `--cdp` with it → `stderr> Error: --list-rules prints the rule catalog and takes no file, URL, or --cdp scan\n`, `exit 1`. Evaluated after `--help` (so `--list-rules --help` prints usage) |
 | `--help` | print usage (stdout) and `exit 0` — evaluated *after* scope/viewport parsing (so a bad `--scope` still errors first) |
 | `--no-advisory` | drop findings with `advisory === true` before output/exit-code |
 | `--no-consent-hiding` | URL scans only (Rust engine): leave known consent managers' banners on the page instead of hiding them before the scan (see **Consent banners** under URL scans). No effect on file scans |
@@ -118,6 +119,8 @@ Scan files or URLs for UI anti-patterns and design quality issues.
 Options:
   --json              Output results as JSON
   --quiet             In text mode, only print the final findings count
+  --list-rules        Print the detector rule catalog and exit. --json
+                      for JSON, --quiet for ids only. Takes no targets
   --scope <name>      Only report rules in the given design domain
                       (type, layout). Comma-separated.
   --viewport <WxH>    Browser viewport for URL scans (default 1280x800),
@@ -150,6 +153,7 @@ Advisory findings:
 Output streams:
   Human-readable findings go to stderr so stdout stays available for structured
   output. Use --json for JSON on stdout, or redirect text with 2> findings.txt.
+  --list-rules writes the catalog to stdout (no scan).
 
 Exit status:
   0  Scan completed with no primary findings (advisories may still be listed)
@@ -184,6 +188,7 @@ Examples:
   impeccable detect https://example.com
   impeccable detect --cdp 9222 --target "My App" --json
   impeccable detect --json .
+  impeccable detect --list-rules
   impeccable detect --no-config src/
 ```
 

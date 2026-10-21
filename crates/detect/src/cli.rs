@@ -21,6 +21,10 @@ use crate::file_system::{
     walk_dir_reporting,
 };
 use crate::jsp;
+use crate::list_rules::{
+    collect_catalog_rules, format_list_rules_ids, format_list_rules_json, format_list_rules_text,
+    LIST_RULES_SCAN_ERROR,
+};
 use crate::util::{exists, re, D};
 
 pub const USAGE: &str = "Usage: impeccable detect [options] [file-or-dir-or-url...]
@@ -30,6 +34,8 @@ Scan files or URLs for UI anti-patterns and design quality issues.
 Options:
   --json              Output results as JSON
   --quiet             In text mode, only print the final findings count
+  --list-rules        Print the detector rule catalog and exit. --json
+                      for JSON, --quiet for ids only. Takes no targets
   --scope <name>      Only report rules in the given design domain
                       (type, layout). Comma-separated.
   --viewport <WxH>    Browser viewport for URL scans (default 1280x800),
@@ -62,6 +68,7 @@ Advisory findings:
 Output streams:
   Human-readable findings go to stderr so stdout stays available for structured
   output. Use --json for JSON on stdout, or redirect text with 2> findings.txt.
+  --list-rules writes the catalog to stdout (no scan).
 
 Exit status:
   0  Scan completed with no primary findings (advisories may still be listed)
@@ -96,6 +103,7 @@ Examples:
   impeccable detect https://example.com
   impeccable detect --cdp 9222 --target \"My App\" --json
   impeccable detect --json .
+  impeccable detect --list-rules
   impeccable detect --no-config src/
 ";
 
@@ -632,6 +640,21 @@ fn detect_cli(args_in: &[String], io: &mut Io, engines: &Engines) -> Result<i32,
 
     if help_mode {
         io.out(USAGE);
+        return Ok(0);
+    }
+    if has(&args, "--list-rules") {
+        if cdp.is_some() || !targets.is_empty() {
+            io.err(LIST_RULES_SCAN_ERROR);
+            return Err(Exit(1));
+        }
+        let rules = collect_catalog_rules(&scopes, no_advisory);
+        if json_mode {
+            io.out(&format!("{}\n", format_list_rules_json(&rules)));
+        } else if quiet_mode {
+            io.out(&format_list_rules_ids(&rules));
+        } else {
+            io.out(&format_list_rules_text(&rules));
+        }
         return Ok(0);
     }
     if cdp.is_some() && !targets.is_empty() {
