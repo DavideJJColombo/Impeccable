@@ -7,7 +7,8 @@ use impeccable_core::checks::css_scan::{
     CssHostIndex,
 };
 use impeccable_core::checks::rules::{
-    find_gray_on_color_bg, find_solid_chromatic_bg, is_near_black_neutral_class, DeclaredCorners, NOMINAL_CARD_WIDTH_PX,
+    find_gray_on_color_bg, find_solid_chromatic_bg, is_near_black_neutral_class, is_radius_property,
+    DeclaredCorners, NOMINAL_CARD_WIDTH_PX,
 };
 use impeccable_core::color::is_neutral_color;
 use impeccable_core::constants::{EM_DASH_CHARS_PER_DASH, EM_DASH_FLOOR, OVERUSED_FONTS};
@@ -863,6 +864,26 @@ fn brace_scope_corners(
     index: usize,
     base: DeclaredCorners,
 ) -> DeclaredCorners {
+    let (chunks, unknown) = brace_scope_statements(source, i, index);
+    let mut corners = if unknown {
+        DeclaredCorners::unknown()
+    } else {
+        base
+    };
+    for (statements, theme_scale) in chunks.iter().rev() {
+        apply_statements(&mut corners, statements, *theme_scale);
+    }
+    corners
+}
+
+/// The statement chunks [`brace_scope_corners`] reads, innermost scope first,
+/// each with whether it is a theme-scale object, and whether the walk could
+/// not name the element.
+fn brace_scope_statements(
+    source: &SourceText,
+    i: usize,
+    index: usize,
+) -> (Vec<(Vec<String>, bool)>, bool) {
     let text = source.text.as_str();
     let b = text.as_bytes();
     let (mut start, mut end, mut open) = block_bounds(b, source.line_starts[i] + index);
@@ -898,19 +919,11 @@ fn brace_scope_corners(
         }
         (start, end, open) = block_bounds(b, selector_start);
     }
-    let mut corners = if unknown {
-        DeclaredCorners::unknown()
-    } else {
-        base
-    };
-    for &(s, e, object) in chunks.iter().rev() {
-        apply_statements(
-            &mut corners,
-            &split_statements(&text[s..e], object),
-            object && theme_scale,
-        );
-    }
-    corners
+    let chunks = chunks
+        .iter()
+        .map(|&(s, e, object)| (split_statements(&text[s..e], object), object && theme_scale))
+        .collect();
+    (chunks, unknown)
 }
 
 /// The indentation-syntax Sass reading of [`brace_scope_corners`]: the lines
@@ -921,6 +934,21 @@ fn brace_scope_corners(
 /// Otherwise the statements apply over `base`: the cascade's `0`, or unknown
 /// corners to learn which ones the scope declares.
 fn sass_scope_corners(source: &SourceText, i: usize, base: DeclaredCorners) -> DeclaredCorners {
+    let (chunks, unknown) = sass_scope_statements(source, i);
+    let mut corners = if unknown {
+        DeclaredCorners::unknown()
+    } else {
+        base
+    };
+    for statements in chunks.iter().rev() {
+        apply_statements(&mut corners, statements, false);
+    }
+    corners
+}
+
+/// The statement chunks [`sass_scope_corners`] reads, innermost scope first,
+/// and whether an interpolated parent selector made the scope unknown.
+fn sass_scope_statements(source: &SourceText, i: usize) -> (Vec<Vec<String>>, bool) {
     let indent = |l: &str| l.len() - l.trim_start().len();
     let blank = |l: &str| l.trim().is_empty();
     let mut chunks: Vec<Vec<String>> = Vec::new();
@@ -981,15 +1009,7 @@ fn sass_scope_corners(source: &SourceText, i: usize, base: DeclaredCorners) -> D
         }
         at = pj;
     }
-    let mut corners = if unknown {
-        DeclaredCorners::unknown()
-    } else {
-        base
-    };
-    for statements in chunks.iter().rev() {
-        apply_statements(&mut corners, statements, false);
-    }
-    corners
+    (chunks, unknown)
 }
 
 /// Whether a `side-tab` match is the stripe-child form: a narrow coloured
@@ -1087,6 +1107,107 @@ pub fn side_tab_known_square_in_sheet<'s>(
     index
         .get_or_init(|| CssHostIndex::new(index_text))
         .is_declaration_known_square(source.offset(i, m.index), side, sheet)
+}
+
+/// Whether some statement declares a radius. A statement that might bring
+/// one in unseen (a mixin, `@apply`) is not one.
+fn declares_radius(statements: &[String]) -> bool {
+    statements.iter().any(|s| {
+        !is_unseen_declaration_source(s)
+            && split_declaration(s).is_some_and(|(prop, _)| is_radius_property(&prop))
+    })
+}
+
+/// The text a stylesheet index is built on for the match at `at` on line `i`:
+/// the source itself in stylesheet text, a component file's blanked `<style>`
+/// text (`style_text`) when the match sits inside one, `None` in markup.
+pub fn style_index_text<'s>(
+    block_context: bool,
+    source: &'s SourceText,
+    i: usize,
+    at: usize,
+    style_text: Option<&'s (String, Vec<(usize, usize)>)>,
+) -> Option<&'s str> {
+    if block_context {
+        return Some(source.text());
+    }
+    let pos = source.offset(i, at);
+    let (text, spans) = style_text?;
+    spans
+        .iter()
+        .any(|(s, e)| *s <= pos && pos <= *e)
+        .then_some(text.as_str())
+}
+
+/// What a file contributes to [`Scope::element_declares_radius`]: the pieces
+/// to read a match's own element, built only when a matcher asks.
+pub struct ElementSource<'a, 's> {
+    pub lines: &'a [&'a str],
+    pub source: &'s once_cell::unsync::OnceCell<SourceText>,
+    pub index: &'a once_cell::unsync::OnceCell<CssHostIndex<'s>>,
+    pub i: usize,
+    pub block_context: bool,
+    pub sass: bool,
+    pub style_text: Option<&'s (String, Vec<(usize, usize)>)>,
+}
+
+/// What a [`Matcher`]'s `test` reads: dereferenced it is the match's context
+/// text, the line or in stylesheet text the lines around it, and
+/// [`element_declares_radius`](Self::element_declares_radius) answers from
+/// the stylesheet instead of the distance between lines.
+pub struct Scope<'a, 's> {
+    text: &'a str,
+    element: Option<ElementSource<'a, 's>>,
+}
+
+impl<'a, 's> Scope<'a, 's> {
+    /// A scope over markup text alone.
+    #[cfg(test)]
+    pub fn line(text: &'a str) -> Self {
+        Scope { text, element: None }
+    }
+
+    pub fn in_file(text: &'a str, element: ElementSource<'a, 's>) -> Self {
+        Scope {
+            text,
+            element: Some(element),
+        }
+    }
+
+    /// Whether a radius declaration styles the match's own element, or `None`
+    /// where the match is in markup and has no stylesheet to read. Braces
+    /// syntax reads the match's own rule scope, so a radius on a
+    /// pseudo-element rule that holds the accent counts, and asks the
+    /// stylesheet's [`CssHostIndex`] for the rules tied to the match's box,
+    /// the way side-tab does. Indented Sass reads its own scope. A scope the
+    /// reader cannot see through asserts nothing.
+    pub fn element_declares_radius(&self, m: &MatchCtx) -> Option<bool> {
+        let e = self.element.as_ref()?;
+        let source = e.source.get_or_init(|| SourceText::new(e.lines));
+        let index_text = style_index_text(e.block_context, source, e.i, m.index, e.style_text)?;
+        if e.sass {
+            let (chunks, _) = sass_scope_statements(source, e.i);
+            return Some(chunks.iter().any(|c| declares_radius(c)));
+        }
+        let index = e.index.get_or_init(|| CssHostIndex::new(index_text));
+        let pos = source.offset(e.i, m.index);
+        // With no brace or template quote before it the text around the match
+        // is not one scope; the index holds a template's top-level declarations.
+        let in_block = block_bounds(source.text().as_bytes(), pos).0 > 0;
+        let own_scope = in_block && {
+            let (chunks, _) = brace_scope_statements(source, e.i, m.index);
+            chunks.iter().any(|(statements, _)| declares_radius(statements))
+        };
+        Some(own_scope || index.declaration_declares_radius(pos))
+    }
+}
+
+impl std::ops::Deref for Scope<'_, '_> {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        self.text
+    }
 }
 
 re!(MARKUP_TAG_NAME_RE, r"^<([A-Za-z][-\w.:]*)".to_string());
@@ -1258,7 +1379,7 @@ pub struct Matcher {
     pub id: &'static str,
     /// Match every occurrence on one line, in order.
     pub find_all: fn(&str) -> Vec<MatchCtx>,
-    pub test: fn(&MatchCtx, &str) -> bool,
+    pub test: fn(&MatchCtx, &Scope) -> bool,
     pub fmt: fn(&MatchCtx, &str) -> String,
 }
 
@@ -1630,43 +1751,193 @@ re!(
     CUBIC_BEZIER_RE,
     format!("cubic-bezier\\({WS}*([0-9.-]+){WS}*,{WS}*([0-9.-]+){WS}*,{WS}*([0-9.-]+){WS}*,{WS}*([0-9.-]+){WS}*\\)")
 );
-re!(
-    BROKEN_IMG_SRC_RE,
-    format!(
-        "<{img}{B}[^>]*?{B}{src}{WS}*={WS}*(?:\"\"|''|\"{WS}+\"|'{WS}+'|\"#\"|'#')",
-        img = ci("img"),
-        src = ci("src")
-    )
-);
 re!(IMG_OPEN_RE, format!("<{}{B}", ci("img")));
-re!(SRC_ATTR_RE, format!("{B}{}{WS}*=", ci("src")));
 
-/// Hand-written port of `/<img\b(?:(?!\bsrc\s*=)[^>])*>/gi`.
-fn find_img_without_src(line: &str) -> Vec<MatchCtx> {
+/// Read attributes, not substrings of an attribute value or expression.
+/// Dynamic bindings/spreads cannot establish a missing source statically.
+pub(crate) fn image_source_is_missing(tag: &str, ext: &str) -> bool {
+    let shorthand = matches!(ext, ".svelte" | ".astro");
+    let vue = ext == ".vue";
+    let b = tag.as_bytes();
+    let mut p = 4; // <img
+    while p < b.len() {
+        while p < b.len() && (b[p].is_ascii_whitespace() || b[p] == b'/') { p += 1; }
+        if p >= b.len() || b[p] == b'>' { break; }
+        if b[p] == b'{' {
+            let Some(close) = matching_close(b, p) else { return false; };
+            let expression = tag[p + 1..close].trim();
+            if shorthand && (expression == "src" || expression.starts_with("...")) {
+                return false;
+            }
+            // JSX spreads also leave the source unknown.
+            if matches!(ext, ".jsx" | ".tsx" | ".js") && expression.starts_with("...") {
+                return false;
+            }
+            p = close + 1;
+            continue;
+        }
+        let start = p;
+        while p < b.len() && !b[p].is_ascii_whitespace() && !matches!(b[p], b'=' | b'>' | b'/') { p += 1; }
+        let name = &tag[start..p];
+        while p < b.len() && b[p].is_ascii_whitespace() { p += 1; }
+        let source = names_image_source(name);
+        let directive = name.contains(':');
+        if vue && ((source && directive) || name == "v-bind") {
+            return false;
+        }
+        if p >= b.len() || b[p] != b'=' {
+            // Svelte `bind:src` alone is shorthand for `bind:src={src}`;
+            // a bare `src` is still empty.
+            if source && directive { return false; }
+            continue;
+        }
+        p += 1;
+        while p < b.len() && b[p].is_ascii_whitespace() { p += 1; }
+        let value_start = p;
+        let value = if p < b.len() && matches!(b[p], b'\'' | b'"') {
+            let quote = b[p];
+            p += 1;
+            let start = p;
+            while p < b.len() && b[p] != quote { p += 1; }
+            let value = &tag[start..p];
+            p = (p + 1).min(b.len());
+            Some(value)
+        } else if p < b.len() && b[p] == b'{' {
+            p = matching_close(b, p).map(|close| close + 1).unwrap_or(b.len());
+            None
+        } else {
+            while p < b.len() && !b[p].is_ascii_whitespace() && b[p] != b'>' { p += 1; }
+            Some(&tag[value_start..p])
+        };
+        // Any source with a value, or bound to an expression, is present.
+        let empty = value.is_some_and(|v| v.trim().is_empty() || v.trim() == "#");
+        if source && !empty {
+            return false;
+        }
+    }
+    true
+}
+
+/// `src`, a binding of it (`:src`, `v-bind:src`, Svelte `bind:src`, Vue
+/// modifiers), or an alias such as lazy loading's `data-src`, all of which
+/// the original `\bsrc\s*=` matcher accepted.
+fn names_image_source(name: &str) -> bool {
+    let base = name.split('.').next().unwrap_or(name);
+    base.eq_ignore_ascii_case("src")
+        || base
+            .rsplit_once(|c| c == ':' || c == '-')
+            .is_some_and(|(_, last)| last.eq_ignore_ascii_case("src"))
+}
+
+/// How far a tag may run past its `<img`, so an unclosed one costs little.
+const MAX_IMG_TAG_BYTES: usize = 8 * 1024;
+
+enum TagScan {
+    /// The tag's closing `>`.
+    End(usize),
+    /// The probe sits in a quoted attribute value or an expression's string.
+    Hidden,
+    /// The probe sits in an expression as code (nested JSX).
+    Visible,
+    NotATag,
+}
+
+/// Walk the markup tag opened at `start`. Attribute quotes close at the next
+/// matching quote with no escapes (HTML, Svelte, Vue and JSX strings alike),
+/// `{...}` expressions follow JS rules, and a top-level `<` means the text
+/// was never a tag.
+fn scan_markup_tag(b: &[u8], start: usize, probe: Option<usize>) -> TagScan {
+    let inside = |open: usize, close: usize| probe.filter(|x| *x > open && *x < close);
+    let mut p = start + 1;
+    while p < b.len() {
+        match b[p] {
+            b'>' => return TagScan::End(p),
+            b'<' => return TagScan::NotATag,
+            quote @ (b'"' | b'\'') => {
+                let Some(close) = b[p + 1..].iter().position(|c| *c == quote) else {
+                    return TagScan::NotATag;
+                };
+                let close = p + 1 + close;
+                if inside(p, close).is_some() {
+                    return TagScan::Hidden;
+                }
+                p = close + 1;
+            }
+            b'{' => {
+                let Some(close) = matching_close(b, p) else { return TagScan::NotATag; };
+                if let Some(x) = inside(p, close) {
+                    return if in_js_string(&b[p..x]) { TagScan::Hidden } else { TagScan::Visible };
+                }
+                p = close + 1;
+            }
+            _ => p += 1,
+        }
+    }
+    TagScan::NotATag
+}
+
+fn in_js_string(b: &[u8]) -> bool {
+    let mut quote = None;
+    let mut p = 0;
+    while p < b.len() {
+        match (quote, b[p]) {
+            (Some(_), b'\\') => p += 1,
+            (Some(q), c) if c == q => quote = None,
+            (None, c @ (b'"' | b'\'' | b'`')) => quote = Some(c),
+            _ => {}
+        }
+        p += 1;
+    }
+    quote.is_some()
+}
+
+/// A candidate inside the quoted attribute of an earlier tag on its line is
+/// text, even when the quote closes on a later line; one in a JSX attribute
+/// expression is a real nested element.
+fn hidden_in_parent_tag(text: &[u8], at: usize) -> bool {
+    let window = &text[..text.len().min(at + MAX_IMG_TAG_BYTES)];
+    let mut i = 0;
+    while i < at {
+        if text[i] == b'<' && text.get(i + 1).is_some_and(|c| c.is_ascii_alphabetic()) {
+            match scan_markup_tag(window, i, Some(at)) {
+                TagScan::Hidden => return true,
+                TagScan::Visible => return false,
+                TagScan::End(end) => {
+                    i = end + 1;
+                    continue;
+                }
+                TagScan::NotATag => {}
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// `text` runs from the start of a line to the end of the file: candidates
+/// start on that line, and a tag may continue on the lines after it.
+pub(crate) fn find_broken_images(text: &str) -> Vec<MatchCtx> {
+    let line = &text[..text.find('\n').unwrap_or(text.len())];
+    let b = text.as_bytes();
     let mut out = Vec::new();
     let mut pos = 0;
     while let Some(m) = IMG_OPEN_RE.find_at(line, pos) {
-        let run_start = m.end();
-        let gt = line[run_start..].find('>').map(|i| i + run_start);
-        match gt {
-            Some(gt) => {
-                let has_src = SRC_ATTR_RE
-                    .find_at(line, run_start)
-                    .map(|s| s.start() < gt)
-                    .unwrap_or(false);
-                if has_src {
-                    pos = m.end();
-                    continue;
-                }
-                out.push(MatchCtx {
-                    groups: vec![Some(line[m.start()..gt + 1].to_string())],
-                    index: m.start(),
-                });
-                pos = gt + 1;
-            }
-            None => {
-                pos = m.end();
-            }
+        pos = m.end();
+        if hidden_in_parent_tag(b, m.start()) { continue; }
+        let window = &b[..b.len().min(m.start() + MAX_IMG_TAG_BYTES)];
+        let TagScan::End(end) = scan_markup_tag(window, m.start(), None) else { continue; };
+        pos = (end + 1).min(line.len());
+        let tag = &text[m.start()..end + 1];
+        if image_source_is_missing(tag, "") {
+            let tag = if tag.contains('\n') {
+                tag.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" ")
+            } else {
+                tag.to_string()
+            };
+            out.push(MatchCtx {
+                groups: vec![Some(tag)],
+                index: m.start(),
+            });
         }
     }
     out
@@ -1770,7 +2041,12 @@ pub static REGEX_MATCHERS: Lazy<Vec<Matcher>> = Lazy::new(|| {
         Matcher {
             id: "border-accent-on-rounded",
             find_all: |l| all(&BORDER_ACCENT_CSS_RE, l),
-            test: |m, line| num(m.g(1)) >= 3.0 && has_border_radius(line),
+            test: |m, scope| {
+                num(m.g(1)) >= 3.0
+                    && scope
+                        .element_declares_radius(m)
+                        .unwrap_or_else(|| has_border_radius(scope))
+            },
             fmt: |m, _| m.whole().to_string(),
         },
         Matcher {
@@ -1867,14 +2143,8 @@ pub static REGEX_MATCHERS: Lazy<Vec<Matcher>> = Lazy::new(|| {
         },
         Matcher {
             id: "broken-image",
-            find_all: |l| all(&BROKEN_IMG_SRC_RE, l),
+            find_all: find_broken_images,
             test: |_, _| true,
-            fmt: |m, _| slice_utf16_start(m.whole(), 100),
-        },
-        Matcher {
-            id: "broken-image",
-            find_all: find_img_without_src,
-            test: |m, _| !SRC_ATTR_RE.is_match(m.whole()),
             fmt: |m, _| slice_utf16_start(m.whole(), 100),
         },
     ]
@@ -2261,7 +2531,7 @@ mod tests {
         let mut out = vec![];
         for m in REGEX_MATCHERS.iter().filter(|m| m.id == id) {
             for c in (m.find_all)(line) {
-                if (m.test)(&c, line) {
+                if (m.test)(&c, &Scope::line(line)) {
                     out.push((m.fmt)(&c, line));
                 }
             }

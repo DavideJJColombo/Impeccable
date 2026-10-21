@@ -267,3 +267,19 @@ fn text_mode_prints_the_framework_note() {
     assert!(err.contains("Next.js"), "{err}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn github_conflicts_with_list_rules() {
+    let dir = std::env::temp_dir().join(format!("impeccable-gh-list-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for args in [&["--list-rules", "--github"][..], &["--list-rules", "--github", "--json"][..]] {
+        let (code, out, err) = run_with(&dir, args, &MissingHtmlEngine, HashMap::new());
+        assert_eq!(code, 1, "{args:?}");
+        assert!(out.is_empty(), "{out}");
+        assert_eq!(
+            err,
+            "Error: --github annotates scan findings and cannot be used with --list-rules\n"
+        );
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}

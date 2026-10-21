@@ -20,6 +20,7 @@ pub mod file_system;
 pub mod github_annotations;
 pub mod ignores;
 pub mod jsp;
+pub mod list_rules;
 pub mod profiler;
 pub mod regex_matchers;
 pub mod skills;

@@ -10,6 +10,8 @@ use impeccable_core::findings::Finding;
 use impeccable_core::js::number_to_string;
 
 pub const GITHUB_JSON_CONFLICT: &str = "Error: --github cannot be used with --json\n";
+pub const GITHUB_LIST_RULES_CONFLICT: &str =
+    "Error: --github annotates scan findings and cannot be used with --list-rules\n";
 
 /// `%` first so a later replacement is not itself percent-encoded.
 pub fn escape_data(value: &str) -> String {

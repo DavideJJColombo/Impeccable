@@ -20,8 +20,14 @@ use crate::file_system::{
     build_import_graph_reporting, detect_framework_config, is_port_listening, uses_html_engine,
     walk_dir_reporting,
 };
-use crate::github_annotations::{format_github_annotations, GITHUB_JSON_CONFLICT};
+use crate::github_annotations::{
+    format_github_annotations, GITHUB_JSON_CONFLICT, GITHUB_LIST_RULES_CONFLICT,
+};
 use crate::jsp;
+use crate::list_rules::{
+    collect_catalog_rules, format_list_rules_ids, format_list_rules_json, format_list_rules_text,
+    LIST_RULES_SCAN_ERROR,
+};
 use crate::util::{exists, re, D};
 
 pub const USAGE: &str = "Usage: impeccable detect [options] [file-or-dir-or-url...]
@@ -32,7 +38,9 @@ Options:
   --json              Output results as JSON
   --quiet             In text mode, only print the final findings count
   --github            Write GitHub Actions annotations for each
-                      finding. Cannot be used with --json
+                      finding. Not with --json or --list-rules
+  --list-rules        Print the detector rule catalog and exit. --json
+                      for JSON, --quiet for ids only. Takes no targets
   --scope <name>      Only report rules in the given design domain
                       (type, layout). Comma-separated.
   --viewport <WxH>    Browser viewport for URL scans (default 1280x800),
@@ -66,6 +74,7 @@ Output streams:
   Human-readable findings go to stderr so stdout stays available for structured
   output. Use --json for JSON on stdout, or redirect text with 2> findings.txt.
   --github writes Actions annotations to stdout (no human findings).
+  --list-rules writes the catalog to stdout (no scan).
 
 Exit status:
   0  Scan completed with no primary findings (advisories may still be listed)
@@ -101,6 +110,7 @@ Examples:
   impeccable detect --cdp 9222 --target \"My App\" --json
   impeccable detect --json .
   impeccable detect --github src/
+  impeccable detect --list-rules
   impeccable detect --no-config src/
 ";
 
@@ -625,6 +635,10 @@ fn detect_cli(args_in: &[String], io: &mut Io, engines: &Engines) -> Result<i32,
         keep_consent_banners: has(&args, "--no-consent-hiding"),
         keep_overlays: has(&args, "--no-overlay-hiding"),
         unreported_rules: unreported_rules(&detection_config.ignore_rules, &scopes),
+        ignored_linked_stylesheet: Some({
+            let (cwd, config) = (cwd.clone(), detection_config.clone());
+            std::rc::Rc::new(move |path: &str| should_ignore_detection_file(path, &cwd, &config))
+        }),
     };
     let targets: Vec<String> = expand_joined_url_targets(
         args.iter()
@@ -635,6 +649,25 @@ fn detect_cli(args_in: &[String], io: &mut Io, engines: &Engines) -> Result<i32,
 
     if help_mode {
         io.out(USAGE);
+        return Ok(0);
+    }
+    if has(&args, "--list-rules") {
+        if github_mode {
+            io.err(GITHUB_LIST_RULES_CONFLICT);
+            return Err(Exit(1));
+        }
+        if cdp.is_some() || !targets.is_empty() {
+            io.err(LIST_RULES_SCAN_ERROR);
+            return Err(Exit(1));
+        }
+        let rules = collect_catalog_rules(&scopes, no_advisory);
+        if json_mode {
+            io.out(&format!("{}\n", format_list_rules_json(&rules)));
+        } else if quiet_mode {
+            io.out(&format_list_rules_ids(&rules));
+        } else {
+            io.out(&format_list_rules_text(&rules));
+        }
         return Ok(0);
     }
     if github_mode && json_mode {
