@@ -9,11 +9,12 @@
 //! (`customPropMap` is `null`, `overrides` is `null`).
 
 use super::checks_shim::CustomProps;
+use super::shorthand::{names_background_geometry, position_slot_or_default, size_slot_or_default};
 use super::{
-    apply_static_declaration, collect_static_css_rules, compare_static_priority,
-    is_static_inherited_prop, make_default_style, normalize_static_css_value,
-    parse_static_style_attribute, static_default_style, CssRule, DeclMeta, SpecifiedDecl,
-    SpecifiedStore, StyleValues, STATIC_DEFAULT_STYLE,
+    apply_static_declaration, collect_static_css_rules, collect_static_css_rules_from,
+    compare_static_priority, is_static_inherited_prop, make_default_style,
+    normalize_static_css_value, parse_static_style_attribute, static_default_style, CssRule,
+    DeclMeta, SpecifiedDecl, SpecifiedStore, StyleValues, UrlBase, STATIC_DEFAULT_STYLE,
 };
 use crate::dom::StaticDocument;
 use crate::profile::{self, Meta, ProfileSink};
@@ -39,8 +40,15 @@ static REMOTE_HREF_RE: Lazy<Regex> =
 /// Cache-busting (styles.css?v=3) and root-relative (/static/app.css) hrefs
 /// must not resolve as OS-absolute paths; otherwise the whole stylesheet is
 /// invisible to every element-level check.
-fn resolve_linked_css_path(file_dir: &str, href: &str) -> String {
+pub(crate) fn resolve_linked_css_path(file_dir: &str, href: &str) -> String {
     let stripped = href.split(['?', '#']).next().unwrap_or("");
+    resolve_css_path_exact(file_dir, stripped)
+}
+
+/// [`resolve_linked_css_path`] for a path with no query or fragment left to
+/// cut: an image url's path after its `%XX` escapes are decoded, where a
+/// `#` or `?` is part of the file name (#560).
+pub(crate) fn resolve_css_path_exact(file_dir: &str, stripped: &str) -> String {
     let root_relative = stripped.starts_with('/') && !stripped.starts_with("//");
     if !root_relative {
         return jsp::resolve("/", &[file_dir, stripped]);
@@ -85,15 +93,76 @@ fn resolve_linked_css_path(file_dir: &str, href: &str) -> String {
     jsp::join(&[file_dir, &rel])
 }
 
+/// A page's CSS as the cascade reads it: the text of every `<style>` element
+/// and every local linked stylesheet, joined with `\n`, plus where each
+/// stylesheet linked from another directory sits in that text. The text is
+/// never rewritten, so the pattern checks read every sheet as authored; only
+/// the rules collected from a foreign sheet resolve their urls against it.
+#[derive(Debug, Clone, Default)]
+pub struct StaticCss {
+    pub text: String,
+    page_dir: String,
+    foreign_sheets: Vec<ForeignSheet>,
+}
+
+#[derive(Debug, Clone)]
+struct ForeignSheet {
+    start: usize,
+    end: usize,
+    dir: String,
+}
+
+impl StaticCss {
+    /// The rules of the whole text in cascade order. With no foreign sheet
+    /// this is one parse of the joined text, exactly as before; a foreign
+    /// sheet is parsed on its own so its urls can be told apart, and the
+    /// order numbers run on across the stretches.
+    pub fn rules(&self) -> Vec<CssRule> {
+        if self.foreign_sheets.is_empty() {
+            return collect_static_css_rules(&self.text);
+        }
+        let mut rules: Vec<CssRule> = Vec::new();
+        let mut cursor = 0usize;
+        for sheet in &self.foreign_sheets {
+            if sheet.start > cursor {
+                let stretch = &self.text[cursor..sheet.start];
+                rules.extend(collect_static_css_rules_from(
+                    stretch,
+                    rules.len() as i64,
+                    None,
+                ));
+            }
+            let base = UrlBase::new(&sheet.dir, &self.page_dir);
+            let stretch = &self.text[sheet.start..sheet.end];
+            rules.extend(collect_static_css_rules_from(
+                stretch,
+                rules.len() as i64,
+                Some(&base),
+            ));
+            cursor = sheet.end;
+        }
+        if cursor < self.text.len() {
+            let stretch = &self.text[cursor..];
+            rules.extend(collect_static_css_rules_from(
+                stretch,
+                rules.len() as i64,
+                None,
+            ));
+        }
+        rules
+    }
+}
+
 /// JS: css-cascade.mjs#collectStaticCssText(root, fileDir, profile, filePath, modules)
 /// The text of every `<style>` element plus every local `<link rel=stylesheet>`
 /// resolved relative to `file_dir` (query/hash stripped), joined with `\n`.
 /// `warn` receives the JS `process.stderr.write` notice for an unreadable
 /// linked stylesheet (once per resolved path per scan).
 ///
-/// Returns that text plus a second one for the page-level pattern scan: the
-/// same join minus the linked sheets `ignored` accepts (given the resolved
-/// path). The cascade keeps the full text.
+/// Returns that text, as the cascade's [`StaticCss`], plus a second one for
+/// the page-level pattern scan: the same join minus the linked sheets
+/// `ignored` accepts (given the resolved path). The cascade keeps the full
+/// text.
 pub fn collect_static_css_text(
     doc: &StaticDocument,
     file_dir: &Path,
@@ -101,17 +170,37 @@ pub fn collect_static_css_text(
     file_path: &str,
     warn: Option<&dyn Fn(&str)>,
     ignored: Option<&dyn Fn(&str) -> bool>,
-) -> (String, String) {
-    let mut style_texts: Vec<String> = Vec::new();
+) -> (StaticCss, String) {
+    let file_dir_str = file_dir.to_string_lossy().into_owned();
+    let mut css = StaticCss {
+        page_dir: file_dir_str.clone(),
+        ..StaticCss::default()
+    };
     let mut pattern_texts: Vec<String> = Vec::new();
+    let mut pieces = 0usize;
+    // `style_texts.join('\n')`, built in place so a sheet's span is known.
+    let mut push = |css: &mut StaticCss, piece: &str, foreign_dir: Option<String>| {
+        if pieces > 0 {
+            css.text.push('\n');
+        }
+        pieces += 1;
+        let start = css.text.len();
+        css.text.push_str(piece);
+        if let Some(dir) = foreign_dir {
+            css.foreign_sheets.push(ForeignSheet {
+                start,
+                end: css.text.len(),
+                dir,
+            });
+        }
+    };
     let mut warned_missing_stylesheets: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     for style_el in doc.query_selector_all("style") {
         let text = style_el.text_content();
-        pattern_texts.push(text.clone());
-        style_texts.push(text);
+        push(&mut css, &text, None);
+        pattern_texts.push(text);
     }
-    let file_dir_str = file_dir.to_string_lossy().into_owned();
     for link in doc.query_selector_all("link") {
         let rel = link.get_attribute("rel").unwrap_or("");
         let href = link.get_attribute("href").unwrap_or("");
@@ -126,11 +215,13 @@ pub fn collect_static_css_text(
         );
         match read {
             Ok(bytes) => {
+                let sheet_dir = jsp::dirname(&css_path);
+                let foreign_dir = (sheet_dir != file_dir_str).then_some(sheet_dir);
                 let text = String::from_utf8_lossy(&bytes).into_owned();
+                push(&mut css, &text, foreign_dir);
                 if !ignored.is_some_and(|f| f(&css_path)) {
-                    pattern_texts.push(text.clone());
+                    pattern_texts.push(text);
                 }
-                style_texts.push(text);
             }
             Err(_) => {
                 if warned_missing_stylesheets.insert(css_path.clone()) {
@@ -143,7 +234,7 @@ pub fn collect_static_css_text(
             }
         }
     }
-    (style_texts.join("\n"), pattern_texts.join("\n"))
+    (css, pattern_texts.join("\n"))
 }
 
 static PSEUDO_RULE_RE: Lazy<Regex> = Lazy::new(|| {
@@ -283,6 +374,26 @@ fn mark_pseudo_rule(
                 .find(&surf_raw)
                 .map(|m| m.as_str().to_string());
             let surf = parse_any_color(Some(token.as_deref().unwrap_or(&surf_raw)));
+            // Anything the pseudo paints over the box, however faint, sits
+            // between the box's own image and its text (#560). Only nothing,
+            // `none`, and a color too faint to see are known not to paint; a
+            // value the engine cannot read counts as paint.
+            let no_paint = surf_raw.is_empty()
+                || surf_raw.eq_ignore_ascii_case("none")
+                || surf.is_some_and(|c| c.alpha_or_one() <= 0.02);
+            let paints = !no_paint
+                || GRADIENT_RE.is_match(&surf_raw)
+                || js::to_lower_case(&first_of("background-image", "background")).contains("url(");
+            if paints {
+                let ids: Vec<NodeId> = doc
+                    .query_selector_all(base_selector)
+                    .iter()
+                    .map(|e| e.id())
+                    .collect();
+                for id in ids {
+                    doc.set_pseudo_overlay(id);
+                }
+            }
             if let Some(surf) = surf {
                 if surf.alpha_or_one() >= 0.9 && !GRADIENT_RE.is_match(&surf_raw) {
                     let ids: Vec<NodeId> = doc
@@ -299,24 +410,54 @@ fn mark_pseudo_rule(
     }
 }
 
+/// A `background` shorthand's bare `var()` beside its image is stored in
+/// every slot no other token claims (#560): the repeat, the position, and
+/// the color. Resolved, it held one of them, and the other slots compute as
+/// if the shorthand had named nothing there, so each reader sees what the
+/// shorthand named, the default when it named none:
+///
+/// - the color slot computes as `transparent` when it resolves to
+///   background geometry (a repeat, position, size, attachment, or box
+///   token), so every reader of `backgroundColor` sees exactly that and
+///   none takes a keyword for an unreadable color;
+/// - the position slot computes without a repeat, size keyword, attachment,
+///   box, or color token, `0% 0%` when nothing is left
+///   (`position_slot_or_default`), so the position reader does not take a
+///   `no-repeat` for a shift and leave a covering image unread;
+/// - the position slot also computes without a size the `var()` held
+///   behind its slash (`center / cover`), which is the size slot's;
+/// - the size slot, holding the same `var()` as the shorthand's own
+///   (`from-shorthand(...)`), computes to the size behind that slash and
+///   to `auto` when the `var()` held none (`size_slot_or_default`); a
+///   later `background-size` longhand carries no marker and simply wins;
+/// - the repeat reader reads keywords only, so that slot needs nothing.
+fn shorthand_slot_or_default(prop: &str, value: String) -> String {
+    match prop {
+        "backgroundColor" if names_background_geometry(&value) => "transparent".to_string(),
+        "backgroundPosition" => position_slot_or_default(&value),
+        "backgroundSize" => size_slot_or_default(&value),
+        _ => value,
+    }
+}
+
 /// JS: css-cascade.mjs#buildStaticStyleMap(root, staticDoc, cssText, modules, profile, filePath)
 pub fn build_static_style_map(
     doc: &mut StaticDocument,
-    css_text: &str,
+    css: &StaticCss,
     profile: Option<&dyn ProfileSink>,
     file_path: &str,
 ) {
     let mut specified: SpecifiedStore<NodeId> = SpecifiedStore::new();
     let mut hover_specified: SpecifiedStore<NodeId> = SpecifiedStore::new();
     let mut placeholder_specified: SpecifiedStore<NodeId> = SpecifiedStore::new();
-    let root_custom_props = collect_css_custom_props(css_text);
+    let root_custom_props = collect_css_custom_props(&css.text);
     // Selectors of radius rules the matcher refuses: the side-accent gate
     // cannot read their corners, so the elements they may reach stay unknown.
     let mut refused_radius_selectors: Vec<String> = Vec::new();
     let rules = profile::step(
         profile,
         Meta::new("parse-css", "css-rules", file_path),
-        || collect_static_css_rules(css_text),
+        || css.rules(),
     );
 
     profile::step(
@@ -426,7 +567,7 @@ pub fn build_static_style_map(
             compute_styles(doc, &specified, &hover_specified, &placeholder_specified);
         },
     );
-    mark_side_accent_radius_blind_spots(doc, css_text, &specified, &refused_radius_selectors);
+    mark_side_accent_radius_blind_spots(doc, &css.text, &specified, &refused_radius_selectors);
 }
 
 /// Whether a property sets a border radius, in CSS or camelCase spelling.
@@ -629,9 +770,9 @@ fn compute_styles(
                 parent_style.as_deref(),
                 Some(&values),
             );
+            let next = shorthand_slot_or_default(prop, next);
             values.insert(prop.clone(), next);
         }
-
         // Hover pass: color / backgroundColor only.
         if let Some(hover_map) = hover_specified.get(&node) {
             let mut hover_values: Option<StyleValues> = None;
@@ -650,6 +791,7 @@ fn compute_styles(
                     parent_style.as_deref(),
                     Some(&values),
                 );
+                let next = shorthand_slot_or_default(prop, next);
                 if values.get(prop).map(|s| s.as_str()) == Some(next.as_str()) {
                     continue;
                 }
