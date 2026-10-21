@@ -979,8 +979,11 @@ mod user_scope_hook_tests {
     #[test]
     fn relative_codex_home_uses_caller_cwd_and_preserves_spaces() {
         let mut fixture = UserHookFixture::new("codex");
-        fixture.put("caller/ codex home /hooks.json", CODEX_HOOK);
-        fixture.env.insert("CODEX_HOME".to_string(), " codex home ".to_string());
+        // Windows strips trailing spaces from path components, so the
+        // edge-space spelling only exists on Unix; both keep an interior one.
+        let home = if cfg!(windows) { "codex home" } else { " codex home " };
+        fixture.put(&format!("caller/{home}/hooks.json"), CODEX_HOOK);
+        fixture.env.insert("CODEX_HOME".to_string(), home.to_string());
         let cwd = fixture.root.join("caller").to_string_lossy().into_owned();
         let options = TargetOptions { target_path: Some(fixture.project.clone()) };
         let ctx = load_context(&cwd, &options, &fixture.env);
