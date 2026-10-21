@@ -7142,3 +7142,9 @@ Follow-up to the Dart entry above, from PR review and a detector run against a r
 - The design hook scans `.dart` targets on native PRODUCT.md platforms (`ios`/`android`/`adaptive`); other files keep skipping.
 
 Re-recorded from the binary and reviewed by hand: `detect-fixture-{json,text}-dart-should-flag-dart`, plus the sweeps that contain the fixture (`detect-dir-{json,text}-all-fixtures`, `detect-no-advisory-{json,text}`). The finding set is unchanged — seven findings, one advisory, exit 2 — and `side-tab`/the gradient shift one line because the fixture's stripe now sits on a `borderRadius`. Every non-Dart row in those sweeps is byte-identical. The pass fixture stays at zero findings; it gained a square one-sided border as a negative shape, which emits nothing.
+
+## Recorded 2026-10-21: Flutter projects count as a visual implementation (context)
+
+`hasVisualImplementation` walked only the web-shaped source dirs, so a Flutter app with all its widgets in `lib/` reported `false` and the context directives told the agent there was no incumbent visual system. The scan now adds `lib` for a project whose `pubspec.yaml` depends on the Flutter SDK and inspects `.dart` files there: a widget declaration (`Widget build(`, a widget `State`/`StatelessWidget`-family class) or two style declarations count, while a plain Dart package stays excluded. `staleness_deep`'s directory filter gains `lib` for the same reason.
+
+`context-native-ios`, `context-adaptive`, `context-adaptive-word` and `context-android` were re-recorded from the binary. Their only delta predates this change: the branch added the "A Flutter app is native here" sentence to `ios.md`/`android.md` without re-recording these four goldens, and the platform reference is echoed in their output. No other context case moved, and the `hasVisualImplementation` value in every fixture workspace is unchanged (none of them holds a Flutter `lib/`).

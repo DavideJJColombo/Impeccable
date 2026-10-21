@@ -1273,6 +1273,21 @@ static RE_TOKEN_NAME: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?-u:\b)(?:tokens?
 static RE_STYLE_LINK: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)<style(?-u:\b)|<link[^>]+stylesheet").unwrap());
 static RE_CLASS_ATTR: Lazy<Regex> = Lazy::new(|| Regex::new("(?i)class(?:Name)?\\s*=\\s*[\"'`]([^\"'`]+)[\"'`]").unwrap());
 static RE_STYLED: Lazy<Regex> = Lazy::new(|| Regex::new("(?i)class(?:Name)?\\s*=|style\\s*=|styled\\(|css`").unwrap());
+/// A Flutter widget file's visual evidence: a widget class or build method,
+/// or a couple of style declarations. `color:` alone also appears in models
+/// and services, so it does not count on its own.
+static RE_DART_WIDGET: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        "(?m)Widget build\\(|extends (?:StatelessWidget|StatefulWidget|ConsumerWidget|ConsumerStatefulWidget|State<)",
+    )
+    .unwrap()
+});
+static RE_DART_STYLE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        "(?i)(?:backgroundColor|borderRadius|fontFamily|TextStyle\\(|BoxDecoration\\(|TextTheme\\(|ThemeData\\(|EdgeInsets|Theme\\.of\\()",
+    )
+    .unwrap()
+});
 static RE_MIN: Lazy<Regex> = Lazy::new(|| Regex::new(r"\.min\.[a-z]+$").unwrap());
 
 fn js_slice_utf16(s: &str, n: usize) -> &str {
@@ -1293,8 +1308,13 @@ pub fn has_visual_implementation(project_root: &str) -> bool {
         return false;
     }
     let root = jsp::resolve(project_root, &[]);
+    // A Flutter app keeps its widgets in `lib/`, outside the web-shaped source
+    // dirs. Check the pubspec once so a plain Dart package stays excluded.
+    let is_flutter = safe_read(&jsp::join(&[&root, "pubspec.yaml"]))
+        .is_some_and(|body| is_flutter_pubspec(&body));
+    let flutter_dir = is_flutter.then_some("lib");
     let mut queue: std::collections::VecDeque<(String, usize)> = std::collections::VecDeque::new();
-    for rel in VISUAL_SOURCE_DIRS {
+    for rel in VISUAL_SOURCE_DIRS.into_iter().chain(flutter_dir) {
         let dir = jsp::join(&[&root, rel]);
         if exists(&dir) {
             queue.push_back((dir, 0));
@@ -1306,7 +1326,8 @@ pub fn has_visual_implementation(project_root: &str) -> bool {
     let inspect = |file_path: &str, scanned: &mut usize, styled: &mut usize| -> bool {
         let ext = jsp::extname(file_path).to_lowercase();
         let is_style = STYLE_EXTENSIONS.contains(&ext.as_str());
-        let is_ui = UI_EXTENSIONS.contains(&ext.as_str());
+        let is_dart = ext == ".dart";
+        let is_ui = UI_EXTENSIONS.contains(&ext.as_str()) || (is_dart && is_flutter);
         if !is_style && !is_ui {
             return false;
         }
@@ -1334,6 +1355,12 @@ pub fn has_visual_implementation(project_root: &str) -> bool {
             if custom >= 3 || visual >= 5 {
                 return true;
             }
+        }
+        if is_dart {
+            // Only the Flutter-shaped evidence counts; a Dart file of models or
+            // services is not a visual implementation.
+            return RE_DART_WIDGET.is_match(&evidence)
+                || RE_DART_STYLE.find_iter(&evidence).count() >= 2;
         }
         let is_html = ext == ".html" || ext == ".htm";
         if is_html && ev_len > 600 && RE_STYLE_LINK.is_match(&evidence) {
@@ -1436,6 +1463,28 @@ mod ui_target_tests {
             ("HOME".to_string(), "/nonexistent-impeccable-home".to_string()),
             ("USERPROFILE".to_string(), "/nonexistent-impeccable-home".to_string()),
         ])
+    }
+
+    #[test]
+    fn flutter_lib_counts_as_a_visual_implementation() {
+        let t = Tmp::new("flutter-visual");
+        t.put(
+            "pubspec.yaml",
+            "name: app\nenvironment:\n  sdk: ^3.0.0\ndependencies:\n  flutter:\n    sdk: flutter\n",
+        );
+        t.put(
+            "lib/main.dart",
+            "import 'package:flutter/material.dart';\nWidget build() => Container(\n  color: Colors.white,\n  child: Text('hi', style: TextStyle(fontSize: 14, fontFamily: 'Roboto')),\n);\n",
+        );
+        assert!(has_visual_implementation(&t.root()));
+    }
+
+    #[test]
+    fn a_dart_package_without_flutter_is_not_a_visual_implementation() {
+        let t = Tmp::new("dart-cli");
+        t.put("pubspec.yaml", "name: cli\nenvironment:\n  sdk: ^3.0.0\n");
+        t.put("lib/cli.dart", "void main() {\n  print('no widgets here');\n}\n");
+        assert!(!has_visual_implementation(&t.root()));
     }
 
     /// A Turborepo-style tree: three apps (one API), two UI packages, and

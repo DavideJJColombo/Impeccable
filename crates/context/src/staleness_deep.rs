@@ -10,7 +10,7 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::{Map, Value};
 
-const VISUAL_SOURCE_DIRS: [&str; 7] = ["src", "app", "pages", "components", "site", "styles", "public"];
+const VISUAL_SOURCE_DIRS: [&str; 8] = ["src", "app", "pages", "components", "site", "styles", "public", "lib"];
 const LEGACY_LIVE_PATHS: [&str; 2] = [".impeccable-live.json", ".impeccable-live"];
 
 fn git(args: &[&str], cwd: &str) -> Option<String> {
