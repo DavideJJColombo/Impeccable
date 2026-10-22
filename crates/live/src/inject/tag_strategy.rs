@@ -3,6 +3,7 @@
 //! meta patch/revert.
 
 use crate::util::{base64_decode, base64_encode, encode_uri_component};
+use markup5ever::data::NAMED_ENTITIES;
 use once_cell::sync::Lazy;
 use regex::{Regex, RegexBuilder};
 
@@ -244,6 +245,53 @@ fn get_attr(attrs: &str, name: &str) -> Option<Attr> {
     best.map(|(_, a)| a)
 }
 
+static CHAR_REF_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"&(?:#([0-9]+);|#[xX]([0-9a-fA-F]+);|([A-Za-z][A-Za-z0-9]*;))").unwrap()
+});
+
+/// The policy text a browser reads from an attribute value.
+fn decode_attr_value(value: &str) -> String {
+    CHAR_REF_RE
+        .replace_all(value, |c: &regex::Captures| {
+            let decoded = if let Some(d) = c.get(1) {
+                d.as_str()
+                    .parse()
+                    .ok()
+                    .and_then(char::from_u32)
+                    .map(String::from)
+            } else if let Some(h) = c.get(2) {
+                u32::from_str_radix(h.as_str(), 16)
+                    .ok()
+                    .and_then(char::from_u32)
+                    .map(String::from)
+            } else {
+                NAMED_ENTITIES.get(&c[3]).map(|&(a, b)| {
+                    [a, b]
+                        .into_iter()
+                        .filter(|&cp| cp != 0)
+                        .filter_map(char::from_u32)
+                        .collect()
+                })
+            };
+            decoded.unwrap_or_else(|| c[0].to_string())
+        })
+        .into_owned()
+}
+
+/// Policy text written back as an attribute value delimited by `quote`. A raw
+/// `>` would end the tag for `META_TAG_RE` and hide the marker from revert.
+fn encode_attr_value(text: &str, quote: &str) -> String {
+    let text = text
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    if quote == "'" {
+        text.replace('\'', "&#39;")
+    } else {
+        text.replace('"', "&quot;")
+    }
+}
+
 fn append_origin_to_directive(csp: &str, directive: &str, origin: &str) -> String {
     let re = RegexBuilder::new(&format!("(^|;)(\\s*)({})\\s+([^;]*)", directive))
         .case_insensitive(true)
@@ -302,8 +350,10 @@ pub fn patch_csp_meta(content: &str, port: i64) -> String {
             continue;
         };
         let original = content_attr.value.clone();
-        let mut patched = original.clone();
-        patched = append_origin_to_directive(&patched, "script-src", &origin);
+        // Patch the policy the browser reads, not the raw attribute bytes:
+        // a character reference's `;` is not a directive separator.
+        let policy = decode_attr_value(&original);
+        let mut patched = append_origin_to_directive(&policy, "script-src", &origin);
         // The detector the overlay loads from that origin is a WebAssembly
         // module (WASM-BUNDLE.md in the detector repo); a script-src that names the origin
         // but not 'wasm-unsafe-eval' still refuses to compile it. Not in the
@@ -313,12 +363,14 @@ pub fn patch_csp_meta(content: &str, port: i64) -> String {
         patched = append_origin_to_directive(&patched, "script-src", "'wasm-unsafe-eval'");
         patched = append_origin_to_directive(&patched, "connect-src", &origin);
         patched = append_origin_to_directive(&patched, "img-src", "blob:");
-        if patched == original {
+        if patched == policy {
             continue;
         }
         let new_content_attr = format!(
             "content={}{}{}",
-            content_attr.quote, patched, content_attr.quote
+            content_attr.quote,
+            encode_attr_value(&patched, &content_attr.quote),
+            content_attr.quote
         );
         let marker = format!(
             "{}=\"{}\"",
@@ -360,28 +412,14 @@ pub fn revert_csp_meta(content: &str) -> String {
             content_attr.quote, original_value, content_attr.quote
         );
         let mut new_attrs = tag.attrs.replacen(&content_attr.full, &new_content_attr, 1);
-        // JS: new RegExp(`\\s*${origAttr.full}`) (unescaped; the value is
-        // base64 + quotes, which carry no regex metacharacters besides `+`
-        // and `/`... `+` IS a metachar; JS would treat `A+` as a quantifier).
-        // JS-PARITY: build the same regex the JS builds.
-        let re_src = format!("\\s*{}", orig_attr.full);
-        match Regex::new(&re_src) {
-            Ok(re) => {
-                new_attrs = re.replacen(&new_attrs, 1, "").into_owned();
-            }
-            Err(_) => {
-                // A base64 value like `A+B` compiles in JS as a quantifier;
-                // fall back to a literal removal when the Rust regex rejects it.
-                if let Some(pos) = new_attrs.find(&orig_attr.full) {
-                    let before = &new_attrs[..pos];
-                    let ws = before.len() - before.trim_end().len();
-                    new_attrs = format!(
-                        "{}{}",
-                        &before[..before.len() - ws],
-                        &new_attrs[pos + orig_attr.full.len()..]
-                    );
-                }
-            }
+        if let Some(pos) = new_attrs.find(&orig_attr.full) {
+            let before = &new_attrs[..pos];
+            let ws = before.len() - before.trim_end().len();
+            new_attrs = format!(
+                "{}{}",
+                &before[..before.len() - ws],
+                &new_attrs[pos + orig_attr.full.len()..]
+            );
         }
         let new_tag = tag.full.replacen(tag.attrs.as_str(), &new_attrs, 1);
         result = format!("{}{}{}", &result[..tag.start], new_tag, &result[tag.end..]);
@@ -422,5 +460,71 @@ mod tests {
             patched.contains("script-src 'self' http://localhost:8412 'wasm-unsafe-eval'"),
             "{patched}"
         );
+    }
+
+    #[test]
+    fn csp_meta_single_quoted_round_trip_encodes_inserted_quotes() {
+        let html = "<meta http-equiv=\"Content-Security-Policy\" content='script-src https://example.com/a~'>";
+        let patched = patch_csp_meta(html, 8412);
+        assert!(patched.contains("&#39;wasm-unsafe-eval&#39;"), "{patched}");
+        assert_eq!(revert_csp_meta(&patched), html);
+    }
+
+    #[test]
+    fn csp_meta_patch_decodes_character_references() {
+        let html = "<meta http-equiv=\"Content-Security-Policy\" content='script-src &#39;self&#39; https://a.example; object-src &#x27;none&#x27;'>";
+        let patched = patch_csp_meta(html, 8412);
+        assert!(
+            patched.contains("script-src &#39;self&#39; https://a.example http://localhost:8412 &#39;wasm-unsafe-eval&#39;;"),
+            "{patched}"
+        );
+        assert!(
+            patched.contains("object-src &#39;none&#39;; connect-src"),
+            "{patched}"
+        );
+        assert_eq!(revert_csp_meta(&patched), html);
+
+        let html =
+            "<meta http-equiv=\"Content-Security-Policy\" content='default-src &#39;self&#39;'>";
+        let patched = patch_csp_meta(html, 8412);
+        assert!(
+            patched.contains("default-src &#39;self&#39;; script-src")
+                && patched.contains("; connect-src &#39;self&#39; http://localhost:8412"),
+            "{patched}"
+        );
+        assert_eq!(revert_csp_meta(&patched), html);
+
+        // `&#59;` is a separator, and a source spelled with references is
+        // already present.
+        let html = "<meta http-equiv=\"Content-Security-Policy\" content='script-src &#39;wasm-unsafe-eval&#39;&#59; img-src blob:'>";
+        let patched = patch_csp_meta(html, 8412);
+        assert!(
+            patched.contains("content='script-src &#39;wasm-unsafe-eval&#39; http://localhost:8412; img-src blob:; connect-src &#39;self&#39; http://localhost:8412'"),
+            "{patched}"
+        );
+        assert_eq!(revert_csp_meta(&patched), html);
+
+        let html = "<meta http-equiv=\"Content-Security-Policy\" content=\"img-src https://a.example/?a&b; script-src 'self'\">";
+        let patched = patch_csp_meta(html, 8412);
+        assert!(
+            patched.contains("?a&amp;b blob:; script-src 'self' http://localhost:8412"),
+            "{patched}"
+        );
+
+        let html = "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src&Tab;'none'; script-src 'self'\">";
+        let patched = patch_csp_meta(html, 8412);
+        assert!(
+            patched.contains("default-src\t'none'; script-src 'self' http://localhost:8412"),
+            "{patched}"
+        );
+        assert_eq!(revert_csp_meta(&patched), html);
+
+        let html = "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'self' &gt;&semi; script-src 'self'\">";
+        let patched = patch_csp_meta(html, 8412);
+        assert!(
+            patched.contains("&gt;; script-src 'self' http://localhost:8412"),
+            "{patched}"
+        );
+        assert_eq!(revert_csp_meta(&patched), html);
     }
 }
