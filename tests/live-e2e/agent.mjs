@@ -948,7 +948,12 @@ export async function applyManualEditBatchToSource(batch, { tmp, sourceEdits, re
   }
 
   for (const file of filesTouched) {
-    await fs.writeFile(safeProjectPath(tmp, file), fileCache.get(file), 'utf-8');
+    // Publish atomically. A direct write briefly exposes a zero-byte file that
+    // Vite can read mid-Apply and answer with a full reload.
+    const target = safeProjectPath(tmp, file);
+    const temporaryPath = `${target}.impeccable-manual-apply-${process.pid}.tmp`;
+    await fs.writeFile(temporaryPath, fileCache.get(file), 'utf-8');
+    await fs.rename(temporaryPath, target);
   }
 
   const status = failed.length === 0 ? 'done' : (appliedEntryIds.length > 0 ? 'partial' : 'error');
