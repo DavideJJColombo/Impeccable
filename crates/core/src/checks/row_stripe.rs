@@ -23,7 +23,7 @@ use crate::checks::css_scan::{
 };
 use crate::checks::measures::resolve_var_refs;
 use crate::checks::rules::{extract_shadow_lengths, find_shadow_color};
-use crate::color::{parse_any_color, Rgba};
+use crate::color::{parse_any_color, rgb_to_oklch_lc, Rgba};
 use crate::js::{self, number_to_string};
 use crate::js_ext_a::split_commas_outside_parens;
 use once_cell::sync::Lazy;
@@ -163,8 +163,21 @@ fn accent_colour(value: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Option
     Some(colour.is_some_and(|c| is_accent(&c)))
 }
 
+/// OKLCH chroma a row stripe needs: a status colour (red, green, amber, a
+/// brand blue) sits well above it, a slate divider (`#2e3d54`, about 0.04)
+/// below, though its channels spread past the card scans' 30.
+pub const MIN_ROW_STRIPE_CHROMA: f64 = 0.07;
+
+/// Whether a colour reads as an accent on a row: visible, and coloured
+/// rather than a tinted grey.
+pub fn is_row_stripe_accent(c: &Rgba) -> bool {
+    c.alpha_or_one() >= 0.1
+        && js::math_max3(c.r, c.g, c.b) - js::math_min3(c.r, c.g, c.b) >= 30.0
+        && rgb_to_oklch_lc(c).1 >= MIN_ROW_STRIPE_CHROMA
+}
+
 fn is_accent(c: &Rgba) -> bool {
-    c.alpha_or_one() >= 0.1 && js::math_max3(c.r, c.g, c.b) - js::math_min3(c.r, c.g, c.b) >= 30.0
+    is_row_stripe_accent(c)
 }
 
 fn in_band(px: f64) -> bool {
@@ -398,6 +411,7 @@ mod tests {
             "tr[aria-current] td { box-shadow: inset 3px 0 0 #2563eb; }",
             // Neutral, transparent, faint or unresolved-and-unnamed colours.
             "tr.is-x td { box-shadow: inset 3px 0 0 #e5e7eb; }",
+            ".vital-cell { border-left: 2px solid #2e3d54; padding-left: 18px; }",
             "tr.is-x td { box-shadow: inset 3px 0 0 transparent; }",
             "tr.is-x td { box-shadow: inset 3px 0 0 rgba(220, 38, 38, .05); }",
             "tr.is-x td { box-shadow: inset 3px 0 0 var(--line); }",

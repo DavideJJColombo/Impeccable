@@ -564,6 +564,9 @@ pub fn check_element_inset_stripe_dom(dom: &dyn Dom, el: ElId) -> Vec<RuleHit> {
         if colour.alpha_or_one() < 0.1 || spread(&colour) < 30.0 {
             continue;
         }
+        if row && !crate::checks::row_stripe::is_row_stripe_accent(&colour) {
+            continue;
+        }
         let (ax, ay) = (layer.x.abs(), layer.y.abs());
         let (thickness, edge, side) = match (ax > 0.0, ay > 0.0) {
             (true, false) if layer.x > 0.0 => (ax, "left", 3),
@@ -5913,6 +5916,7 @@ mod tests {
         assert!(hits[0].snippet.contains("3px stripe on a row or cell (left edge)"), "{}", hits[0].snippet);
         for silent in [
             "rgb(229, 231, 235) 3px 0px 0px 0px inset",
+            "rgb(46, 61, 84) 3px 0px 0px 0px inset",
             "rgb(220, 38, 38) 3px 0px 4px 0px inset",
             "rgb(220, 38, 38) 0px -3px 0px 0px inset",
             "rgb(220, 38, 38) 1px 0px 0px 0px inset",
