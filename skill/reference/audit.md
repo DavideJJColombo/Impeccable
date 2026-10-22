@@ -6,7 +6,7 @@ This is a code-level audit, not a design critique. Check what's measurable and v
 
 ## Diagnostic Scan
 
-Run comprehensive checks across 6 dimensions. Score each dimension 0-4 using the criteria below.
+Run comprehensive checks across 5 dimensions. Score each dimension 0-4 using the criteria below.
 
 ### 1. Accessibility (A11y)
 
@@ -52,8 +52,16 @@ Run comprehensive checks across 6 dimensions. Score each dimension 0-4 using the
 - **Horizontal scroll**: Content overflow on narrow viewports
 - **Text scaling**: Layouts that break when text size increases
 - **Missing breakpoints**: No mobile/tablet variants
+- **Physical directional properties on RTL-declared pages** (each is a signal to verify the rendered result, not a defect in itself; flag only where the rendering is actually wrong): `margin-left`, `margin-right`, `padding-left`, `padding-right` where logical equivalents (`margin-inline-start`, `margin-inline-end`, `padding-inline-start`, `padding-inline-end`) would be expected
+- **Physical text-align**: `text-align: left` or `text-align: right` instead of `text-align: start` / `text-align: end`
+- **Physical float**: `float: left` or `float: right` instead of `float: inline-start` / `float: inline-end`
+- **Physical positioning on positioned elements**: `left:` or `right:` instead of `inset-inline-start` / `inset-inline-end`. Note: `left:50%; transform:translateX(-50%)` is a direction-agnostic centering pattern that works correctly in both LTR and RTL; replacing `left` with `inset-inline-start` there breaks the centering because `translateX` is physical and does not mirror. Similarly, direction-scoped rules like `[dir="rtl"] .x { margin-right:1rem }` are correct by construction
+- **Physical border properties**: `border-left`, `border-right` instead of `border-inline-start`, `border-inline-end`
+- **Directional icons and assets**: arrows, chevrons, and navigation icons that point the wrong direction for the reading order. An RTL-only page may ship assets already drawn correctly without a `[dir="rtl"]` flip; verify the rendered icon rather than assuming a missing `transform: scaleX(-1)` is a defect
 
-**Score 0-4**: 0=Desktop-only (breaks on mobile), 1=Major issues (some breakpoints, many failures), 2=Partial (works on mobile, rough edges), 3=Good (responsive, minor touch target or overflow issues), 4=Excellent (fluid, all viewports, proper touch targets, gestures work under touch)
+**RTL scope**: flag physical directional properties only on pages that declare `dir="rtl"` on the `<html>` or `<body>` element. A `lang` attribute alone does not set direction (browsers take direction from `dir`, never from `lang`), but treat an RTL-script `lang` (`ar`, `fa`, `ur`, `ps`, `ckb`, `he`, `yi`, `ug`, `sd`, `dv`) without an explicit `dir` as a signal worth noting. On LTR-only pages, note their presence as informational (P3) rather than a violation, since they will break if RTL is added later but are not incorrect today.
+
+**Score 0-4**: 0=Desktop-only (breaks on mobile), 1=Major issues (some breakpoints, many failures), 2=Partial (works on mobile, rough edges), 3=Good (responsive, minor touch target or overflow issues), 4=Excellent (fluid, all viewports, proper touch targets, gestures work under touch). On RTL-declared pages, reduce by 1 for pervasive physical directional properties; LTR-only pages score on viewport responsiveness alone (note physical properties as informational P3)
 
 ### 5. Implementation Integrity (CRITICAL)
 
@@ -62,20 +70,6 @@ Run the bundled detector and verify each finding in context. Look for repeated i
 **Desktop apps** (Electron, NW.js, CEF, WebView2): launch the app with a local DevTools port (`--remote-debugging-port=9222`, or `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222` for WebView2; keep it on 127.0.0.1, never exposed), seed the state to audit, keep the window on screen (a hidden one skips the pixel contrast reads), then run `{{scripts_path}}/impeccable detect --cdp 9222 --target <part of the page URL or title> --json`. It returns the same JSON as a URL scan and leaves the window as found. Take screenshots through the harness's CDP tooling, and leave the window as you found it too. Tauri on macOS (WKWebView) and on Linux (WebKitGTK) expose no CDP: scan the source and say the rendered check did not run.
 
 **Score 0-4**: 0=systemic drift, 1=major repeated failures, 2=several verified issues, 3=minor isolated issues, 4=coherent and intentional
-
-### 6. Internationalization
-
-**Check for** (each is a signal to verify the rendered result, not a defect in itself; flag only where the rendering is actually wrong):
-- **Physical directional properties on RTL-declared pages**: `margin-left`, `margin-right`, `padding-left`, `padding-right` where logical equivalents (`margin-inline-start`, `margin-inline-end`, `padding-inline-start`, `padding-inline-end`) would be expected
-- **Physical text-align**: `text-align: left` or `text-align: right` instead of `text-align: start` / `text-align: end`
-- **Physical float**: `float: left` or `float: right` instead of `float: inline-start` / `float: inline-end`
-- **Physical positioning on positioned elements**: `left:` or `right:` instead of `inset-inline-start` / `inset-inline-end`. Note: `left:50%; transform:translateX(-50%)` is a direction-agnostic centering pattern that works correctly in both LTR and RTL; replacing `left` with `inset-inline-start` there breaks the centering because `translateX` is physical and does not mirror. Similarly, direction-scoped rules like `[dir="rtl"] .x { margin-right:1rem }` are correct by construction
-- **Physical border properties**: `border-left`, `border-right` instead of `border-inline-start`, `border-inline-end`
-- **Directional icons and assets**: arrows, chevrons, and navigation icons that point the wrong direction for the reading order. An RTL-only page may ship assets already drawn correctly without a `[dir="rtl"]` flip; verify the rendered icon rather than assuming a missing `transform: scaleX(-1)` is a defect
-
-**Scope**: flag physical directional properties only on pages that declare `dir="rtl"` on the `<html>` or `<body>` element. A `lang` attribute alone does not set direction (browsers take direction from `dir`, never from `lang`), but treat an RTL-script `lang` (`ar`, `fa`, `ur`, `ps`, `ckb`, `he`, `yi`, `ug`, `sd`, `dv`) without an explicit `dir` as a signal worth noting. On LTR-only pages, note their presence as informational (P3) rather than a violation, since they will break if RTL is added later but are not incorrect today.
-
-**Score 0-4**: 0=RTL page using physical properties throughout (layout mirrors incorrectly), 1=RTL page mostly physical with a few logical (partial breakage), 2=RTL page mixed (some properties converted, key gaps remain), 3=RTL page mostly logical (minor physical holdouts in non-critical paths), 4=RTL page fully logical. LTR-only pages score 4 (physical properties are correct on LTR); note them as informational (P3) per scope above
 
 ## Generate Report
 
@@ -88,16 +82,15 @@ Run the bundled detector and verify each finding in context. Look for repeated i
 | 3 | Theming | ? | |
 | 4 | Responsive Design | ? | |
 | 5 | Implementation Integrity | ? | |
-| 6 | Internationalization | ? | |
-| **Total** | | **??/24** | **[Rating band]** |
+| **Total** | | **??/20** | **[Rating band]** |
 
-**Rating bands**: 22-24 Excellent (minor polish), 17-21 Good (address weak dimensions), 12-16 Acceptable (significant work needed), 7-11 Poor (major overhaul), 0-6 Critical (fundamental issues)
+**Rating bands**: 18-20 Excellent (minor polish), 14-17 Good (address weak dimensions), 10-13 Acceptable (significant work needed), 6-9 Poor (major overhaul), 0-5 Critical (fundamental issues)
 
 ### Implementation Integrity Verdict
 **Start here.** Pass/fail: does the implementation express a coherent product-specific system? Cite verified evidence and detector findings.
 
 ### Executive Summary
-- Audit Health Score: **??/24** ([rating band])
+- Audit Health Score: **??/20** ([rating band])
 - Total issues found (count by severity: P0/P1/P2/P3)
 - Top 3-5 critical issues
 - Recommended next steps
@@ -113,7 +106,7 @@ Tag every issue with **P0-P3 severity**:
 For each issue, document:
 - **[P?] Issue name**
 - **Location**: Component, file, line
-- **Category**: Accessibility / Performance / Theming / Responsive / Implementation Integrity / Internationalization
+- **Category**: Accessibility / Performance / Theming / Responsive / Implementation Integrity
 - **Impact**: How it affects users
 - **WCAG/Standard**: Which standard it violates (if applicable)
 - **Recommendation**: How to fix it
