@@ -40,6 +40,12 @@
 
       <h2>Flag: a straggler in a paragraph with inline links</h2>
       <p class="copy flag-inline" style="width: 36.5ch">Read the full <a href="#changelog">changelog</a> for every fix in this release, and the <em>migration notes</em> for the two breaking changes.</p>
+
+      <h2>Flag: a centered paragraph whose last word wraps alone</h2>
+      <p class="copy flag-centered" style="width: 39.5ch; text-align: center">Line breaks decide how a block of text sits on the page, and one word alone on the last line leaves a hole under the text.</p>
+
+      <h2>Flag: a right-aligned paragraph whose last word wraps alone</h2>
+      <p class="copy flag-right" style="width: 39.5ch; text-align: right">Line breaks decide how a block of text sits on the page, and one word alone on the last line leaves a hole under the text.</p>
     </div>
 
     <div class="col" data-col="pass">
@@ -64,6 +70,13 @@
 
       <h2>Pass: a paragraph that ends on an inline icon</h2>
       <p class="copy pass-inline-icon" style="width: 39.5ch">Line breaks decide how a block of text sits on the page, and one word alone on the last line leaves a hole under the <img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16'/%3E" width="16" height="16" alt=""> text.</p>
+
+      <!-- Issue #1073: in 16px Arial at 711px, "it fills." sets in 6% of the
+           measure, and a count of its characters read it as one word. The
+           no-break space keeps the two words on one line in any face, so the
+           row passes on a machine without Arial too. -->
+      <h2>Pass: two narrow words on a short last line</h2>
+      <p class="pass-narrow-letters" style="width: 711px; font: 16px/1.6 Arial, sans-serif; margin: 0">Every room has a shape of its own, and the furniture in it slowly bends toward whatever open space it&nbsp;fills.</p>
 
       <h2>Pass: a one-line paragraph</h2>
       <p class="copy pass-one-line" style="width: 39.5ch">One line of copy, short of the column.</p>
