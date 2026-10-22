@@ -13,8 +13,8 @@
 //! Both are advisory. An uneven break can be the design: a headline that
 //! lands on one word for weight, a poster line, a pull quote.
 
-use super::dom::{renders_no_text, tag_lower, Dom, DomChild, ElId};
-use super::quality::{is_atomic_inline, is_visually_hidden, rendered_text_len, COMBINING_OR_FORMAT_RE};
+use super::dom::{renders_no_text, tag_lower, Dom, DomChild, ElId, Rect};
+use super::quality::{is_atomic_inline, is_visually_hidden, rendered_text_len};
 use super::text_geometry::{holds_only_phrasing, phrasing_holds_break};
 use crate::checks::rules::{is_heading_tag, RuleHit};
 use crate::checks::text_rules::is_cjk_text;
@@ -157,12 +157,13 @@ fn words(dom: &dyn Dom, el: ElId) -> Vec<String> {
         .collect()
 }
 
-/// The characters of `word` that take up room on a line, counted as
-/// `rendered_text_len` counts them: one per character, combining marks and
-/// format characters left out. An emoji is one, not two UTF-16 units.
-fn advancing_len(word: &str) -> f64 {
-    let mut buf = [0u8; 4];
-    word.chars().filter(|c| !COMBINING_OR_FORMAT_RE.is_match(c.encode_utf8(&mut buf))).count() as f64
+/// Whether two rects sit on one row: they overlap by more than half the
+/// shorter one's height, the test `merge_text_rects_into_lines` joins
+/// fragments into a line by.
+fn share_a_row(a: Rect, b: Rect) -> bool {
+    let overlap = a.bottom.min(b.bottom) - a.top.max(b.top);
+    let shorter = a.height.min(b.height);
+    shorter > 0.0 && overlap > shorter / 2.0
 }
 
 /// Characters per pixel of `el`'s lines: the rendered characters
@@ -175,10 +176,10 @@ fn chars_per_px(dom: &dyn Dom, el: ElId, widths: &[f64]) -> Option<f64> {
 
 /// `straggler`: one word alone on the last line of a multi-line paragraph.
 ///
-/// The lines are measured; the words on them are not. The characters divide
-/// between the lines in proportion to their widths, as `line-length` divides
-/// them, and the last line holds one word when its share of the characters
-/// is nearer the last word's length than the last two words'.
+/// The lines and the last two words are both measured: the last word is
+/// alone when the word before it ended on another row. A count of the
+/// characters on the last line could not say so: narrow letters fit two
+/// words in the room the estimate gave one.
 fn check_straggler(dom: &dyn Dom, el: ElId) -> Option<RuleHit> {
     if wraps_with(dom, el, "pretty") || breaks_are_authored(dom, el) {
         return None;
@@ -204,12 +205,11 @@ fn check_straggler(dom: &dyn Dom, el: ElId) -> Option<RuleHit> {
     if widest * chars_per_px < STRAGGLER_MIN_COLUMN_CHARS {
         return None;
     }
-    let word = &words[words.len() - 1];
-    let one = advancing_len(word);
-    let two = one + 1.0 + advancing_len(&words[words.len() - 2]);
-    if last * chars_per_px >= (one + two) / 2.0 {
+    let [before, last_word] = dom.last_word_rects(el)?;
+    if share_a_row(before, last_word) {
         return None;
     }
+    let word = &words[words.len() - 1];
     Some(RuleHit::new(
         "straggler",
         format!(
@@ -282,6 +282,10 @@ mod tests {
         let rects: Vec<(f64, f64, f64, f64)> =
             lines.iter().enumerate().map(|(i, w)| (0.0, 100.0 + 24.0 * i as f64, *w, 19.0)).collect();
         d.set_text_lines(el, &rects);
+        // The last word alone: the word before it ends the line above.
+        if let [.., (_, above, w_above, _), (_, y, w, h)] = rects[..] {
+            d.set_last_words(el, (w_above - 40.0, above, 40.0, h), (0.0, y, w, h));
+        }
         el
     }
 
@@ -332,6 +336,44 @@ mod tests {
         let mut d = FakeDom::new();
         let (_h, body) = d.with_page();
         let p = block(&mut d, body, "p", PROSE, &[560.0, 510.0, 80.0]);
+        d.set_last_words(p, (0.0, 148.0, 38.0, 19.0), (42.0, 148.0, 38.0, 19.0));
+        assert!(ids(&d, p).is_empty());
+    }
+
+    /// Issue #1073: in 16px Arial at 711px, "it fills." set on the last
+    /// line in 6% of the measure, which a count of its characters read as
+    /// "fills." alone. Measured, the two words share the row.
+    #[test]
+    fn narrow_letters_on_a_short_last_line_are_two_words() {
+        let mut d = FakeDom::new();
+        let (_h, body) = d.with_page();
+        let text = PROSE.replace("under the text.", "under the line it fills.");
+        let p = block(&mut d, body, "p", &text, &[700.0, 42.0]);
+        d.set_last_words(p, (0.0, 124.0, 9.0, 19.0), (13.0, 124.0, 29.0, 19.0));
+        assert!(ids(&d, p).is_empty());
+    }
+
+    /// A word hyphenated across the last break ends on the last line, its
+    /// tail alone there; its last rect is the one the rule reads.
+    #[test]
+    fn a_word_hyphenated_onto_the_last_line_is_a_straggler() {
+        let mut d = FakeDom::new();
+        let (_h, body) = d.with_page();
+        let text = PROSE.replace("text.", "re\u{AD}turn.");
+        let p = block(&mut d, body, "p", &text, &[560.0, 560.0, 30.0]);
+        // "the" ends line two; "re-" ends it too, and "turn." starts line three.
+        d.set_last_words(p, (500.0, 124.0, 24.0, 19.0), (0.0, 148.0, 30.0, 19.0));
+        assert_eq!(ids(&d, p), ["straggler"]);
+    }
+
+    /// A DOM that did not measure the last two words gets no finding: the
+    /// rule does not fall back on guessing where they broke.
+    #[test]
+    fn no_last_word_rects_no_finding() {
+        let mut d = FakeDom::new();
+        let (_h, body) = d.with_page();
+        let p = block(&mut d, body, "p", PROSE, &[560.0, 560.0, 40.0]);
+        d.el_mut(p).last_word_rects = None;
         assert!(ids(&d, p).is_empty());
     }
 
@@ -564,15 +606,6 @@ mod tests {
         let p = block(&mut d, body, "p", &text, &[560.0, 560.0, 560.0, 560.0, 560.0, 560.0, 560.0, 40.0]);
         d.set_style(p, "textWrapStyle", "balance");
         assert_eq!(ids(&d, p), vec!["straggler"]);
-    }
-
-    /// The word is counted the way the line is: an emoji advances once, not
-    /// as its two UTF-16 units, so a short word plus an emoji tail is two
-    /// words and not one long one.
-    #[test]
-    fn the_word_and_the_line_are_counted_alike() {
-        assert_eq!(advancing_len("go\u{1F680}"), 3.0);
-        assert_eq!(advancing_len("e\u{301}te\u{301}"), 3.0);
     }
 }
 
