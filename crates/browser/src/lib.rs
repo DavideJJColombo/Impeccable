@@ -848,8 +848,10 @@ fn results_from_groups(groups: &[Value]) -> Vec<RawResult> {
 /// order: whether it is a `low-contrast` verdict on text the element pass
 /// hands to the pixels ([`impeccable_core::browser::visual::routed_reason`]).
 /// The live scan lets a pixel verdict replace such a verdict, so it is the
-/// visual-contrast pass's to report, and a replay leaves it out.
-fn handed_over(dom: &SnapshotDom, groups: &[impeccable_core::browser::FindingGroup]) -> Vec<bool> {
+/// visual-contrast pass's to report, and a replay leaves it out. A handed
+/// verdict over a picture carries the text it keeps if the pixels give none
+/// ([`impeccable_core::browser::visual::unmeasured_handed_over_snippet`]).
+fn handed_over(dom: &SnapshotDom, groups: &[impeccable_core::browser::FindingGroup]) -> Vec<Handed> {
     let mut out = Vec::new();
     for g in groups {
         let mut routed: Option<bool> = None;
@@ -858,22 +860,39 @@ fn handed_over(dom: &SnapshotDom, groups: &[impeccable_core::browser::FindingGro
                 && *routed.get_or_insert_with(|| {
                     impeccable_core::browser::visual::routed_reason(dom, g.el).is_some()
                 });
-            out.push(handed);
+            out.push(if handed {
+                Handed::Yes(impeccable_core::browser::visual::unmeasured_handed_over_snippet(dom, g.el, &f.detail))
+            } else {
+                Handed::No
+            });
         }
     }
     out
 }
 
-/// Move the verdicts [`handed_over`] marks to [`origin::VISUAL_CONTRAST`].
-/// Results that do not line up with the marks (never expected) stay in the
-/// scan origin, the same way live and in a replay.
-fn hand_over(results: &mut [RawResult], handed: &[bool]) {
+/// What [`handed_over`] says of one result.
+#[derive(Debug, Clone, PartialEq)]
+enum Handed {
+    No,
+    /// Handed to the pixels, with the text the verdict keeps if they give
+    /// none (`None`: its own).
+    Yes(Option<String>),
+}
+
+/// Move the verdicts [`handed_over`] marks to [`origin::VISUAL_CONTRAST`],
+/// with the text they keep if the pixels give none (only an unsuperseded
+/// one is ever printed). Results that do not line up with the marks (never
+/// expected) stay in the scan origin, the same way live and in a replay.
+fn hand_over(results: &mut [RawResult], handed: &[Handed]) {
     if handed.len() != results.len() {
         return;
     }
     for (r, handed) in results.iter_mut().zip(handed) {
-        if *handed {
+        if let Handed::Yes(unmeasured) = handed {
             r.origin = origin::VISUAL_CONTRAST;
+            if let Some(text) = unmeasured {
+                r.snippet = text.clone();
+            }
         }
     }
 }

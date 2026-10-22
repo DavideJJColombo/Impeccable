@@ -30,7 +30,7 @@ fn runtime<'a>(io: &Io, html: &'a dyn HtmlEngine) -> Runtime<'a> {
         cwd,
         io.env.clone(),
         provider.command,
-        &provider.self_cmd,
+        &provider.self_raw,
         html,
     )
 }

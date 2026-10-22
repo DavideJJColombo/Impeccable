@@ -244,6 +244,7 @@ pub fn run(args: &[String], io: &mut Io) -> i32 {
         .get("IMPECCABLE_SELF")
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
+        .map(|v| impeccable_common::launcher::spell_self(&v))
         .unwrap_or_else(|| "impeccable".to_string());
     let (flags, target) = match parse_args(args) {
         Ok(v) => v,

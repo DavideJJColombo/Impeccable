@@ -1157,6 +1157,7 @@ mod user_scope_hook_tests {
             command: "/impeccable".to_string(),
             skill_dir: None,
             self_cmd: "impeccable".to_string(),
+            self_raw: "impeccable".to_string(),
         };
         let mut env = Env::new();
         env.insert("HOME".to_string(), home.clone());

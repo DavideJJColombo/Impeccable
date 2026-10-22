@@ -66,8 +66,9 @@ pub(crate) fn self_cmd(io: &Io) -> String {
         && !value.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-' | b':') || (cfg!(windows) && b == b'\\'))
     {
         if cfg!(windows) {
-            // cmd.exe treats single quotes as literal filename characters.
-            return format!("\"{value}\"");
+            // cmd.exe treats single quotes as literal filename characters;
+            // a quoted .cmd launcher also needs PowerShell's call operator.
+            return impeccable_common::launcher::with_call_operator(&value, format!("\"{value}\""));
         }
         return format!("'{}'", value.replace('\'', "'\\''"));
     }
@@ -3263,8 +3264,9 @@ mod transparency_guidance_tests {
         for value in [relative.to_string(), launcher.to_string_lossy().into_owned()] {
             let env = [("IMPECCABLE_SELF".into(), value.clone())].into();
             let (io, _) = Io::captured("", dir.clone(), env);
-            let quote = if cfg!(windows) { '"' } else { '\'' };
-            let expected = format!("{quote}{value}{quote}");
+            // Windows spells the quoted .cmd launcher as a PowerShell call
+            // on a literal string (#744); sh quotes the path in single quotes.
+            let expected = if cfg!(windows) { format!("& '{value}'") } else { format!("'{value}'") };
             assert_eq!(self_cmd(&io), expected);
             let next = next_instruction(&io, &json!({"phase": "plates"}));
             assert!(next.contains(&format!("{expected} generate-image --ref")), "{next}");
