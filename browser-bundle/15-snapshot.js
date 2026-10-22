@@ -122,33 +122,34 @@ function __snapRendersNoText(el) {
 // in document order, skipping subtrees `rendersNoText` says set no text,
 // split on white space, soft hyphens and zero-width spaces dropped. A word
 // may run across text nodes (`fil<em>ls.</em>`), so a Range spans them.
-// `null` when the text holds fewer than two words.
+// `null` when the text holds fewer than two words. The walk runs backward
+// from the last text node and stops at the space before the second word, so
+// a long block (or each `li` of a nested list) reads only its tail.
 function __snapLastWordRects(el, rendersNoText) {
-  const nodes = [];
-  (function walk(node) {
-    for (const child of node.childNodes) {
-      if (child.nodeType === 3) nodes.push(child);
-      else if (child.nodeType === 1 && !rendersNoText(child)) walk(child);
+  function* textNodesBackward(node) {
+    for (let child = node.lastChild; child; child = child.previousSibling) {
+      if (child.nodeType === 3) yield child;
+      else if (child.nodeType === 1 && !rendersNoText(child)) yield* textNodesBackward(child);
     }
-  })(el);
+  }
   // Rust's char::is_whitespace: JS \s less U+FEFF, plus U+0085.
   const space = c => c === '\u0085' || (c !== '\uFEFF' && /\s/.test(c));
   const ink = c => !space(c) && c !== '\u00AD' && c !== '\u200B';
-  // Walk back from the end: [node, offset] of each word's first and last
-  // inked character, last word first.
+  // [node, offset] of each word's first and last inked character, last
+  // word first.
   const words = [];
   let end = null, start = null;
-  for (let n = nodes.length - 1; n >= 0 && words.length < 2; n--) {
-    const data = nodes[n].data;
+  scan: for (const node of textNodesBackward(el)) {
+    const data = node.data;
     for (let i = data.length - 1; i >= 0; i--) {
       const c = data[i];
       if (space(c)) {
-        if (end) { words.push([start, end]); end = start = null; if (words.length === 2) break; }
+        if (end) { words.push([start, end]); end = start = null; if (words.length === 2) break scan; }
       } else if (ink(c)) {
-        if (!end) end = [nodes[n], i + 1];
-        start = [nodes[n], i];
+        if (!end) end = [node, i + 1];
+        start = [node, i];
       } else if (end) {
-        start = [nodes[n], i];
+        start = [node, i];
       }
     }
   }
