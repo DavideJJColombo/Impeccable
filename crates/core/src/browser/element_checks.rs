@@ -528,7 +528,10 @@ pub fn check_element_inset_stripe_dom(dom: &dyn Dom, el: ElId) -> Vec<RuleHit> {
     if shadow.is_empty() || shadow == "none" || !shadow.contains("inset") {
         return Vec::new();
     }
-    let row = matches_or_false(dom, el, ROW_OR_CELL);
+    let row = matches_or_false(dom, el, ROW_OR_CELL)
+        || class_attr(dom, el)
+            .split_whitespace()
+            .any(|c| crate::checks::row_stripe::is_row_or_cell_selector(&format!(".{c}")));
     let tag = tag_lower(dom, el);
     if !row && (BORDER_SAFE_TAGS.contains(&tag.as_str()) || tag == "table" || tag == "summary") {
         return Vec::new();
@@ -553,6 +556,20 @@ pub fn check_element_inset_stripe_dom(dom: &dyn Dom, el: ElId) -> Vec<RuleHit> {
                 })
         };
         if selected(el) || host.is_some_and(selected) {
+            return Vec::new();
+        }
+        // The row's state, or a cell that paints nothing but the stripe, as
+        // the stylesheet scan asks: a shaded cell with an edge is a column.
+        let status = |e: ElId| {
+            ["data-state", "data-status"].iter().any(|a| dom.attr(e, a).is_some())
+                || dom.attr(e, "aria-invalid").is_some_and(|v| v == "true")
+                || class_attr(dom, e).split_whitespace().any(|c| {
+                    crate::checks::row_stripe::selector_has_status_marker(&format!(".{c}"))
+                })
+        };
+        let bare = parse_rgb_or_any(&dom.style(el, "backgroundColor"))
+            .map_or(true, |c| c.alpha_or_one() < 0.1);
+        if !status(el) && !host.is_some_and(status) && !bare {
             return Vec::new();
         }
     }
@@ -5925,8 +5942,14 @@ mod tests {
             d.set_style(td, "boxShadow", silent);
             assert!(check_element_inset_stripe_dom(&d, td).is_empty(), "{silent}");
         }
-        // A selected row's stripe marks the selection.
+        // A shaded cell in an ordinary row is a column, not a status.
         d.set_style(td, "boxShadow", red);
+        d.set_attr(tr, "class", "");
+        d.set_style(td, "backgroundColor", "rgb(248, 250, 252)");
+        assert!(check_element_inset_stripe_dom(&d, td).is_empty());
+        d.set_attr(tr, "class", "is-broken");
+        assert_eq!(check_element_inset_stripe_dom(&d, td).len(), 1);
+        // A selected row's stripe marks the selection.
         d.set_attr(tr, "aria-selected", "true");
         assert!(check_element_inset_stripe_dom(&d, td).is_empty());
         // Off a table, the stripe is the card tell only on a rounded card.
