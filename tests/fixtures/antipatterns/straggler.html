@@ -71,17 +71,21 @@
       <h2>Pass: a paragraph that ends on an inline icon</h2>
       <p class="copy pass-inline-icon" style="width: 39.5ch">Line breaks decide how a block of text sits on the page, and one word alone on the last line leaves a hole under the <img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16'/%3E" width="16" height="16" alt=""> text.</p>
 
-      <!-- Issue #1073: in 16px Arial at 711px, "it fills." sets in 6% of the
-           measure, and a count of its characters read it as one word. The
-           no-break space keeps the two words on one line in any face, so the
-           row passes on a machine without Arial too. -->
-      <h2>Pass: two narrow words on a short last line</h2>
-      <p class="pass-narrow-letters" style="width: 711px; font: 16px/1.6 Arial, sans-serif; margin: 0">Every room has a shape of its own, and the furniture in it slowly bends toward whatever open space it&nbsp;fills.</p>
-
       <h2>Pass: a one-line paragraph</h2>
       <p class="copy pass-one-line" style="width: 39.5ch">One line of copy, short of the column.</p>
     </div>
 
+  </div>
+
+  <div class="col" data-col="pass">
+    <!-- Issue #1073: narrow letters fooled a count of the last line's
+         characters into reading "it fills." as one word (16px Verdana at
+         840px, mid-band of the widths where it misfired). The no-break
+         space keeps the two words on one line in any face, so the row
+         passes on a machine without Verdana too. It sits under the grid:
+         at 840px it would widen the pass column and wrap the flag headings. -->
+    <h2>Pass: two narrow words on a short last line</h2>
+    <p class="pass-narrow-letters" style="width: 840px; font: 16px/1.6 Verdana, sans-serif; margin: 0">Every room has a shape of its own, and the furniture in it slowly bends toward whatever open space it&nbsp;fills.</p>
   </div>
 </body>
 </html>
