@@ -65,13 +65,13 @@ Run the bundled detector and verify each finding in context. Look for repeated i
 
 ### 6. Internationalization
 
-**Check for**:
-- **Physical directional properties on RTL-declared pages**: `margin-left`, `margin-right`, `padding-left`, `padding-right` where logical equivalents (`margin-inline-start`, `margin-inline-end`, `padding-inline-start`, `padding-inline-end`) should be used
+**Check for** (each is a signal to verify the rendered result, not a defect in itself; flag only where the rendering is actually wrong):
+- **Physical directional properties on RTL-declared pages**: `margin-left`, `margin-right`, `padding-left`, `padding-right` where logical equivalents (`margin-inline-start`, `margin-inline-end`, `padding-inline-start`, `padding-inline-end`) would be expected
 - **Physical text-align**: `text-align: left` or `text-align: right` instead of `text-align: start` / `text-align: end`
 - **Physical float**: `float: left` or `float: right` instead of `float: inline-start` / `float: inline-end`
-- **Physical positioning on positioned elements**: `left:` or `right:` instead of `inset-inline-start` / `inset-inline-end`
+- **Physical positioning on positioned elements**: `left:` or `right:` instead of `inset-inline-start` / `inset-inline-end`. Note: `left:50%; transform:translateX(-50%)` is a direction-agnostic centering pattern that works correctly in both LTR and RTL; replacing `left` with `inset-inline-start` there breaks the centering because `translateX` is physical and does not mirror. Similarly, direction-scoped rules like `[dir="rtl"] .x { margin-right:1rem }` are correct by construction
 - **Physical border properties**: `border-left`, `border-right` instead of `border-inline-start`, `border-inline-end`
-- **Mirrored icons and directional assets**: arrows, chevrons, and navigation icons that point a fixed direction without a `[dir="rtl"]` flip (`transform: scaleX(-1)`)
+- **Directional icons and assets**: arrows, chevrons, and navigation icons that point the wrong direction for the reading order. An RTL-only page may ship assets already drawn correctly without a `[dir="rtl"]` flip; verify the rendered icon rather than assuming a missing `transform: scaleX(-1)` is a defect
 
 **Scope**: flag physical directional properties only on pages that declare `dir="rtl"` on the `<html>` or `<body>` element. A `lang` attribute alone does not set direction (browsers take direction from `dir`, never from `lang`), but treat an RTL-script `lang` (`ar`, `fa`, `ur`, `ps`, `ckb`, `he`, `yi`, `ug`, `sd`, `dv`) without an explicit `dir` as a signal worth noting. On LTR-only pages, note their presence as informational (P3) rather than a violation, since they will break if RTL is added later but are not incorrect today.
 
