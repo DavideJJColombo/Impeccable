@@ -52,10 +52,12 @@ Run comprehensive checks across 5 dimensions. Score each dimension 0-4 using the
 - **Horizontal scroll**: Content overflow on narrow viewports
 - **Text scaling**: Layouts that break when text size increases
 - **Missing breakpoints**: No mobile/tablet variants
-- **Physical directional properties on RTL-declared pages** (each is a signal to verify the rendered result, not a defect in itself; flag only where the rendering is actually wrong): `margin-left`, `margin-right`, `padding-left`, `padding-right` where logical equivalents (`margin-inline-start`, `margin-inline-end`, `padding-inline-start`, `padding-inline-end`) would be expected
+
+On RTL-declared pages, each of the following is a signal to verify the rendered result, not a defect in itself; flag only where the rendering is actually wrong:
+- **Physical directional properties**: `margin-left`, `margin-right`, `padding-left`, `padding-right` where logical equivalents (`margin-inline-start`, `margin-inline-end`, `padding-inline-start`, `padding-inline-end`) would be expected
 - **Physical text-align**: `text-align: left` or `text-align: right` instead of `text-align: start` / `text-align: end`
 - **Physical float**: `float: left` or `float: right` instead of `float: inline-start` / `float: inline-end`
-- **Physical positioning on positioned elements**: `left:` or `right:` instead of `inset-inline-start` / `inset-inline-end`. Note: `left:50%; transform:translateX(-50%)` is a direction-agnostic centering pattern that works correctly in both LTR and RTL; replacing `left` with `inset-inline-start` there breaks the centering because `translateX` is physical and does not mirror. Similarly, direction-scoped rules like `[dir="rtl"] .x { margin-right:1rem }` are correct by construction
+- **Physical positioning on positioned elements**: `left:` or `right:` instead of `inset-inline-start` / `inset-inline-end`. Note: `left:50%; transform:translateX(-50%)` is a direction-agnostic centering pattern that works correctly in both LTR and RTL; replacing `left` with `inset-inline-start` there breaks the centering because `translateX` is physical and does not mirror. Similarly, a direction-scoped override like `[dir="rtl"] .x { margin-right:1rem }` is correct only when it also clears the conflicting base property (e.g. `margin-left: 0`); without that, both margins apply
 - **Physical border properties**: `border-left`, `border-right` instead of `border-inline-start`, `border-inline-end`
 - **Directional icons and assets**: arrows, chevrons, and navigation icons that point the wrong direction for the reading order. An RTL-only page may ship assets already drawn correctly without a `[dir="rtl"]` flip; verify the rendered icon rather than assuming a missing `transform: scaleX(-1)` is a defect
 
