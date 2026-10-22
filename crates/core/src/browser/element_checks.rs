@@ -1918,6 +1918,19 @@ pub fn check_element_colors_dom(
     el: ElId,
     seen: &mut SafeTagTextSeen,
 ) -> Vec<RuleHit> {
+    check_element_colors_dom_in(dom, el, seen, None)
+}
+
+/// [`check_element_colors_dom`] with the page's declared mockups: a
+/// `low-contrast` verdict on text inside one is dropped before it claims
+/// the page's one report of its colour pair, so the same pair outside the
+/// mockup still reports.
+pub fn check_element_colors_dom_in(
+    dom: &dyn Dom,
+    el: ElId,
+    seen: &mut SafeTagTextSeen,
+    mockups: Option<&super::hidden_mockup::HiddenMockups<'_>>,
+) -> Vec<RuleHit> {
     let tag = tag_lower(dom, el);
     let rect = dom.rect(el);
     let direct = direct_text(dom, el);
@@ -2327,6 +2340,13 @@ pub fn check_element_colors_dom(
     // glyphs paint another one (SVG text, a colour filter). Asked once, only
     // of an element that failed.
     let ink_read = |h: &RuleHit| (h.id != "low-contrast" && h.id != "gray-on-color") || painted != InkPaint::Unknown;
+    // Text inside a mockup the page declares is not content (decision 1 of
+    // round 13). Asked only of an element that failed.
+    let in_declared_mockup = std::cell::OnceCell::new();
+    let content = |h: &RuleHit| {
+        h.id != "low-contrast"
+            || !*in_declared_mockup.get_or_init(|| mockups.is_some_and(|m| m.declared(el)))
+    };
     let mut findings = crate::checks::rules::check_colors_deduped_shaped(
         &color_opts,
         seen,
@@ -2339,9 +2359,10 @@ pub fn check_element_colors_dom(
                 })
                 && verdict_stands(h)
                 && at_rest(h)
+                && content(h)
         },
     );
-    findings.retain(|h| ink_read(h) && verdict_stands(h) && at_rest(h));
+    findings.retain(|h| ink_read(h) && verdict_stands(h) && at_rest(h) && content(h));
     // A failing verdict that stands over unread paint far from the walk's
     // surface (dim copy on a dark panel laid beside it, where the walk read
     // the white page) is printed against that paint: the ratio the text
@@ -2479,6 +2500,7 @@ pub fn check_element_colors_dom(
     if closest_or_none(dom, el, DISABLED_CONTROL_SELECTOR).is_some() {
         findings.retain(|h| h.id != "low-contrast");
     }
+    findings.retain(|h| content(h));
     findings
 }
 

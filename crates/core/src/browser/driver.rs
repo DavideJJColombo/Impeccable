@@ -2624,6 +2624,33 @@ pub fn element_is_scanned(dom: &dyn Dom, el: ElId) -> bool {
     super::dom::closest_or_none(dom, el, "[id^=\"impeccable-live-\"]").is_none()
 }
 
+/// Drops the [`super::hidden_mockup::DROP_RULES`] findings of an element
+/// inside a declared mockup, and reports them as advisory inside a box
+/// labelled as a screenshot or illustration.
+fn apply_mockup_signals(mockups: &super::hidden_mockup::HiddenMockups<'_>, groups: &mut Vec<FindingGroup>) {
+    use super::hidden_mockup::{MockupSignal, DROP_RULES};
+    if mockups.is_empty() {
+        return;
+    }
+    for g in groups.iter_mut() {
+        if !g.findings.iter().any(|f| DROP_RULES.contains(&f.type_.as_str())) {
+            continue;
+        }
+        match mockups.signal(g.el) {
+            Some(MockupSignal::Declared) => {
+                g.findings.retain(|f| !DROP_RULES.contains(&f.type_.as_str()));
+            }
+            Some(MockupSignal::Labelled) => {
+                for f in g.findings.iter_mut().filter(|f| DROP_RULES.contains(&f.type_.as_str())) {
+                    f.severity = Some(crate::checks::rules::ADVISORY_SEVERITY.to_string());
+                }
+            }
+            None => {}
+        }
+    }
+    groups.retain(|g| !g.findings.is_empty());
+}
+
 /// JS: index.mjs#collectBrowserFindings()
 pub fn collect_browser_findings(dom: &dyn Dom, config: &BrowserConfig) -> CollectResult {
     use super::element_checks as ec;
@@ -2670,6 +2697,9 @@ pub fn collect_browser_findings(dom: &dyn Dom, config: &BrowserConfig) -> Collec
     let body_key = body.unwrap_or(0);
 
     let glow_text = ec::GlowTextRects::default();
+    // Product mockups the page declares are not content (decision 1 of round
+    // 13), and boxes labelled as a screenshot report as advisory (r13-t5).
+    let mockups = super::hidden_mockup::HiddenMockups::scan(dom);
     for el in dom.query_all(None, "*").unwrap_or_default() {
         if !element_is_scanned(dom, el) {
             continue;
@@ -2679,7 +2709,7 @@ pub fn collect_browser_findings(dom: &dyn Dom, config: &BrowserConfig) -> Collec
         findings.extend(hits(ec::check_element_borders_dom(dom, el)));
         findings.extend(hits(ec::check_element_pseudo_stripe_dom(dom, el)));
         findings.extend(hits(ec::check_element_stripe_child_dom(dom, el)));
-        findings.extend(hits(ec::check_element_colors_dom(dom, el, &mut color_seen)));
+        findings.extend(hits(ec::check_element_colors_dom_in(dom, el, &mut color_seen, Some(&mockups))));
         findings.extend(hits(ec::check_element_motion_dom(dom, el)));
         findings.extend(hits(ec::check_element_glow_dom(dom, el)));
         findings.extend(hits(ec::check_element_hard_offset_shadow_dom(dom, el)));
@@ -2852,7 +2882,7 @@ pub fn collect_browser_findings(dom: &dyn Dom, config: &BrowserConfig) -> Collec
     el_pass(&mut groups, pc::check_text_occlusion_dom(dom));
     el_pass(&mut groups, pc::check_first_viewport_column_overflow_dom(dom));
 
-    page_pass(&mut groups, &mut page_level, q::check_page_quality_dom(dom));
+    page_pass(&mut groups, &mut page_level, q::check_page_quality_dom_in(dom, Some(&mockups)));
     page_pass(&mut groups, &mut page_level, q::check_page_overflow_dom(dom));
     page_pass(&mut groups, &mut page_level, hits(pc::check_cream_palette(dom)));
     // The stylesheet-text forms go last among the built-in passes because
@@ -2868,6 +2898,11 @@ pub fn collect_browser_findings(dom: &dyn Dom, config: &BrowserConfig) -> Collec
     let page_forms =
         reconcile_page_level_forms(dom, &groups, pattern_items, &pattern_style_text, root_dark);
     page_pass(&mut groups, &mut page_level, page_forms);
+
+    // The rules that score a mockup's text and boxes as the page's content
+    // report nothing inside a mockup the page declares, and advisory inside
+    // a box labelled as a screenshot.
+    apply_mockup_signals(&mockups, &mut groups);
 
     // Rule-pack page rules run after every built-in page pass, through the
     // same attribution as the built-in checks that name their own element.

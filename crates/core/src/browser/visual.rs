@@ -1972,6 +1972,10 @@ pub fn collect_visual_contrast_candidates(dom: &dyn Dom, options: &Value) -> Vec
     // still reports its own verdict when it is read.
     let mut routed_keys: Vec<String> = Vec::new();
     let mut repeats: Vec<Value> = Vec::new();
+    // Text in a mockup the page declares is not content (decision 1 of
+    // round 13): the element pass reports none of it, and it takes no slot
+    // of either budget here.
+    let mockups = super::hidden_mockup::HiddenMockups::scan(dom);
     for el in dom.query_all(None, "*").unwrap_or_default() {
         let base_open = (candidates.len() as f64) < max_candidates;
         let routed_open = (routed.len() as f64) < max_routed;
@@ -2008,6 +2012,9 @@ pub fn collect_visual_contrast_candidates(dom: &dyn Dom, options: &Value) -> Vec
             || is_emoji_only_text(&direct)
             || super::element_checks::is_icon_text(dom, el, &direct)
         {
+            continue;
+        }
+        if mockups.declared(el) {
             continue;
         }
         if base_open && rendered {

@@ -2869,12 +2869,26 @@ pub const FOOTER_SELECTOR: &str = "footer, [role=\"contentinfo\"], #footer";
 /// closing call to action is often inside the footer). A skip between two
 /// later footer headings, and every skip in the content, reports.
 pub fn check_page_quality_from_doc(dom: &dyn Dom) -> Vec<RuleHit> {
+    check_page_quality_from_doc_in(dom, None)
+}
+
+/// [`check_page_quality_from_doc`] with the page's declared mockups: a
+/// heading inside one is part of a drawing, not of the page's outline, so
+/// the outline reads on around it as if it were not there (decision 1 of
+/// round 13).
+pub fn check_page_quality_from_doc_in(
+    dom: &dyn Dom,
+    mockups: Option<&super::hidden_mockup::HiddenMockups<'_>>,
+) -> Vec<RuleHit> {
     let mut findings = Vec::new();
     let mut prev_level: i64 = 0;
     let mut prev_text = String::new();
     let mut prev_footer: Option<ElId> = None;
     let mut prev_opens_footer = false;
     for h in dom.query_all(None, "h1, h2, h3, h4, h5, h6").unwrap_or_default() {
+        if mockups.is_some_and(|m| m.declared(h)) {
+            continue;
+        }
         let tag = dom.tag_name(h);
         // JS `parseInt(h.tagName[1])`
         let level = js::parse_int(&tag.chars().nth(1).map(|c| c.to_string()).unwrap_or_default(), 10);
@@ -2913,7 +2927,16 @@ pub fn check_page_quality_from_doc(dom: &dyn Dom) -> Vec<RuleHit> {
 
 /// JS: checks.mjs#checkPageQualityDOM() — `{ type, detail }` shape.
 pub fn check_page_quality_dom(dom: &dyn Dom) -> Vec<BrowserFinding> {
-    check_page_quality_from_doc(dom)
+    check_page_quality_dom_in(dom, None)
+}
+
+/// [`check_page_quality_dom`] with the page's declared mockups
+/// ([`check_page_quality_from_doc_in`]).
+pub fn check_page_quality_dom_in(
+    dom: &dyn Dom,
+    mockups: Option<&super::hidden_mockup::HiddenMockups<'_>>,
+) -> Vec<BrowserFinding> {
+    check_page_quality_from_doc_in(dom, mockups)
         .iter()
         .map(BrowserFinding::from_hit)
         .collect()
