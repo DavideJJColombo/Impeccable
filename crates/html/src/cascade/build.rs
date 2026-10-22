@@ -107,12 +107,23 @@ pub fn collect_static_css_text(
     let mut warned_missing_stylesheets: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     for style_el in doc.query_selector_all("style") {
-        let text = style_el.text_content();
-        pattern_texts.push(text.clone());
-        style_texts.push(text);
+        if style_el
+            .get_attribute("media")
+            .is_none_or(|m| m.trim().is_empty() || super::media::matches_media(m))
+        {
+            let text = style_el.text_content();
+            pattern_texts.push(text.clone());
+            style_texts.push(text);
+        }
     }
     let file_dir_str = file_dir.to_string_lossy().into_owned();
     for link in doc.query_selector_all("link") {
+        if link
+            .get_attribute("media")
+            .is_some_and(|m| !m.trim().is_empty() && !super::media::matches_media(m))
+        {
+            continue;
+        }
         let rel = link.get_attribute("rel").unwrap_or("");
         let href = link.get_attribute("href").unwrap_or("");
         if !STYLESHEET_REL_RE.is_match(rel) || href.is_empty() || REMOTE_HREF_RE.is_match(href) {
@@ -143,7 +154,10 @@ pub fn collect_static_css_text(
             }
         }
     }
-    (style_texts.join("\n"), pattern_texts.join("\n"))
+    (
+        super::media::screen_styles(&style_texts.join("\n")),
+        super::media::screen_styles(&pattern_texts.join("\n")),
+    )
 }
 
 static PSEUDO_RULE_RE: Lazy<Regex> = Lazy::new(|| {
@@ -306,6 +320,8 @@ pub fn build_static_style_map(
     profile: Option<&dyn ProfileSink>,
     file_path: &str,
 ) {
+    let screen_css = super::media::screen_styles(css_text);
+    let css_text = screen_css.as_str();
     let mut specified: SpecifiedStore<NodeId> = SpecifiedStore::new();
     let mut hover_specified: SpecifiedStore<NodeId> = SpecifiedStore::new();
     let mut placeholder_specified: SpecifiedStore<NodeId> = SpecifiedStore::new();
