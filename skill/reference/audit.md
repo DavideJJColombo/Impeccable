@@ -6,7 +6,7 @@ This is a code-level audit, not a design critique. Check what's measurable and v
 
 ## Diagnostic Scan
 
-Run comprehensive checks across 5 dimensions. Score each dimension 0-4 using the criteria below.
+Run comprehensive checks across 6 dimensions. Score each dimension 0-4 using the criteria below.
 
 ### 1. Accessibility (A11y)
 
@@ -63,6 +63,20 @@ Run the bundled detector and verify each finding in context. Look for repeated i
 
 **Score 0-4**: 0=systemic drift, 1=major repeated failures, 2=several verified issues, 3=minor isolated issues, 4=coherent and intentional
 
+### 6. Internationalization
+
+**Check for**:
+- **Physical directional properties on RTL-declared pages**: `margin-left`, `margin-right`, `padding-left`, `padding-right` where logical equivalents (`margin-inline-start`, `margin-inline-end`, `padding-inline-start`, `padding-inline-end`) should be used
+- **Physical text-align**: `text-align: left` or `text-align: right` instead of `text-align: start` / `text-align: end`
+- **Physical float**: `float: left` or `float: right` instead of `float: inline-start` / `float: inline-end`
+- **Physical positioning on positioned elements**: `left:` or `right:` instead of `inset-inline-start` / `inset-inline-end`
+- **Physical border properties**: `border-left`, `border-right` instead of `border-inline-start`, `border-inline-end`
+- **Mirrored icons and directional assets**: arrows, chevrons, and navigation icons that point a fixed direction without a `[dir="rtl"]` flip (`transform: scaleX(-1)`)
+
+**Scope**: flag physical directional properties only on pages that declare `dir="rtl"` on the `<html>` or `<body>` element. A `lang` attribute alone does not set direction (browsers take direction from `dir`, never from `lang`), but treat an RTL-script `lang` (`ar`, `fa`, `ur`, `ps`, `ckb`, `he`, `yi`, `ug`, `sd`, `dv`) without an explicit `dir` as a signal worth noting. On LTR-only pages, note their presence as informational (P3) rather than a violation, since they will break if RTL is added later but are not incorrect today.
+
+**Score 0-4**: 0=RTL page using physical properties throughout (layout mirrors incorrectly), 1=RTL page mostly physical with a few logical (partial breakage), 2=RTL page mixed (some properties converted, key gaps remain), 3=RTL page mostly logical (minor physical holdouts in non-critical paths), 4=RTL page fully logical. LTR-only pages score 4 (physical properties are correct on LTR); note them as informational (P3) per scope above
+
 ## Generate Report
 
 ### Audit Health Score
@@ -74,15 +88,16 @@ Run the bundled detector and verify each finding in context. Look for repeated i
 | 3 | Theming | ? | |
 | 4 | Responsive Design | ? | |
 | 5 | Implementation Integrity | ? | |
-| **Total** | | **??/20** | **[Rating band]** |
+| 6 | Internationalization | ? | |
+| **Total** | | **??/24** | **[Rating band]** |
 
-**Rating bands**: 18-20 Excellent (minor polish), 14-17 Good (address weak dimensions), 10-13 Acceptable (significant work needed), 6-9 Poor (major overhaul), 0-5 Critical (fundamental issues)
+**Rating bands**: 22-24 Excellent (minor polish), 17-21 Good (address weak dimensions), 12-16 Acceptable (significant work needed), 7-11 Poor (major overhaul), 0-6 Critical (fundamental issues)
 
 ### Implementation Integrity Verdict
 **Start here.** Pass/fail: does the implementation express a coherent product-specific system? Cite verified evidence and detector findings.
 
 ### Executive Summary
-- Audit Health Score: **??/20** ([rating band])
+- Audit Health Score: **??/24** ([rating band])
 - Total issues found (count by severity: P0/P1/P2/P3)
 - Top 3-5 critical issues
 - Recommended next steps
@@ -98,7 +113,7 @@ Tag every issue with **P0-P3 severity**:
 For each issue, document:
 - **[P?] Issue name**
 - **Location**: Component, file, line
-- **Category**: Accessibility / Performance / Theming / Responsive / Implementation Integrity
+- **Category**: Accessibility / Performance / Theming / Responsive / Implementation Integrity / Internationalization
 - **Impact**: How it affects users
 - **WCAG/Standard**: Which standard it violates (if applicable)
 - **Recommendation**: How to fix it
