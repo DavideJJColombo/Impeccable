@@ -140,17 +140,17 @@ fn is_button_box(dom: &dyn Dom, el: ElId) -> bool {
     false
 }
 const FURNITURE_ELEMENTS: &str = "nav, [role=\"navigation\"], td, th, [role=\"gridcell\"], [role=\"cell\"], caption, figcaption, dt, dd, footer";
-const FURNITURE_CLASSES: &str = "[class*=\"meta\" i], [class*=\"label\" i], [class*=\"badge\" i], [class*=\"chip\" i], [class*=\"pill\" i], [class*=\"tag\" i], [class*=\"kicker\" i], [class*=\"eyebrow\" i], [class*=\"breadcrumb\" i], [class*=\"timestamp\" i], [class*=\"category\" i], [class*=\"caption\" i], [class*=\"nav\" i]";
 
 /// Whether `el` is, or sits in, page furniture: navigation, a table cell, a
 /// caption, a footer, or a box whose class names one (a label, a chip, a
-/// breadcrumb). The class markers are not read off `html`, which holds the
+/// breadcrumb), read by part ([`class_names_furniture`]). The class markers are not read off `html`, which holds the
 /// page's script state flags: schlittermann.de's `html.js-nav-ready` made
 /// every element on the page navigation, a 10px sentence among them.
 /// `body` is still read: letour.fr's `body.has-breadcrumb` is a state flag
 /// too, but the 10px team names it reaches in the ranking rows are ones both
 /// judges called harmful (run 35, 218586).
 fn is_furniture(dom: &dyn Dom, el: ElId) -> bool {
+    use crate::checks::decorative_text::class_names_furniture;
     if matches_or_closest(dom, el, FURNITURE_ELEMENTS) {
         return true;
     }
@@ -159,7 +159,7 @@ fn is_furniture(dom: &dyn Dom, el: ElId) -> bool {
         if tag_lower(dom, c) == "html" {
             return false;
         }
-        if matches_or_false(dom, c, FURNITURE_CLASSES) {
+        if dom.attr(c, "class").is_some_and(|cls| class_names_furniture(&cls)) {
             return true;
         }
         cur = dom.parent(c);
@@ -3168,13 +3168,13 @@ mod tests {
         };
         let mut d = FakeDom::new();
         let (html, body) = d.with_page();
-        d.add_selector(html, FURNITURE_CLASSES);
+        d.set_attr(html, "class", "js js-nav-ready");
         let note = text_el(&mut d, body, "p", "For mails we never asked for and will never read", "10px");
         d.set_rect(note, 40.0, 400.0, 600.0, 14.0);
         assert!(!undersized(&d, note), "a sentence under html.js-nav-ready");
         // A box inside the page whose class names navigation still counts.
         let nav = d.add(Some(body), "div");
-        d.add_selector(nav, FURNITURE_CLASSES);
+        d.set_attr(nav, "class", "site-nav");
         let item = text_el(&mut d, nav, "span", "Linux support and consulting since 1997", "10px");
         d.set_rect(item, 40.0, 500.0, 300.0, 14.0);
         assert!(undersized(&d, item));

@@ -104,9 +104,16 @@ pub fn automatic_hook_mode(ctx: &Ctx, cwd: &str, env: &Env, provider: &Provider)
             }
         }
     }
-    if provider.id == "claude-code" {
-        let user_settings = jsp::join(&[&crate::util::homedir(env), ".claude", "settings.json"]);
-        if let Some(raw) = read_json(&user_settings) {
+    let user_manifest = match provider.id.as_str() {
+        "claude-code" => Some(jsp::join(&[&crate::util::homedir(env), ".claude", "settings.json"])),
+        "codex" | "agents" => Some(match env_nonempty(env, "CODEX_HOME") {
+            Some(root) => std::path::Path::new(cwd).join(root).join("hooks.json").to_string_lossy().into_owned(),
+            None => jsp::join(&[&crate::util::homedir(env), ".codex", "hooks.json"]),
+        }),
+        _ => None,
+    };
+    if let Some(path) = user_manifest {
+        if let Some(raw) = read_json(&path) {
             if let Some(hooks) = raw.get("hooks") {
                 if crate::staleness::js_truthy(hooks) && value_has_hook_marker(hooks) {
                     return "stop";
@@ -893,9 +900,202 @@ mod output_budget_tests {
 #[cfg(test)]
 mod user_scope_hook_tests {
     use super::automatic_hook_mode;
-    use crate::context::Ctx;
+    use crate::context::{load_context, Ctx};
     use crate::provider::Provider;
+    use crate::target_args::TargetOptions;
     use crate::util::Env;
+    use std::path::PathBuf;
+
+    const CODEX_HOOK: &str = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"\"/skills/impeccable/scripts/impeccable\" hook"}]}]}}"#;
+
+    struct UserHookFixture {
+        root: PathBuf,
+        project: String,
+        env: Env,
+    }
+
+    impl UserHookFixture {
+        fn new(provider: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "impeccable-codex-user-hook-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            ));
+            let project = root.join("project");
+            let home = root.join("home");
+            std::fs::create_dir_all(project.join(".git")).unwrap();
+            std::fs::create_dir_all(&home).unwrap();
+            let env = Env::from([
+                ("HOME".to_string(), home.to_string_lossy().into_owned()),
+                ("USERPROFILE".to_string(), home.to_string_lossy().into_owned()),
+                ("IMPECCABLE_PROVIDER_ID".to_string(), provider.to_string()),
+            ]);
+            Self { root, project: project.to_string_lossy().into_owned(), env }
+        }
+
+        fn put(&self, path: &str, body: &str) {
+            let path = self.root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+
+        fn mode(&self) -> &'static str {
+            let ctx = load_context(&self.project, &TargetOptions::default(), &self.env);
+            let provider = crate::provider::detect(&self.env, &self.project);
+            automatic_hook_mode(&ctx, &self.project, &self.env, &provider)
+        }
+    }
+
+    impl Drop for UserHookFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn codex_user_hooks_supply_automatic_hook_coverage() {
+        let fixture = UserHookFixture::new("codex");
+        fixture.put("home/.codex/hooks.json", CODEX_HOOK);
+        assert_eq!(fixture.mode(), "stop");
+    }
+
+    #[test]
+    fn agents_user_hooks_supply_automatic_hook_coverage() {
+        let fixture = UserHookFixture::new("agents");
+        fixture.put("home/.codex/hooks.json", CODEX_HOOK);
+        assert_eq!(fixture.mode(), "stop");
+    }
+
+    #[test]
+    fn custom_codex_home_supplies_coverage_for_both_providers() {
+        for provider in ["codex", "agents"] {
+            let mut fixture = UserHookFixture::new(provider);
+            fixture.put("custom-home/hooks.json", CODEX_HOOK);
+            fixture.env.insert("CODEX_HOME".to_string(), fixture.root.join("custom-home").to_string_lossy().into_owned());
+            assert_eq!(fixture.mode(), "stop", "{provider}");
+        }
+    }
+
+    #[test]
+    fn relative_codex_home_uses_caller_cwd_and_preserves_spaces() {
+        let mut fixture = UserHookFixture::new("codex");
+        // Windows strips trailing spaces from path components, so the
+        // edge-space spelling only exists on Unix; both keep an interior one.
+        let home = if cfg!(windows) { "codex home" } else { " codex home " };
+        fixture.put(&format!("caller/{home}/hooks.json"), CODEX_HOOK);
+        fixture.env.insert("CODEX_HOME".to_string(), home.to_string());
+        let cwd = fixture.root.join("caller").to_string_lossy().into_owned();
+        let options = TargetOptions { target_path: Some(fixture.project.clone()) };
+        let ctx = load_context(&cwd, &options, &fixture.env);
+        let provider = crate::provider::detect(&fixture.env, &cwd);
+        assert_eq!(ctx.project_root, fixture.project);
+        assert_eq!(automatic_hook_mode(&ctx, &cwd, &fixture.env, &provider), "stop");
+    }
+
+    #[test]
+    fn empty_codex_home_uses_default_user_hooks() {
+        let mut fixture = UserHookFixture::new("codex");
+        fixture.put("home/.codex/hooks.json", CODEX_HOOK);
+        fixture.env.insert("CODEX_HOME".to_string(), String::new());
+        assert_eq!(fixture.mode(), "stop");
+    }
+
+    #[test]
+    fn custom_codex_home_never_borrows_default_user_hooks() {
+        for provider in ["codex", "agents"] {
+            let mut fixture = UserHookFixture::new(provider);
+            fixture.put("home/.codex/hooks.json", CODEX_HOOK);
+            fixture.env.insert("CODEX_HOME".to_string(), fixture.root.join("custom-home").to_string_lossy().into_owned());
+            assert_eq!(fixture.mode(), "none", "{provider}: missing directory");
+            std::fs::create_dir_all(fixture.root.join("custom-home")).unwrap();
+            assert_eq!(fixture.mode(), "none", "{provider}: missing manifest");
+            fixture.put("custom-home/hooks.json", "{invalid json");
+            assert_eq!(fixture.mode(), "none", "{provider}: invalid manifest");
+        }
+    }
+
+    #[test]
+    fn invalid_user_hooks_do_not_supply_coverage() {
+        let fixture = UserHookFixture::new("codex");
+        assert_eq!(fixture.mode(), "none", "missing manifest");
+        for manifest in [
+            "{invalid json",
+            r#"{"command":"/skills/impeccable/scripts/impeccable hook"}"#,
+            r#"{"hooks":{}}"#,
+            r#"{"hooks":{"Stop":[{"command":"echo hook"}]}}"#,
+            r#"{"hooks":{"Stop":[{"command":"node /skills/impeccable/scripts/hook.mjs"}]}}"#,
+            r#"{"hooks":{"SessionStart":[{"command":"/skills/impeccable/scripts/impeccable context"}]}}"#,
+        ] {
+            fixture.put("home/.codex/hooks.json", manifest);
+            assert_eq!(fixture.mode(), "none", "{manifest}");
+        }
+    }
+
+    #[test]
+    fn disabled_project_or_environment_blocks_user_hooks() {
+        let mut fixture = UserHookFixture::new("codex");
+        fixture.put("home/.codex/hooks.json", CODEX_HOOK);
+        fixture.env.insert("IMPECCABLE_HOOK_DISABLED".to_string(), "yes".to_string());
+        assert_eq!(fixture.mode(), "none", "environment disabled");
+        fixture.env.remove("IMPECCABLE_HOOK_DISABLED");
+        fixture.put("project/.impeccable/config.json", r#"{"hook":{"enabled":false}}"#);
+        assert_eq!(fixture.mode(), "none", "project disabled");
+        fixture.put("project/.impeccable/config.local.json", r#"{"hook":{"enabled":true}}"#);
+        assert_eq!(fixture.mode(), "stop", "local config re-enables hooks");
+        fixture.put("project/.impeccable/config.json", r#"{"hook":{"enabled":true}}"#);
+        fixture.put("project/.impeccable/config.local.json", r#"{"hook":{"enabled":false}}"#);
+        assert_eq!(fixture.mode(), "none", "local config disables hooks");
+    }
+
+    #[test]
+    fn home_lifecycle_config_does_not_disable_an_unrelated_project() {
+        let fixture = UserHookFixture::new("codex");
+        fixture.put("home/.codex/hooks.json", CODEX_HOOK);
+        fixture.put("home/.impeccable/config.json", r#"{"hook":{"enabled":false}}"#);
+        assert_eq!(fixture.mode(), "stop");
+    }
+
+    #[test]
+    fn other_providers_do_not_borrow_codex_user_hooks() {
+        for provider in ["source", "cursor", "gemini", "claude-code"] {
+            let mut fixture = UserHookFixture::new(provider);
+            fixture.put("home/.codex/hooks.json", CODEX_HOOK);
+            fixture.put("custom-home/hooks.json", CODEX_HOOK);
+            fixture.env.insert("CODEX_HOME".to_string(), fixture.root.join("custom-home").to_string_lossy().into_owned());
+            assert_eq!(fixture.mode(), "none", "{provider}");
+        }
+    }
+
+    #[test]
+    fn native_platforms_exclude_user_hooks() {
+        let fixture = UserHookFixture::new("codex");
+        fixture.put("home/.codex/hooks.json", CODEX_HOOK);
+        for platform in ["ios", "android", "adaptive"] {
+            fixture.put("project/PRODUCT.md", &format!("# Product\n\n## Platform\n{platform}\n"));
+            let ctx = load_context(&fixture.project, &TargetOptions::default(), &fixture.env);
+            assert_eq!(ctx.platform.as_deref(), Some(platform));
+            assert_eq!(fixture.mode(), "none", "{platform}");
+        }
+    }
+
+    #[test]
+    fn project_hooks_still_supply_coverage_with_missing_custom_home() {
+        let mut fixture = UserHookFixture::new("codex");
+        fixture.put("project/.codex/hooks.json", CODEX_HOOK);
+        fixture.env.insert("CODEX_HOME".to_string(), fixture.root.join("missing").to_string_lossy().into_owned());
+        assert_eq!(fixture.mode(), "stop");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_home_resolves_parent_components_after_symlinks() {
+        let mut fixture = UserHookFixture::new("codex");
+        fixture.put("real-home/hooks.json", CODEX_HOOK);
+        std::fs::create_dir_all(fixture.root.join("real-home/child")).unwrap();
+        std::os::unix::fs::symlink(fixture.root.join("real-home/child"), fixture.root.join("project/link")).unwrap();
+        fixture.env.insert("CODEX_HOME".to_string(), "link/..".to_string());
+        assert_eq!(fixture.mode(), "stop");
+    }
 
     #[test]
     fn claude_user_settings_supply_automatic_hook_coverage() {
