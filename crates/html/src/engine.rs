@@ -31,6 +31,7 @@ use crate::profile::{self, Meta, ProfileSink};
 use crate::quality::{check_element_quality, check_page_quality_from_doc, pf0};
 use impeccable_core::checks::css_scan::{side_stripe_index, CssHostIndex};
 use impeccable_core::checks::html_patterns::{check_html_patterns, HtmlPatternCorpora};
+use impeccable_core::checks::row_stripe::scan_css_text_for_row_stripe;
 use impeccable_core::checks::rules::{is_rounded_away_from_side, RuleHit, SafeTagTextSeen};
 use impeccable_core::findings::{try_finding, Finding};
 use impeccable_core::inline_ignores::apply_inline_ignores;
@@ -431,6 +432,30 @@ pub fn detect_html_source(
                     item.severity = sev.clone();
                 }
                 impeccable_core::findings::derive_advisory_flag(&mut item);
+                findings.push(item);
+            }
+        }
+
+        // A side stripe on a status row or cell, which the card scans above
+        // skip: it reports when the page has a row or cell it paints.
+        let row_hits = profile::findings(
+            profile,
+            Meta::new("page", "row-stripe", fp),
+            |f: &impeccable_core::checks::css_scan::PatternFinding| f.id.as_str(),
+            || scan_css_text_for_row_stripe(&corpora.style_text, None),
+        );
+        for f in row_hits {
+            let Some(selector) = f.selector.as_deref() else { continue };
+            let stripped = PSEUDO_STRIP_RE.replace_all(selector, "");
+            let stripped = impeccable_core::js::trim(&stripped);
+            if doc.compile(stripped).is_err() {
+                continue;
+            }
+            let hosts = doc.query_selector_all(stripped);
+            if hosts.is_empty() || hosts.iter().all(|el| scoped_ignore_active(el, &f.id)) {
+                continue;
+            }
+            if let Some(item) = mk(&f.id, &f.snippet) {
                 findings.push(item);
             }
         }
