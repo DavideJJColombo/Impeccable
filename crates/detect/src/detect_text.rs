@@ -1906,29 +1906,61 @@ pub fn run_regex_matchers(
         let run = || {
             let mut matches = Vec::new();
             let image = matcher.id == "broken-image";
-            if image && !lines.iter().any(|l| l.as_bytes().windows(4).any(|w| w.eq_ignore_ascii_case(b"<img"))) {
+            if image
+                && (phase != "source"
+                    || !lines.iter().any(|l| {
+                        l.as_bytes().windows(4).any(|w| w.eq_ignore_ascii_case(b"<img"))
+                    }))
+            {
                 return matches;
             }
+            let mut image_cursor = 0;
             for (i, line) in lines.iter().enumerate() {
                 let (line, ctxs): (&str, Vec<MatchCtx>) = if image {
-                    let (text, starts) = image_source.get_or_init(|| {
+                    let (text, starts, markup) = image_source.get_or_init(|| {
                         let joined = lines.join("\n");
-                        let mut starts = Vec::with_capacity(lines.len());
-                        let mut at = 0;
-                        for l in lines {
-                            starts.push(at);
-                            at += l.len() + 1;
-                        }
                         // Masking keeps every byte offset and newline.
                         let text = if JS_SOURCE_EXTS.contains(&ext.as_str()) {
                             mask_js_literals(&joined, matches!(ext.as_str(), ".js" | ".jsx" | ".tsx"))
                         } else {
                             joined
                         };
-                        (text, starts)
+                        let mut starts = Vec::with_capacity(lines.len());
+                        let mut at = 0;
+                        for (i, l) in text.split('\n').enumerate() {
+                            starts.push(at);
+                            at += l.len() + usize::from(i + 1 < lines.len());
+                        }
+                        let jsx = matches!(ext.as_str(), ".js" | ".jsx" | ".tsx");
+                        let template = matches!(ext.as_str(), ".svelte" | ".vue" | ".astro");
+                        let css = CSS_LIKE_EXTS.contains(&ext.as_str());
+                        let markup = crate::regex_matchers::scan_markup_context(
+                            &text,
+                            crate::regex_matchers::MarkupScanOptions {
+                                jsx,
+                                expressions: jsx || template,
+                                nested_tags: jsx || ext == ".astro",
+                                raw_text: !JS_SOURCE_EXTS.contains(&ext.as_str()) && !css,
+                                markup: !css,
+                            },
+                        );
+                        (text, starts, markup)
                     });
-                    let rest = &text[starts[i]..];
-                    (&rest[..line.len()], crate::regex_matchers::find_broken_images(rest))
+                    let line_start = starts[i];
+                    let line_end = text[line_start..]
+                        .find('\n')
+                        .map(|end| line_start + end)
+                        .unwrap_or(text.len());
+                    (
+                        &text[line_start..line_end],
+                        crate::regex_matchers::find_broken_images_in_line(
+                            text,
+                            markup,
+                            &mut image_cursor,
+                            line_start,
+                            line_end,
+                        ),
+                    )
                 } else {
                     (line, (matcher.find_all)(line))
                 };

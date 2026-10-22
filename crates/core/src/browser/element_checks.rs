@@ -2369,6 +2369,71 @@ pub fn check_element_colors_dom(
             }
         }
     }
+    // Text that paints its gradient through transparent glyphs has no ink
+    // colour the passes above can score. On a solid ground it is scored by
+    // the stop that reads best, and reports only where even that one fails
+    // (`clipped_gradient_text_contrast`). The ground is what lies under the
+    // box, read from its parent, and only where the walk resolves one flat
+    // colour there and the climb finds no other paint under the text; a
+    // gradient or a picture beneath decides nothing here. Outlined or
+    // shadowed glyphs are read with their edge, which no stop describes.
+    if has_direct_text
+        && !icon_text
+        && !is_emoji_only_text(&direct)
+        && crate::checks::rules::background_clips_to_text(color_opts.bg_clip.as_deref().unwrap_or(""))
+        && {
+            // The glyph fill decides whether the gradient shows. A declared
+            // `-webkit-text-fill-color` is the fill (an opaque one paints
+            // over the gradient whatever `color` says); unset, the fill is
+            // `color`.
+            let fill = dom.style(ink_el, "webkitTextFillColor");
+            if fill.trim().is_empty() {
+                text_color.map_or(false, |c| c.alpha_or_one() <= crate::checks::rules::TRANSPARENT_INK_FLOOR)
+            } else {
+                text_fill_is_transparent(&fill)
+            }
+        }
+        && !findings.iter().any(|h| h.id == "low-contrast")
+    {
+        let shadow = dom.style(ink_el, "textShadow");
+        let edged = (!shadow.is_empty() && shadow != "none") || crate::browser::visual::text_outlined(dom, ink_el);
+        let ground = dom.flat_parent(el).and_then(|p| {
+            let under = resolve_text_surface(dom, p, &|_| false, text_box, font_size);
+            // A host whose own image paints over its fill is no flat
+            // ground, even where the walk fell back on the fill.
+            let host_paints_image = under.host.is_some_and(|h| {
+                let image = dom.style(h, "backgroundImage");
+                !image.is_empty() && image != "none"
+            });
+            (!under.info.unresolved
+                && under.samples.is_none()
+                && under.gradient_host.is_none()
+                && !host_paints_image)
+                .then_some(under.info.color)
+                .flatten()
+        });
+        if let (false, Some(ground)) = (edged, ground) {
+            if let Some(mut hit) = crate::checks::rules::clipped_gradient_text_contrast(color_opts.bg_image.as_deref().unwrap_or(""), &ground, threshold) {
+                // The climb starts at the parent: from the element itself its
+                // own clipped gradient answers first, and a dark backdrop
+                // laid under the headline (an absolute sibling, a hero photo)
+                // is never seen. Only the parent's own fill as the first
+                // paint under the text is the ground scored here.
+                let text_rect = dom.direct_text_rect(el).unwrap_or(rect);
+                let ground_is_ancestor = dom.flat_parent(el).is_some_and(|p| {
+                    crate::browser::visual::layer_under_rect(dom, p, &text_rect).0
+                        == crate::browser::visual::LayerUnder::Ancestor
+                });
+                let clear = ground_is_ancestor && layers_at() != crate::browser::text_layers::TextLayers::Covered;
+                if clear && at_rest(&hit) {
+                    if is_decorative() {
+                        hit.severity = Some(crate::checks::rules::ADVISORY_SEVERITY.to_string());
+                    }
+                    findings.push(hit);
+                }
+            }
+        }
+    }
     if findings.iter().any(|h| h.id == "gradient-text") && !gradient_text_paints_a_ramp(dom, el) {
         findings.retain(|h| h.id != "gradient-text");
     }
@@ -2780,6 +2845,36 @@ fn gradient_ancestor_average(dom: &dyn Dom, start: Option<ElId>) -> Option<Rgba>
     None
 }
 
+pub fn check_element_hard_offset_shadow_dom(dom: &dyn Dom, el: ElId) -> Vec<RuleHit> {
+    let box_shadow = dom.style(el, "boxShadow");
+    if !crate::checks::hard_offset_shadow::has_shadow(&box_shadow) {
+        return Vec::new();
+    }
+    crate::checks::hard_offset_shadow::check_hard_offset_shadow(
+        &box_shadow,
+        &dom.style(el, "color"),
+        effective_opacity_dom(dom, el),
+    )
+}
+
+/// The stops of the gradient [`gradient_ancestor_average`] finds, when every
+/// stop is opaque and no picture is layered with it; empty otherwise.
+fn gradient_ancestor_stops(dom: &dyn Dom, start: Option<ElId>) -> Vec<Rgba> {
+    let mut cur = start;
+    while let Some(c) = cur {
+        let bg_image = dom.style(c, "backgroundImage");
+        let stops = parse_gradient_colors(Some(&bg_image));
+        if !stops.is_empty() {
+            if bg_image.contains("url(") || stops.iter().any(|s| s.alpha_or_one() < 0.999) {
+                return Vec::new();
+            }
+            return stops;
+        }
+        cur = dom.parent(c);
+    }
+    Vec::new()
+}
+
 /// JS: checks.mjs#checkElementGlowDOM(el)
 pub fn check_element_glow_dom(dom: &dyn Dom, el: ElId) -> Vec<RuleHit> {
     let box_shadow = {
@@ -2817,6 +2912,15 @@ pub fn check_element_glow_dom(dom: &dyn Dom, el: ElId) -> Vec<RuleHit> {
     if parent_bg.is_none() && !parent_bg_info.unresolved {
         parent_bg = gradient_ancestor_average(dom, parent);
     }
+    // On a gradient whose stops are all opaque the lift is read against each
+    // stop, and the glow is passed over only where it lifts none of them
+    // enough. A translucent stop shows what is beneath it, and leaves the
+    // floor to decide alone, as before.
+    let stops = if surface.is_none() && !parent_bg_info.unresolved {
+        gradient_ancestor_stops(dom, parent)
+    } else {
+        Vec::new()
+    };
     let rect = dom.rect(el);
     let mut opts = GlowOpts {
         box_shadow: Some(box_shadow),
@@ -2826,7 +2930,15 @@ pub fn check_element_glow_dom(dom: &dyn Dom, el: ElId) -> Vec<RuleHit> {
         element_size: Some((rect.width, rect.height)),
         surface,
     };
-    let hits = check_glow(&opts);
+    let hits = if stops.is_empty() {
+        check_glow(&opts)
+    } else {
+        stops
+            .iter()
+            .map(|stop| check_glow(&GlowOpts { surface: Some(*stop), ..opts.clone() }))
+            .find(|h| !h.is_empty())
+            .unwrap_or_default()
+    };
     // "On dark background" is a claim about the surface the glow is drawn on,
     // and the ancestor walk reads only ancestors' fills: a light panel or
     // gradient laid beside the content over a dark section is never read, and
@@ -2957,7 +3069,7 @@ re!(
 );
 
 /// The widest `blur()` radius in a filter-shaped value, in px.
-fn blur_radius_px(value: &str) -> f64 {
+pub(crate) fn blur_radius_px(value: &str) -> f64 {
     let mut widest = 0.0f64;
     for m in BLUR_FN_RE.captures_iter(value) {
         let n = parse_float(m.get(1).map(|g| g.as_str()).unwrap_or(""));
@@ -3169,6 +3281,53 @@ fn is_fade_strip_on_own_fill(dom: &dyn Dom, el: ElId, rect: &Rect, stops: &[Rgba
     !samples.is_empty() && on_fill * 2 >= samples.len()
 }
 
+/// A syntax highlighter's token (observations-1006 row 4, nitrostack.ai's
+/// `text-purple-400` keywords in a `whitespace-pre` sample): text in a
+/// monospace face whose spaces are kept (`pre`, `pre-wrap` or
+/// `break-spaces`; `pre-line` collapses them, as prose does), set inline
+/// beside at least one other inline run, or the parent's own text, in a
+/// different colour. The
+/// colours come from the language, not a palette. A one-colour terminal line
+/// on a neon hero is not a highlighted sample and is still read, and so is
+/// one whose other run paints nothing (hidden, transparent or at opacity 0).
+fn is_highlighted_code_token(dom: &dyn Dom, el: ElId) -> bool {
+    if !crate::checks::text_rules::is_monospace_family(&dom.style(el, "fontFamily")) {
+        return false;
+    }
+    if !matches!(dom.style(el, "whiteSpace").as_str(), "pre" | "pre-wrap" | "break-spaces") {
+        return false;
+    }
+    // Runs share a line: the token and the other run are inline boxes (a
+    // block paragraph beside it in another colour is not a highlighter).
+    let inline = |node: ElId| dom.style(node, "display").starts_with("inline");
+    if !inline(el) {
+        return false;
+    }
+    let Some(own) = parse_rgb_or_any(&dom.style(el, "color")) else { return false };
+    let Some(parent) = dom.parent(el) else { return false };
+    let differs = |node: ElId| {
+        parse_rgb_or_any(&dom.style(node, "color")).is_some_and(|c| {
+            (c.r - own.r).abs() + (c.g - own.g).abs() + (c.b - own.b).abs() > 24.0
+                || (c.alpha_or_one() - own.alpha_or_one()).abs() > 0.1
+        })
+    };
+    if !js::trim(&direct_text(dom, parent)).is_empty() && differs(parent) {
+        return true;
+    }
+    let paints = |node: ElId| {
+        !matches!(dom.style(node, "visibility").as_str(), "hidden" | "collapse")
+            && own_opacity(dom, node) > 0.0
+            && parse_rgb_or_any(&dom.style(node, "color")).is_some_and(|c| c.alpha_or_one() > 0.0)
+    };
+    dom.children(parent).into_iter().any(|sib| {
+        sib != el
+            && inline(sib)
+            && !js::trim(&dom.text_content(sib)).is_empty()
+            && paints(sib)
+            && differs(sib)
+    })
+}
+
 /// The neon-text half: a run of glyphs the element paints itself, in band,
 /// on a dark surface. SVG geometry, icon wrappers and spacer characters
 /// inherit `color` without painting text, and one glyph is a texture.
@@ -3185,6 +3344,9 @@ fn ai_palette_text_hit(
     // and still paints the whole word.
     let text = direct_text(dom, el);
     if utf16_len(js::trim(&text)) < AI_PALETTE_MIN_TEXT_CHARS {
+        return None;
+    }
+    if is_highlighted_code_token(dom, el) {
         return None;
     }
     let tc = parse_rgb_or_any(&dom.style(el, "color"))
@@ -4366,6 +4528,33 @@ fn generated_content_unmeasured(dom: &dyn Dom, el: ElId) -> bool {
     PSEUDOS.iter().any(|which| pseudo_unmeasured(dom, el, which))
 }
 
+/// Whether an absolutely positioned `::before` / `::after` generates one
+/// character drawn as a mark inside `el`: its box, placed from its containing
+/// block and moved by its transform ([`super::visual::pseudo_box`]), lies
+/// within `el`'s border box. hardyn.com.br strikes an out-of-stock size
+/// swatch with a rotated `content: "/"` at 50px, whose glyph raises the
+/// swatch's `scrollWidth` to 55px in a 35px box; the slash is a mark over the
+/// swatch, not a label running out of it. More than one character, a counter
+/// or an attribute, or a box the capture cannot place, stays unmeasured.
+fn is_placed_mark_inside(dom: &dyn Dom, el: ElId, which: &str, content: &str) -> bool {
+    let c = js::trim(content);
+    let quoted = c.len() >= 2
+        && ((c.starts_with('"') && c.ends_with('"')) || (c.starts_with('\'') && c.ends_with('\'')));
+    if !quoted || c[1..c.len() - 1].chars().count() != 1 {
+        return false;
+    }
+    let Some((placed, _)) = super::visual::pseudo_box(dom, el, which) else {
+        return false;
+    };
+    let host = dom.rect(el);
+    placed.all_finite()
+        && host.all_finite()
+        && placed.left >= host.left - 0.5
+        && placed.right <= host.right + 0.5
+        && placed.top >= host.top - 0.5
+        && placed.bottom <= host.bottom + 0.5
+}
+
 /// [`generated_content_unmeasured`] for one pseudo-element.
 fn pseudo_unmeasured(dom: &dyn Dom, el: ElId, which: &str) -> bool {
     if !pseudo_present(dom, el, which) {
@@ -4376,7 +4565,7 @@ fn pseudo_unmeasured(dom: &dyn Dom, el: ElId, which: &str) -> bool {
         return false;
     }
     if generated_content_has_text(&content) {
-        return true;
+        return !is_placed_mark_inside(dom, el, which, &content);
     }
     let position = pseudo_str(dom, el, which, "position");
     if position == "absolute" || position == "fixed" {
@@ -5348,6 +5537,79 @@ mod tests {
             );
         }
         (d, body)
+    }
+
+    /// interplanetaryfund.base44.app's tagline on a solid ground: a pale
+    /// cyan-to-violet gradient painted through transparent glyphs.
+    #[test]
+    fn gradient_text_is_scored_by_its_best_stop_on_a_solid_ground() {
+        let (mut d, body) = page();
+        let panel = d.add(Some(body), "aside");
+        visible(&mut d, panel);
+        d.set_style(panel, "backgroundColor", "rgb(244, 241, 255)");
+        d.set_rect(panel, 0.0, 0.0, 200.0, 800.0);
+        let line = |d: &mut FakeDom, gradient: &str, y: f64| {
+            let p = d.add(Some(panel), "p");
+            visible(d, p);
+            d.add_text(p, "What If?");
+            d.set_styles(
+                p,
+                &[
+                    ("color", "rgba(0, 0, 0, 0)"),
+                    ("webkitTextFillColor", "rgba(0, 0, 0, 0)"),
+                    ("backgroundImage", gradient),
+                    ("backgroundClip", "text"),
+                    ("webkitBackgroundClip", "text"),
+                    ("fontSize", "16px"),
+                    ("fontWeight", "400"),
+                ],
+            );
+            d.set_rect(p, 12.0, y, 162.0, 24.0);
+            d.set_text_rect(p, 12.0, y, 80.0, 24.0);
+            p
+        };
+        let low = |hits: &[RuleHit]| hits.iter().filter(|h| h.id == "low-contrast").cloned().collect::<Vec<_>>();
+        let pale = line(&mut d, "linear-gradient(to right, rgb(103, 232, 249), rgb(96, 165, 250), rgb(167, 139, 250))", 74.0);
+        let hits = low(&colors(&d, pale));
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].snippet, "2.4:1 (need 4.5:1) — gradient text, best stop #a78bfa on #f4f1ff");
+        // One stop that reads is enough: the glyphs may sit on it.
+        let deep = line(&mut d, "linear-gradient(to right, rgb(103, 232, 249), rgb(76, 29, 149))", 120.0);
+        assert!(low(&colors(&d, deep)).is_empty());
+        // A translucent stop shows what is beneath: not scored.
+        let washed = line(&mut d, "linear-gradient(to right, rgba(103, 232, 249, 0.5), rgb(167, 139, 250))", 160.0);
+        assert!(low(&colors(&d, washed)).is_empty());
+        // On a gradient ground nothing is scored yet.
+        d.set_style(panel, "backgroundImage", "linear-gradient(158deg, rgb(250, 251, 255), rgb(240, 245, 255))");
+        assert!(low(&colors(&d, pale)).is_empty());
+        d.set_style(panel, "backgroundColor", "rgba(0, 0, 0, 0)");
+        assert!(low(&colors(&d, pale)).is_empty());
+        d.set_styles(panel, &[("backgroundImage", "none"), ("backgroundColor", "rgb(244, 241, 255)")]);
+        // Over a photo the stops decide nothing.
+        let photo = d.add(Some(panel), "img");
+        visible(&mut d, photo);
+        d.set_styles(photo, &[("position", "absolute")]);
+        d.set_rect(photo, 0.0, 0.0, 200.0, 800.0);
+        assert!(low(&colors(&d, pale)).is_empty());
+        d.set_style(photo, "display", "none");
+        d.set_rect(photo, 0.0, 0.0, 0.0, 0.0);
+        assert_eq!(low(&colors(&d, pale)).len(), 1);
+        // A dark backdrop laid under the headline as an absolute sibling is
+        // its ground, not the panel's fill: nothing is scored.
+        let backdrop = d.add(Some(panel), "div");
+        visible(&mut d, backdrop);
+        d.set_styles(backdrop, &[("position", "absolute"), ("backgroundColor", "rgb(11, 16, 32)")]);
+        d.set_rect(backdrop, 0.0, 0.0, 200.0, 800.0);
+        d.set_styles(pale, &[("position", "relative"), ("zIndex", "1")]);
+        assert!(low(&colors(&d, pale)).is_empty());
+        // A glyph fill in a colour of its own paints over the gradient.
+        d.set_styles(pale, &[("webkitTextFillColor", "rgb(30, 41, 59)"), ("color", "rgb(30, 41, 59)")]);
+        assert!(!colors(&d, pale).iter().any(|h| h.snippet.contains("gradient text")));
+        // Only the fill changes: a transparent `color` under an opaque
+        // fill still shows the fill, and a transparent fill under an opaque
+        // `color` still shows the gradient.
+        d.set_styles(pale, &[("webkitTextFillColor", "rgb(30, 41, 59)"), ("color", "rgba(0, 0, 0, 0)")]);
+        assert!(!colors(&d, pale).iter().any(|h| h.snippet.contains("gradient text")));
     }
 
     /// A block of text on the same line as a spill, `w` wide at `x`: the
@@ -7611,6 +7873,53 @@ mod tests {
         assert!(check_element_ai_palette_dom(&d, label, Some(&empty)).ink.is_some());
     }
 
+    /// nitrostack.ai: syntax tokens in a highlighted sample are code, set in
+    /// a monospace face at `white-space: pre` beside runs in other colours. A
+    /// one-colour monospace line, a `pre-line` run and a line whose
+    /// whitespace collapses are still read (review of round 12).
+    #[test]
+    fn ai_palette_skips_highlighted_code_tokens() {
+        let (mut d, body) = page();
+        let panel = d.add(Some(body), "div");
+        d.set_style(panel, "backgroundColor", "rgb(10, 10, 14)");
+        d.set_rect(panel, 0.0, 0.0, 400.0, 80.0);
+        let token = d.add(Some(panel), "span");
+        d.add_text(token, "import");
+        d.set_rect(token, 24.0, 24.0, 50.0, 16.0);
+        d.set_style(token, "color", "rgb(192, 132, 252)");
+        d.set_style(token, "fontFamily", "ui-monospace, SFMono-Regular, monospace");
+        d.set_style(token, "whiteSpace", "pre");
+        d.set_style(token, "display", "inline");
+        // Alone on its line, one colour: a terminal-styled line, still read.
+        assert!(check_element_ai_palette_dom(&d, token, None).ink.is_some(), "a one-colour mono line");
+        // Beside a run in the foreground colour: a highlighted sample.
+        let rest = d.add(Some(panel), "span");
+        d.add_text(rest, " { Agent } ");
+        d.set_style(rest, "color", "rgb(229, 231, 235)");
+        d.set_style(rest, "display", "block");
+        assert!(check_element_ai_palette_dom(&d, token, None).ink.is_some(), "a block in another colour");
+        d.set_style(rest, "display", "inline");
+        assert!(check_element_ai_palette_dom(&d, token, None).ink.is_none(), "a code token");
+        // The other run paints nothing: still one visible colour, still read.
+        d.set_style(rest, "visibility", "hidden");
+        assert!(check_element_ai_palette_dom(&d, token, None).ink.is_some(), "beside a hidden run");
+        d.set_style(rest, "visibility", "visible");
+        d.set_style(rest, "opacity", "0");
+        assert!(check_element_ai_palette_dom(&d, token, None).ink.is_some(), "beside a run at opacity 0");
+        d.set_style(rest, "opacity", "1");
+        d.set_style(rest, "color", "rgba(229, 231, 235, 0)");
+        assert!(check_element_ai_palette_dom(&d, token, None).ink.is_some(), "beside a transparent run");
+        d.set_style(rest, "color", "rgb(229, 231, 235)");
+        assert!(check_element_ai_palette_dom(&d, token, None).ink.is_none(), "a code token again");
+        d.set_style(token, "whiteSpace", "pre-line");
+        assert!(check_element_ai_palette_dom(&d, token, None).ink.is_some(), "pre-line collapses spaces");
+        d.set_style(token, "whiteSpace", "normal");
+        assert!(check_element_ai_palette_dom(&d, token, None).ink.is_some(), "a neon mono line");
+        d.set_style(token, "whiteSpace", "pre");
+        d.set_style(token, "fontFamily", "Inter, sans-serif");
+        assert!(check_element_ai_palette_dom(&d, token, None).ink.is_some(), "kept whitespace alone");
+    }
+
     #[test]
     fn ai_palette_gradient_skips_declared_stops_but_not_undeclared_ones() {
         let (mut d, body) = page();
@@ -8036,6 +8345,35 @@ mod tests {
         let hits = palette_hits(&d, typed);
         assert_eq!(hits.len(), 1, "{hits:?}");
         assert_eq!(hits[0].snippet, "Cyan neon text on dark background");
+    }
+
+    #[test]
+    fn a_glow_on_a_gradient_band_is_lifted_against_its_stops() {
+        let (mut d, body) = page();
+        d.set_style(body, "backgroundColor", "rgb(255, 255, 255)");
+        let band = d.add(Some(body), "section");
+        visible(&mut d, band);
+        d.set_rect(band, 0.0, 0.0, 1280.0, 400.0);
+        d.set_style(band, "backgroundImage", "linear-gradient(90deg, rgb(4, 47, 46), rgb(15, 118, 110))");
+        let tile = |d: &mut FakeDom, shadow: &str, x: f64| {
+            let t = d.add(Some(band), "a");
+            visible(d, t);
+            d.set_rect(t, x, 100.0, 160.0, 72.0);
+            d.set_style(t, "boxShadow", shadow);
+            d.set_style(t, "textShadow", "none");
+            t
+        };
+        // v0-morbiawebsite.vercel.app: a navy drop shadow under each tile,
+        // darker than every stop, reported as a glow on a dark background.
+        let navy = tile(&mut d, "rgba(0, 29, 56, 0.2) 0px 12px 28px 0px", 40.0);
+        assert!(check_element_glow_dom(&d, navy).is_empty());
+        // A cyan glow at the same blur lifts the band.
+        let cyan = tile(&mut d, "rgba(34, 211, 238, 0.6) 0px 0px 28px 0px", 240.0);
+        assert_eq!(check_element_glow_dom(&d, cyan).len(), 1);
+        // With a translucent stop the band shows what lies beneath, and the
+        // floor decides alone, as before.
+        d.set_style(band, "backgroundImage", "linear-gradient(90deg, rgba(4, 47, 46, 0.5), rgb(15, 118, 110))");
+        assert_eq!(check_element_glow_dom(&d, navy).len(), 1);
     }
 
     #[test]
@@ -8821,6 +9159,51 @@ mod tests {
         assert!(check_element_text_overflow_dom(&d, tag).is_empty(), "an empty icon box");
         d.set_pseudo_style(icon, "::before", "content", "\"Featured this week\"");
         assert_eq!(check_element_text_overflow_dom(&d, tag).len(), 1, "an icon glyph string");
+    }
+
+    /// observations-1006 row 15, hardyn.com.br: an out-of-stock size swatch
+    /// struck through by a rotated `content: "/"` at 50px. The mark is
+    /// placed inside the 35px swatch, so its glyph raising `scrollWidth` to
+    /// 55px is no label running out of the box.
+    #[test]
+    fn text_overflow_measures_a_one_character_mark_placed_inside() {
+        let (mut d, body) = page();
+        let chip = d.add(Some(body), "li");
+        visible(&mut d, chip);
+        d.set_attr(chip, "class", "tamanho_produto");
+        d.add_text(chip, "P");
+        d.set_rect(chip, 181.875, 400.0, 35.0, 35.0);
+        d.el_mut(chip).client_width = 35.0;
+        d.el_mut(chip).client_height = 35.0;
+        d.el_mut(chip).scroll_width = 55.0;
+        d.set_styles(chip, &[("display", "flex"), ("overflow", "visible"), ("overflowX", "visible"), ("position", "relative"), ("fontSize", "20px")]);
+        d.set_text_rect(chip, 193.0, 402.5, 12.7, 29.0);
+        neighbor(&mut d, body, 222.0, 400.0, 35.0, 35.0, "M");
+        for (k, v) in [
+            ("content", "\"/\""),
+            ("position", "absolute"),
+            ("display", "block"),
+            ("width", "19.0938px"),
+            ("height", "20px"),
+            ("top", "-7.6875px"),
+            ("left", "10.5px"),
+            ("transform", "matrix(0.258819, -0.965926, 0.965926, 0.258819, -2.47091, 9.22157)"),
+            ("fontSize", "50px"),
+        ] {
+            d.set_pseudo_style(chip, "::after", k, v);
+        }
+        assert!(check_element_text_overflow_dom(&d, chip).is_empty(), "a mark inside the swatch");
+        // Placed past the swatch's edge, it is not a mark over it.
+        d.set_pseudo_style(chip, "::after", "left", "30px");
+        assert_eq!(check_element_text_overflow_dom(&d, chip).len(), 1, "placed outside");
+        d.set_pseudo_style(chip, "::after", "left", "10.5px");
+        // Two characters are text, not a mark.
+        d.set_pseudo_style(chip, "::after", "content", "\"//\"");
+        assert_eq!(check_element_text_overflow_dom(&d, chip).len(), 1, "two characters");
+        // A size the capture did not resolve to pixels cannot be placed.
+        d.set_pseudo_style(chip, "::after", "content", "\"/\"");
+        d.set_pseudo_style(chip, "::after", "width", "auto");
+        assert_eq!(check_element_text_overflow_dom(&d, chip).len(), 1, "unplaced");
     }
 
     /// observations-25 issue 18 (P19): text that runs past its own box into
@@ -10320,6 +10703,79 @@ mod tests {
         assert!(reports_contrast(&run((0.0, 645.0, 1280.0, 155.0), "0.5", 700.0)));
         // Below the fold no point can be asked, and the verdict stands.
         assert!(reports_contrast(&run((0.0, 645.0, 1280.0, 1000.0), "1", 900.0)));
+    }
+
+    /// shinebythara.lovable.app (observations-1006 row 8): a fixed nav at
+    /// `rgba(251, 250, 249, 0.8)` with `backdrop-filter: blur(12px)` over a
+    /// 14px promo row. Frosted glass at 0.75 or more whose blur reaches 8px
+    /// and a third of the text's size hides the text under it. A translucent
+    /// layer with no blur (blueeyes.com.tw's cookie bar at 0.8, row 6),
+    /// fainter glass, a lighter blur, or large type the blur leaves readable
+    /// (glass2.html in the review: a 40px heading under 0.6 and 4px) shows it.
+    #[test]
+    fn text_under_frosted_glass_is_not_scored() {
+        let run = |fill: &str, opacity: &str, backdrop: &str, size: &str| {
+            let (mut d, body) = page();
+            let hero = bare_box(&mut d, body, "section", (0.0, 0.0, 1280.0, 1400.0));
+            let p = faint_copy(&mut d, hero, "rgb(170, 170, 170)", (16.0, 10.0, 600.0, 48.0));
+            d.set_style(p, "fontSize", size);
+            let nav = bare_box(&mut d, body, "nav", (0.0, 0.0, 1280.0, 64.0));
+            d.set_styles(
+                nav,
+                &[("position", "fixed"), ("backgroundColor", fill), ("opacity", opacity), ("backdropFilter", backdrop)],
+            );
+            reports_contrast(&colors(&d, p))
+        };
+        assert!(!run("rgba(251, 250, 249, 0.8)", "1", "blur(12px)", "14px"));
+        assert!(!run("rgba(251, 250, 249, 0.75)", "1", "blur(8px)", "14px"));
+        assert!(!run("rgb(251, 250, 249)", "0.8", "blur(12px)", "14px"));
+        assert!(!run("rgba(251, 250, 249, 0.8)", "1", "blur(16px)", "40px"));
+        // Should-flag twins.
+        assert!(run("rgba(0, 0, 0, 0.8)", "1", "none", "14px"), "a dark bar with no blur");
+        assert!(run("rgba(251, 250, 249, 0.8)", "1", "", "14px"), "an unrecorded backdrop");
+        assert!(run("rgba(251, 250, 249, 0.8)", "1", "blur(4px)", "14px"), "a light blur");
+        assert!(run("rgba(251, 250, 249, 0.65)", "1", "blur(12px)", "14px"), "faint glass");
+        assert!(run("rgba(251, 250, 249, 0.8)", "0.9", "blur(12px)", "14px"), "a faded layer");
+        assert!(run("rgba(255, 255, 255, 0.6)", "1", "blur(4px)", "40px"), "glass2: a heading through light glass");
+        assert!(run("rgba(251, 250, 249, 0.8)", "1", "blur(12px)", "40px"), "a heading larger than the blur");
+        assert!(run("rgba(251, 250, 249, 0.8)", "1", "blur(12px)", ""), "an unrecorded size");
+    }
+
+    /// searchvoro.com and bordeaux-metropole.fr (observations-1006 row 8):
+    /// an opaque card or modal covers a run's text, but the grid probes the
+    /// run's box, which runs past the card or straddles its edge by a row.
+    /// One covering layer that holds 85% or more of the text's own box
+    /// covers it; less, or no text box at all, keeps the verdict.
+    #[test]
+    fn a_layer_holding_most_of_the_text_covers_it_where_the_box_runs_past() {
+        let run_styled = |card: (f64, f64, f64, f64), text_rect: Option<(f64, f64, f64, f64)>, extra: &[(&str, &str)]| {
+            let (mut d, body) = page();
+            let hero = bare_box(&mut d, body, "section", (0.0, 0.0, 1280.0, 1400.0));
+            let p = faint_copy(&mut d, hero, "rgb(170, 170, 170)", (72.0, 700.0, 1136.0, 28.0));
+            if let Some(t) = text_rect {
+                d.set_text_rect(p, t.0, t.1, t.2, t.3);
+            }
+            let modal = bare_box(&mut d, body, "div", card);
+            d.set_styles(modal, &[("position", "fixed"), ("backgroundColor", "rgb(255, 255, 255)"), ("transform", "none")]);
+            d.set_styles(modal, extra);
+            reports_contrast(&colors(&d, p))
+        };
+        let run = |card: (f64, f64, f64, f64), text_rect: Option<(f64, f64, f64, f64)>| run_styled(card, text_rect, &[]);
+        let text = Some((448.0, 704.0, 384.0, 20.0));
+        // The card holds the whole text; the box's ends lie outside it.
+        assert!(!run((192.0, 605.0, 896.0, 179.0), text));
+        // The card's top edge cuts 3 of the text's 20px: 85% under it.
+        assert!(!run((192.0, 707.0, 896.0, 179.0), text));
+        // Should-flag twins: the card holds 75% of the text, or the capture
+        // has no text box to measure.
+        assert!(run((192.0, 709.0, 896.0, 179.0), text), "a quarter of the text shows");
+        assert!(run((192.0, 605.0, 896.0, 179.0), None), "no text box");
+        // A card that paints less than its box says nothing about the share
+        // (review issue 5): a `clip-path`, a rotation.
+        let card = (192.0, 605.0, 896.0, 179.0);
+        assert!(run_styled(card, text, &[("clipPath", "circle(40%)")]), "clip-path");
+        assert!(run_styled(card, text, &[("transform", "matrix(0.7, 0.7, -0.7, 0.7, 0, 0)")]), "rotated");
+        assert!(!run_styled(card, text, &[("transform", "matrix(1, 0, 0, 1, 0, -4)")]), "translated");
     }
 
     #[test]
