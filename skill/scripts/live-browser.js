@@ -13,13 +13,17 @@
   'use strict';
   if (typeof window === 'undefined') return;
 
+  // Take the helper token out of the global before anything else, including
+  // on the double-init return below: each served copy re-prepends it.
+  const TOKEN = window.__IMPECCABLE_TOKEN__;
+  try { delete window.__IMPECCABLE_TOKEN__; } catch { /* non-configurable */ }
+
   // Guard against double-init. Bun's HTML loader may process the <script> tag
   // and create a bundled copy alongside the external load, or HMR may re-execute.
-  // Check BEFORE reading token/port to catch all cases.
+  // Check BEFORE reading port to catch all cases.
   if (window.__IMPECCABLE_LIVE_INIT__) return;
   window.__IMPECCABLE_LIVE_INIT__ = true;
 
-  const TOKEN = window.__IMPECCABLE_TOKEN__;
   const PORT = window.__IMPECCABLE_PORT__;
   const APP_ROOT = window.__IMPECCABLE_APP_ROOT__ || null;
   if (!TOKEN || !PORT) {
@@ -63,11 +67,13 @@
   const MANUAL_APPLY_STATE_TTL_MS = 15 * 60 * 1000;
   // No idFactory: the session helper's default works on plain-HTTP origins,
   // where the secure-context-only randomUUID does not exist (issue #1055).
+  let liveStorage = null;
+  try { liveStorage = window.localStorage; } catch { /* storage denied */ }
   let sessionState = null;
   try {
     sessionState = window.__IMPECCABLE_LIVE_SESSION__?.createLiveBrowserSessionState({
       prefix: PREFIX,
-      storage: localStorage,
+      storage: liveStorage,
     });
   } catch (err) {
     console.error('[impeccable] Live mode could not create its session state.', err);
@@ -13461,12 +13467,22 @@ void main() {
     // Code spans
     s = s.replace(/`([^`]+)`/g, (_, code) => `<code>${code}</code>`);
     // Links [text](url)
-    s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, t, u) => `<a href="${u}" target="_blank" rel="noopener noreferrer">${t}</a>`);
+    s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, t, u) => (
+      isSafeHref(u) ? `<a href="${u}" target="_blank" rel="noopener noreferrer">${t}</a>` : t
+    ));
     // Bold
     s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
     // Italic (only single *…*, skip if inside bold already handled)
     s = s.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>');
     return s;
+  }
+
+  function isSafeHref(url) {
+    // Browsers drop ASCII whitespace and C0 controls inside a scheme, so
+    // "java\tscript:" still runs; strip them before reading the scheme.
+    const probe = String(url).replace(/[\u0000-\u0020\u007f]/g, '');
+    const scheme = probe.match(/^([a-z][a-z0-9+.-]*):/i);
+    return !scheme || ['http', 'https', 'mailto'].includes(scheme[1].toLowerCase());
   }
 
   function highlightBold(text) {

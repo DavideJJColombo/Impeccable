@@ -1285,5 +1285,35 @@ describe('live-browser source contracts', () => {
     assert.equal(lines?.length, 2, 'both configure rows skip auto-focus on touch');
     assert.match(SOURCE, /if \(keepExpanded && touchPrimary\(\)\) preparePageChatInputForTyping\(\);/);
   });
+  it('renders DESIGN.md links only for safe schemes', () => {
+    const fn = (name) => SOURCE.match(new RegExp(`\\n  function ${name}\\([^)]*\\) \\{[\\s\\S]*?\\n  \\}`))?.[0];
+    const sources = ['inlineMd', 'isSafeHref', 'escapeHtml'].map(fn);
+    for (const source of sources) assert.ok(source);
+    const inlineMd = runInNewContext(`${sources.join('\n')}\ninlineMd`, {});
+    // Payloads avoid `)`: the link pattern ends the URL at the first one.
+    for (const href of ['javascript:void 0', 'JavaScript:void 0', 'java\tscript:void 0', ' javascript:void 0', 'data:text/html,x', 'vbscript:x']) {
+      const html = inlineMd(`[docs](${href})`);
+      assert.doesNotMatch(html, /<a /, href);
+      assert.equal(html, 'docs', href);
+    }
+    for (const href of ['https://example.com/a', 'http://localhost:3000', 'mailto:a@b.c', '/docs/x', '#tokens', 'guide.md']) {
+      assert.match(inlineMd(`[docs](${href})`), /^<a href="/, href);
+    }
+  });
+
+  it('removes the helper token from window on every run, including a double-init', () => {
+    for (const alreadyInit of [false, true]) {
+      const window = { __IMPECCABLE_TOKEN__: 'secret', __IMPECCABLE_LIVE_INIT__: alreadyInit };
+      // No port: a fresh run returns right after reading it, before any DOM work.
+      runInNewContext(SOURCE, { window, console });
+      assert.equal('__IMPECCABLE_TOKEN__' in window, false, `alreadyInit=${alreadyInit}`);
+    }
+  });
+  it('reads localStorage for the session helper inside a try', () => {
+    // A denied store throws on the property read itself; unguarded, init
+    // aborts with __IMPECCABLE_LIVE_INIT__ still true and never retries.
+    assert.doesNotMatch(SOURCE, /storage: localStorage,/);
+    assert.match(SOURCE, /try \{ liveStorage = window\.localStorage; \} catch/);
+  });
 });
 
