@@ -1287,3 +1287,114 @@ describe('live-browser source contracts', () => {
   });
 });
 
+// Exercise Tune's real control listeners and open/close lifecycle without a server.
+function tuneHarness(params) {
+  function node(tag) {
+    return {
+      tag, style: {}, dataset: {}, children: [], listeners: {},
+      appendChild(child) { this.children.push(child); },
+      addEventListener(type, fn) { this.listeners[type] = fn; },
+      set innerHTML(value) { this.children = []; },
+    };
+  }
+  const variant = { values: {} };
+  const body = node('div');
+  const context = {
+    state: 'CYCLING', paramsCurrentValues: {}, tuneOpen: false, currentSessionId: null,
+    paramsPanelBody: body, paramsPanelEl: node('div'), paramsPanelPalette: {},
+    barEl: null, C: { brand: 'gold', ink: 'black' }, FONT: 'sans-serif', EASE: 'ease',
+    document: { createElement: node }, el: (tag, style) => Object.assign(node(tag), { style }),
+    getVisibleVariantEl: () => variant, parseVariantParams: () => params,
+    applyParamValue: (target, p, value) => { target.values[p.id] = value; },
+    showParamsPanel() {}, hideParamsPanel() {}, showOrUpdateCyclingBar() {}, queueCheckpoint() {},
+  };
+  const names = ['applyParamDefaults', 'formatRangeValue', 'buildParamsPanel', 'openTunePopover', 'closeTunePopover', 'refreshParamsPanel'];
+  const functions = names.map(name => {
+    const source = SOURCE.match(new RegExp(`function ${name}\\([^\\n]*\\) \\{[\\s\\S]*?\\n  \\}`))?.[0];
+    assert.ok(source, name);
+    return source;
+  }).join('\n');
+  const api = runInNewContext(`${functions}\n({refreshParamsPanel, openTunePopover, closeTunePopover})`, context);
+  const fire = (control, event) => control.listeners[event]({ stopPropagation() {} });
+  return { api, context, variant, body, fire };
+}
+
+describe('Tune reopening', () => {
+  for (const value of [0, 0.65]) {
+    it(`preserves a range value of ${value} through repeated reopening`, () => {
+      const h = tuneHarness([{ id: 'lightness', kind: 'range', min: 0, max: 1, default: 0.5 }]);
+      h.api.refreshParamsPanel();
+      h.api.openTunePopover();
+      const input = h.body.children[0].children[1];
+      input.value = String(value);
+      h.fire(input, 'input');
+      for (let i = 0; i < 2; i++) {
+        h.api.closeTunePopover();
+        h.api.openTunePopover();
+        assert.equal(h.variant.values.lightness, value, 'preview retains edit');
+        assert.equal(h.context.paramsCurrentValues.lightness, value, 'accept/checkpoint state retains edit');
+        assert.equal(h.body.children[0].children[1].value, String(value), 'slider agrees');
+        assert.equal(h.body.children[0].children[0].children[1].textContent, value.toFixed(2));
+      }
+    });
+  }
+  for (const initial of [false, true]) {
+    it(`preserves a toggle changed from ${initial} to ${!initial}`, () => {
+      const h = tuneHarness([{ id: 'italic', kind: 'toggle', default: initial }]);
+      h.api.refreshParamsPanel();
+      h.api.openTunePopover();
+      h.fire(h.body.children[0].children[1], 'click');
+      h.api.closeTunePopover();
+      h.api.openTunePopover();
+      assert.equal(h.context.paramsCurrentValues.italic, !initial);
+      assert.equal(h.variant.values.italic, !initial);
+      assert.equal(h.body.children[0].children[0].children[1].textContent, initial ? 'Off' : 'On');
+      assert.equal(h.body.children[0].children[1].children[0].style.left, initial ? '2px' : '18px');
+    });
+  }
+  it('preserves steps and still resets to the next variant defaults on refresh', () => {
+    const params = [{ id: 'face', kind: 'steps', default: 'sans', options: ['sans', 'serif'] }];
+    const h = tuneHarness(params);
+    h.api.refreshParamsPanel();
+    h.api.openTunePopover();
+    h.fire(h.body.children[0].children[1].children[1], 'click');
+    h.api.closeTunePopover();
+    h.api.openTunePopover();
+    assert.equal(h.variant.values.face, 'serif');
+    assert.equal(h.context.paramsCurrentValues.face, 'serif');
+    assert.equal(h.body.children[0].children[0].children[1].textContent, 'serif');
+    assert.equal(h.body.children[0].children[1].children[1].style.background, 'gold');
+    const nextVariant = { values: {} };
+    h.context.getVisibleVariantEl = () => nextVariant;
+    h.api.refreshParamsPanel();
+    assert.equal(h.context.paramsCurrentValues.face, 'sans');
+    assert.equal(nextVariant.values.face, 'sans');
+  });
+});
+
+
+describe('Tune session boundaries', () => {
+  it('clears old values when leaving the cycling state', () => {
+    const h = tuneHarness([{ id: 'size', kind: 'range', default: 0.5 }]);
+    h.context.paramsCurrentValues = { size: 0.8 };
+    h.context.state = 'IDLE';
+    h.api.refreshParamsPanel();
+    assert.equal(Object.keys(h.context.paramsCurrentValues).length, 0);
+    assert.equal(h.context.tuneOpen, false);
+    h.context.state = 'CYCLING';
+    h.api.refreshParamsPanel();
+    h.api.openTunePopover();
+    assert.equal(h.context.paramsCurrentValues.size, 0.5);
+    assert.equal(h.body.children[0].children[1].value, '0.5');
+  });
+
+  it('clears old values when a variant has no Tune parameters', () => {
+    const h = tuneHarness([]);
+    h.context.paramsCurrentValues = { size: 0.8 };
+    h.context.tuneOpen = true;
+    h.api.refreshParamsPanel();
+    h.api.openTunePopover();
+    assert.equal(Object.keys(h.context.paramsCurrentValues).length, 0);
+    assert.equal(h.context.tuneOpen, false);
+  });
+});
