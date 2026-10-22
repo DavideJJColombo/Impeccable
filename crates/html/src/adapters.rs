@@ -1473,6 +1473,13 @@ pub fn check_element_glow(
 
 /// JS: detect-html.mjs#checkElementBrokenImage(el)
 pub fn check_element_broken_image(el: &StaticElement<'_>) -> Vec<RuleHit> {
+    // `srcset` is a source too (HTML Standard: an img needs `src` or `srcset`).
+    if el.get_attribute("srcset").is_some_and(|set| {
+        let set = js::trim(set);
+        !set.is_empty() && set != "#"
+    }) {
+        return Vec::new();
+    }
     let Some(src) = el.get_attribute("src") else {
         return vec![RuleHit::new(
             "broken-image",

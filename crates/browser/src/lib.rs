@@ -1931,17 +1931,25 @@ fn hide_page_overlays(page: &mut Page<'_>, report: &mut OverlayReport) -> bool {
     }
 }
 
-/// Wait up to [`overlays::PRELOADER_WAIT_MS`] for every preloader covering
+/// Wait up to [`overlays::PRELOADER_WAIT_MS`] ([`overlays::INTRO_WAIT_MS`]
+/// while an intro is among them) for every preloader covering
 /// the page to go on its own. Returns how long it waited: 0 when none was
 /// covering the page, the full budget when one is still there (the hide step
 /// then hides it). A failed probe ends the wait.
 fn wait_for_preloaders(page: &mut Page<'_>) -> u64 {
     let js = overlays::preloader_probe_js();
     let started = Instant::now();
-    let budget = Duration::from_millis(overlays::PRELOADER_WAIT_MS);
     let mut waited = false;
     loop {
-        let covering = matches!(page.evaluate_value(&js), Ok(Value::Array(a)) if !a.is_empty());
+        let (covering, intro) = match page.evaluate_value(&js) {
+            Ok(Value::Array(a)) => {
+                (!a.is_empty(), a.iter().any(|v| v.as_str().is_some_and(|s| s.starts_with("intro "))))
+            }
+            _ => (false, false),
+        };
+        // An intro gets longer than a preloader: it counts to its end on a
+        // timer of its own, and the page under it may start on that end.
+        let budget = Duration::from_millis(if intro { overlays::INTRO_WAIT_MS } else { overlays::PRELOADER_WAIT_MS });
         if !covering || started.elapsed() >= budget {
             return if waited { started.elapsed().as_millis() as u64 } else { 0 };
         }

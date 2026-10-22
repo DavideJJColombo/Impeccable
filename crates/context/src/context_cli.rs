@@ -30,6 +30,21 @@ pub fn hook_manifests_for(provider_id: &str) -> &'static [&'static str] {
     }
 }
 
+/// The user-level manifest a user-scope install writes for this provider:
+/// Claude's `~/.claude/settings.json`; Codex and agents `$CODEX_HOME/hooks.json`
+/// (relative to cwd), or `~/.codex/hooks.json` when CODEX_HOME is unset or
+/// empty. A non-empty CODEX_HOME is exclusive.
+pub fn user_hook_manifest(provider_id: &str, cwd: &str, env: &Env) -> Option<String> {
+    match provider_id {
+        "claude-code" => Some(jsp::join(&[&crate::util::homedir(env), ".claude", "settings.json"])),
+        "codex" | "agents" => Some(match env_nonempty(env, "CODEX_HOME") {
+            Some(root) => std::path::Path::new(cwd).join(root).join("hooks.json").to_string_lossy().into_owned(),
+            None => jsp::join(&[&crate::util::homedir(env), ".codex", "hooks.json"]),
+        }),
+        _ => None,
+    }
+}
+
 const STOP_REVIEW_PROVIDERS: [&str; 4] = ["claude-code", "codex", "agents", "grok"];
 
 // Only the launcher-era design hook counts as an active automatic hook. A
@@ -104,15 +119,7 @@ pub fn automatic_hook_mode(ctx: &Ctx, cwd: &str, env: &Env, provider: &Provider)
             }
         }
     }
-    let user_manifest = match provider.id.as_str() {
-        "claude-code" => Some(jsp::join(&[&crate::util::homedir(env), ".claude", "settings.json"])),
-        "codex" | "agents" => Some(match env_nonempty(env, "CODEX_HOME") {
-            Some(root) => std::path::Path::new(cwd).join(root).join("hooks.json").to_string_lossy().into_owned(),
-            None => jsp::join(&[&crate::util::homedir(env), ".codex", "hooks.json"]),
-        }),
-        _ => None,
-    };
-    if let Some(path) = user_manifest {
+    if let Some(path) = user_hook_manifest(&provider.id, cwd, env) {
         if let Some(raw) = read_json(&path) {
             if let Some(hooks) = raw.get("hooks") {
                 if crate::staleness::js_truthy(hooks) && value_has_hook_marker(hooks) {

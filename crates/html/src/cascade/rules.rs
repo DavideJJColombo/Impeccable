@@ -303,6 +303,11 @@ fn extra_specified_expansions(prop: &str, value: &str) -> Vec<Expanded> {
         "align-self" => vec![("alignSelf".into(), v.to_string())],
         "justify-content" => vec![("justifyContent".into(), v.to_string())],
         "justify-items" => vec![("justifyItems".into(), v.to_string())],
+        // cramped-padding's walk through a transparent shell (#963) stops at
+        // a shell a transform moves, and reads a float as a box that holds
+        // its children's margins. Unset, both read as "".
+        "transform" => vec![("transform".into(), v.to_string())],
+        "float" => vec![("float".into(), v.to_string())],
         // `var()` and CSS-wide keywords resolve later, per longhand; the
         // stripe adapter picks the keyword out of the resolved list.
         "flex-flow" | "place-items" | "place-self"
