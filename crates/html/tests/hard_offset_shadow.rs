@@ -86,7 +86,7 @@ fn named_and_functional_colors_survive_the_static_cascade() {
 }
 
 #[test]
-fn color_fixture_has_four_advisories_and_no_control_findings() {
+fn color_fixture_has_six_advisories_and_no_control_findings() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/hard-offset-shadow/colors.html");
     let html = std::fs::read_to_string(&path).unwrap();
@@ -95,12 +95,14 @@ fn color_fixture_has_four_advisories_and_no_control_findings() {
         .iter()
         .filter(|f| f.antipattern == "hard-offset-shadow")
         .collect();
-    assert_eq!(hits.len(), 4, "{hits:#?}");
+    assert_eq!(hits.len(), 6, "{hits:#?}");
     for paint in [
         "4px 4px red",
         "gray -4px 4px",
         "hwb(0 0% 0%/50%)",
         "color-mix(",
+        "4px 4px 0 black",
+        "0em black",
     ] {
         assert!(
             hits.iter().any(|f| f.snippet.contains(paint)),

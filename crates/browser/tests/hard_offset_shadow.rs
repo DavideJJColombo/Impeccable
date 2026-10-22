@@ -109,8 +109,8 @@ fn named_and_functional_colors_match_static_findings_in_browser() {
         .iter()
         .filter(|f| f.0 == "hard-offset-shadow")
         .collect();
-    assert_eq!(hits.len(), 4, "{hits:#?}");
-    for i in 0..4 {
+    assert_eq!(hits.len(), 6, "{hits:#?}");
+    for i in 0..6 {
         assert!(
             hits.iter()
                 .any(|f| f.2.contains(&format!("#flag-{i}")) && f.3 == "advisory"),

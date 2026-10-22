@@ -46,6 +46,16 @@ pub fn has_shadow(shadow: &str) -> bool {
     !shadow.is_empty() && !shadow.eq_ignore_ascii_case("none")
 }
 
+const LENGTH_UNITS: &[&str] = &[
+    "px", "em", "rem", "ex", "rex", "ch", "rch", "cap", "rcap", "ic", "ric", "lh", "rlh", "vw", "vh",
+    "vi", "vb", "vmin", "vmax", "svw", "svh", "lvw", "lvh", "dvw", "dvh", "cqw", "cqh", "cqi", "cqb",
+    "cqmin", "cqmax", "cm", "mm", "q", "in", "pt", "pc",
+];
+
+fn is_length_unit(unit: &str) -> bool {
+    LENGTH_UNITS.iter().any(|u| unit.eq_ignore_ascii_case(u))
+}
+
 struct ShadowLayer {
     lengths: Vec<f64>,
     color: Rgba,
@@ -84,6 +94,15 @@ fn parse_layer(parser: &mut Parser<'_, '_>, current_color: &str) -> Option<Shado
                     return None;
                 }
                 lengths.push(value);
+                continue;
+            }
+            // A zero length is zero in every unit (`0em` blur paints the same
+            // hard edge as `0px`); other non-px lengths stay unresolved.
+            Token::Dimension { value, ref unit, .. } if value == 0.0 && is_length_unit(unit) => {
+                if lengths_closed {
+                    return None;
+                }
+                lengths.push(0.0);
                 continue;
             }
             Token::Number { .. } if parser.slice_from(start).parse::<f64>().ok()? == 0.0 => {
@@ -223,6 +242,32 @@ mod tests {
             );
         }
         assert!(check_hard_offset_shadow("4px 4px hwb(0 0% 0% / 50%)", "red", 0.2).is_empty());
+    }
+
+    #[test]
+    fn review_cases_named_colors_zero_blur_and_invisible_paint() {
+        for s in [
+            "4px 4px black",
+            "4px 4px 0 black",
+            "4px 4px 0px black",
+            "4px 4px 0em black",
+            "4px 4px 0rem 0vw black",
+            "4px 4px 0.0em black",
+        ] {
+            assert_eq!(check_hard_offset_shadow(s, "black", 1.0).len(), 1, "{s}");
+        }
+        for s in [
+            "4px 4px 0 transparent",
+            "4px 4px 0 rgba(0, 0, 0, 0)",
+            "4px 4px 0 rgb(0 0 0 / 0)",
+            "4px 4px 0 hsla(0, 0%, 0%, 0)",
+            "4px 4px 0 hsl(0 0% 0% / 0%)",
+            "4px 4px 1em black",
+            "4px 4px 0deg black",
+            "4px 4px 0% black",
+        ] {
+            assert!(check_hard_offset_shadow(s, "black", 1.0).is_empty(), "{s}");
+        }
     }
 
     #[test]
