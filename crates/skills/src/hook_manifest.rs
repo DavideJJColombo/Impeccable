@@ -411,11 +411,49 @@ pub fn hook_installed_for_provider(root: &str, provider: &str) -> bool {
 /// For that file, "installed" means current (`user_claude_hook_is_current`),
 /// not merely marked: a legacy `hook.mjs` entry or one naming a launcher that
 /// no longer exists must be rewritten, not counted.
+///
+/// A user-scope Copilot install counts the project manifest only when it does
+/// not name the project's skill, or that skill is there: an older global
+/// install wrote the portable `$(git rev-parse ...)/.github/skills/...` form
+/// into a project with no Copilot skill of its own, a hook that never fires
+/// (#1098), so a repeat install must rewrite it rather than count it.
 pub fn hook_installed_for_provider_at_scope(root: &str, provider: &str, user_scope: bool) -> bool {
     if user_scope && provider == ".claude" {
         return user_claude_hook_is_current(root);
     }
+    if user_scope && provider == ".github" && github_manifest_names_missing_project_skill(root) {
+        return false;
+    }
     hook_installed_for_provider(root, provider)
+}
+
+/// The portable prefix of a project Copilot hook command.
+const GITHUB_PORTABLE_PREFIX: &str = "$(git rev-parse --show-toplevel)/.github/skills/impeccable/scripts/impeccable";
+
+/// True when the project carries its own Copilot skill launcher.
+fn github_project_skill_exists(project_root: &str) -> bool {
+    util::exists(&jsp::join(&[project_root, ".github", "skills", "impeccable", "scripts", "impeccable"]))
+}
+
+/// True when `root` is a project (not the home dir) that ships its own
+/// Copilot skill: its committed manifest keeps the portable command.
+fn github_keeps_portable_form(sys: &Sys, root: &str) -> bool {
+    !sys.is_home_dir(root) && github_project_skill_exists(root)
+}
+
+/// True when `<root>/.github/hooks/impeccable.json` runs an Impeccable hook in
+/// the portable project form while `<root>` has no Copilot skill to run.
+fn github_manifest_names_missing_project_skill(root: &str) -> bool {
+    if github_project_skill_exists(root) {
+        return false;
+    }
+    let Some((Value::Object(map), _)) = read_manifest(&jsp::join(&[root, ".github", "hooks", "impeccable.json"])) else {
+        return false;
+    };
+    let Some(hooks @ (Value::Object(_) | Value::Array(_))) = map.get("hooks") else { return false };
+    let mut commands = Vec::new();
+    collect_impeccable_hook_commands(hooks, &mut commands);
+    commands.iter().any(|c| c.contains(GITHUB_PORTABLE_PREFIX))
 }
 
 /// The command a user-scope install writes into `<home>/.claude/settings.json`:
@@ -605,7 +643,10 @@ pub fn copy_provider_hooks(sys: &crate::providers::Sys, bundle_dir: &str, root: 
                 }
             }
             let fresh_manifest = read_json_file(&artifact.src, "Bundled hook manifest")?;
-            let absolute = skill_root != root || sys.is_home_dir(root);
+            // A project that ships its own Copilot skill keeps the portable,
+            // team-committed command even when the user installs globally.
+            let absolute = (skill_root != root || sys.is_home_dir(root))
+                && !(*provider == ".github" && github_keeps_portable_form(sys, root));
             let fresh = rewrite_hook_commands_for_skill_root(&fresh_manifest, provider, skill_root, absolute);
             let mut next = fresh.clone();
             if util::exists(&artifact.dest) {

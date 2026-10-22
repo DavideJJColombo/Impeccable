@@ -1,3 +1,11 @@
+# cmd.exe parses batch files by byte offset, and an LF-only `.cmd` breaks
+# `call :label` and `goto` (#1098). Every checkout and `git archive` writes
+# the source launcher and its tracked provider copies with CRLF; the build
+# also emits batch files with CRLF whatever the working tree holds
+# (scripts/lib/utils.js), and `bun run build` fails if any emitted copy has a
+# bare LF.
+*.cmd text eol=crlf
+
 # The oracle replays goldens recorded from a POSIX checkout, and a finding's
 # snippet carries the fixture's own bytes, so these files have to arrive with
 # LF on every platform. `-text` disables end-of-line conversion outright, which
@@ -9,10 +17,6 @@ tests/oracle/** -text
 # byte-identical when a Windows checkout would otherwise convert them to CRLF.
 ui/component-review/theme.css text eol=lf
 crates/context/assets/component-review.js text eol=lf
-
-# cmd.exe can miss batch labels in LF-only scripts. Keep the launcher in CRLF
-# on every checkout so release bundles contain a native Windows batch file.
-skill/scripts/impeccable.cmd text eol=crlf
 
 # Machine-written files that a line diff cannot usefully show. `-diff` makes
 # `git diff`, `git show` and `git log -p` print "Binary files differ" instead

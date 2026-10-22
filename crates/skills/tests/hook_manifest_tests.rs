@@ -190,6 +190,12 @@ fn install_from_an_older_bundle_never_runs_the_post_edit_verb_before_the_edit() 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+const GITHUB_PORTABLE: &str = "[ ! -f \"$(git rev-parse --show-toplevel)/.github/skills/impeccable/scripts/impeccable\" ] || \"$(git rev-parse --show-toplevel)/.github/skills/impeccable/scripts/impeccable\" hook";
+
+fn github_bundle_manifest() -> Value {
+    json!({ "version": 1, "hooks": { "postToolUse": [{ "type": "command", "matcher": "edit|create|apply_patch", "bash": GITHUB_PORTABLE, "timeoutSec": 5 }] } })
+}
+
 #[test]
 fn github_project_manifest_stays_portable_and_global_install_uses_home() {
     // Project installs keep the committed `$(git rev-parse ...)` form.
@@ -705,5 +711,53 @@ fn user_scope_keeps_project_hook_when_bundle_has_no_replacement() {
     assert!(written.is_empty());
     assert!(std::path::Path::new(&project_manifest).exists());
     assert!(!std::path::Path::new(&jsp::join(&[&home, ".claude", "settings.json"])).exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn github_user_scope_install_points_the_project_hook_at_the_home_skill() {
+    // #1098: a global install wrote the portable project form into the
+    // project's manifest, naming `.github/skills/...` in a project that has
+    // no Copilot skill, so the hook never fired.
+    let dir = tmp_dir("github-user-hook");
+    let root = dir.to_string_lossy().into_owned();
+    let bundle = jsp::join(&[&root, "bundle"]);
+    let home = jsp::join(&[&root, "home"]);
+    let project = jsp::join(&[&root, "project"]);
+    write(&jsp::join(&[&bundle, ".github", "hooks", "impeccable.json"]), &github_bundle_manifest().to_string());
+    write(&skill_launcher(&home, ".github"), "#!/bin/sh\n");
+    std::fs::create_dir_all(&project).unwrap();
+    let sys = sys_with_home(&home);
+    let manifest = jsp::join(&[&project, ".github", "hooks", "impeccable.json"]);
+
+    // An older global install left the portable form behind: not installed.
+    write(&manifest, &github_bundle_manifest().to_string());
+    assert!(hook_installed_for_provider(&project, ".github"));
+    assert!(!hook_installed_for_provider_at_scope(&project, ".github", true));
+    assert!(hook_installed_for_provider_at_scope(&project, ".github", false));
+
+    let written = copy_provider_hooks(&sys, &bundle, &project, &[".github"], false, Some(&home), Some(&project)).unwrap();
+    assert_eq!(written, [".github"]);
+    let after: Value = serde_json::from_str(&read(&manifest)).unwrap();
+    let gp = skill_launcher(&home, ".github");
+    let expected = if cfg!(windows) {
+        let w = gp.replace('\\', "/");
+        format!("[ ! -f '{w}' ] || '{w}' hook")
+    } else {
+        "[ ! -f \"$HOME/.github/skills/impeccable/scripts/impeccable\" ] || \"$HOME/.github/skills/impeccable/scripts/impeccable\" hook".to_string()
+    };
+    assert_eq!(after["hooks"]["postToolUse"].as_array().unwrap().len(), 1);
+    assert_eq!(after["hooks"]["postToolUse"][0]["bash"], Value::String(expected));
+    assert!(hook_installed_for_provider_at_scope(&project, ".github", true));
+
+    // A project that ships its own Copilot skill keeps the committed,
+    // portable manifest even when the user installs globally.
+    write(&skill_launcher(&project, ".github"), "#!/bin/sh\n");
+    write(&manifest, &github_bundle_manifest().to_string());
+    assert!(hook_installed_for_provider_at_scope(&project, ".github", true));
+    copy_provider_hooks(&sys, &bundle, &project, &[".github"], false, Some(&home), Some(&project)).unwrap();
+    let kept: Value = serde_json::from_str(&read(&manifest)).unwrap();
+    assert_eq!(kept["hooks"]["postToolUse"].as_array().unwrap().len(), 1);
+    assert_eq!(kept["hooks"]["postToolUse"][0]["bash"], GITHUB_PORTABLE);
     let _ = std::fs::remove_dir_all(&dir);
 }

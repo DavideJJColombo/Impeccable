@@ -88,12 +88,25 @@ pub fn event_key(event: &Map<String, Value>, project_cwd: &str, files: &[String]
 /// home read from the hook's own environment (`HOME`, then `USERPROFILE`;
 /// the other way round on Windows). `None` without a home: no claim.
 fn claim_root(rt: &Runtime) -> Option<PathBuf> {
-    if let Some(dir) = rt.env("IMPECCABLE_HOOK_CLAIM_DIR").filter(|s| !s.is_empty()) {
+    user_dir(rt, "IMPECCABLE_HOOK_CLAIM_DIR", "hook-claims")
+}
+
+/// `$<override_env>` when set, else `<home>/.impeccable/<name>`, with home
+/// read from the hook's own environment (`HOME`, then `USERPROFILE`; the
+/// other way round on Windows). `None` without a home.
+pub(crate) fn user_dir(rt: &Runtime, override_env: &str, name: &str) -> Option<PathBuf> {
+    if let Some(dir) = rt.env(override_env).filter(|s| !s.is_empty()) {
         return Some(PathBuf::from(dir));
     }
     let order: [&str; 2] = if cfg!(windows) { ["USERPROFILE", "HOME"] } else { ["HOME", "USERPROFILE"] };
     let home = order.iter().find_map(|k| rt.env(k).filter(|s| !s.is_empty()))?;
-    Some(Path::new(home).join(".impeccable").join("hook-claims"))
+    Some(Path::new(home).join(".impeccable").join(name))
+}
+
+/// Lowercase hex SHA-256 of `s`: a 64-character name that is safe on every
+/// file system.
+pub(crate) fn sha256_hex(s: &str) -> String {
+    Sha256::digest(s.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn now_bucket() -> Option<u64> {
@@ -111,7 +124,7 @@ fn current_uid() -> u32 {
 /// A directory this invocation may create in and delete from: a real
 /// directory (the metadata is `lstat`'s, so a symlink is never one), and on
 /// Unix owned by the current user with no group or other write bit.
-fn is_safe_dir(meta: &std::fs::Metadata) -> bool {
+pub(crate) fn is_safe_dir(meta: &std::fs::Metadata) -> bool {
     if !meta.file_type().is_dir() {
         return false;
     }
@@ -126,7 +139,7 @@ fn is_safe_dir(meta: &std::fs::Metadata) -> bool {
 }
 
 /// Creates one directory level, private to the user on Unix. Not recursive.
-fn create_private_dir(path: &Path) -> std::io::Result<()> {
+pub(crate) fn create_private_dir(path: &Path) -> std::io::Result<()> {
     let mut b = std::fs::DirBuilder::new();
     #[cfg(unix)]
     {
@@ -136,9 +149,20 @@ fn create_private_dir(path: &Path) -> std::io::Result<()> {
     b.create(path)
 }
 
+/// Makes a file `opts` creates private to the user on Unix.
+pub(crate) fn private_file_mode(opts: &mut std::fs::OpenOptions) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    #[cfg(not(unix))]
+    let _ = opts;
+}
+
 /// `Some(created)` when `path` is (now) a safe directory, `None` when it is
 /// missing and could not be made, or is unsafe.
-fn ensure_safe_dir(path: &Path) -> Option<bool> {
+pub(crate) fn ensure_safe_dir(path: &Path) -> Option<bool> {
     let created = match create_private_dir(path) {
         Ok(()) => true,
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
@@ -151,7 +175,12 @@ fn ensure_safe_dir(path: &Path) -> Option<bool> {
 /// The claim root, created when missing (with its `.impeccable` parent, a
 /// plain user dir) and checked; `None` when it is unusable or unsafe.
 fn safe_root(rt: &Runtime) -> Option<PathBuf> {
-    let root = claim_root(rt)?;
+    safe_user_dir(claim_root(rt)?)
+}
+
+/// `root`, created when missing (with its `.impeccable` parent, a plain user
+/// dir) and checked; `None` when it is unusable or unsafe.
+pub(crate) fn safe_user_dir(root: PathBuf) -> Option<PathBuf> {
     if std::fs::symlink_metadata(&root).is_err() {
         if let Some(parent) = root.parent() {
             // Two hooks of one first edit race to make it: losing that race
@@ -171,7 +200,7 @@ fn is_bucket_name(name: &str) -> bool {
     !name.is_empty() && name.len() <= 20 && name.bytes().all(|b| b.is_ascii_digit())
 }
 
-fn is_claim_name(name: &str) -> bool {
+pub(crate) fn is_claim_name(name: &str) -> bool {
     name.len() == 64 && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 

@@ -3251,3 +3251,298 @@ fn concurrent_first_edits_in_a_fresh_home_scan_once() {
         assert_eq!(scans, 1, "round {round}");
     }
 }
+
+// ─── Session root index: Stop from a cwd above the project (#1101) ───────────
+
+/// A temp HOME under the fixture, so the index never touches the real one.
+fn home_env(t: &Tmp) -> HashMap<String, String> {
+    let home = jsp::join(&[&t.path(), "home"]);
+    std::fs::create_dir_all(&home).unwrap();
+    env(&[("HOME", &home), ("USERPROFILE", &home)])
+}
+
+fn index_dir(t: &Tmp) -> String {
+    jsp::join(&[&t.path(), "home", ".impeccable", "hook-sessions"])
+}
+
+fn names_in(dir: &str) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .map(|it| it.map(|e| e.unwrap().file_name().into_string().unwrap()).collect())
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+fn umbrella(t: &Tmp, projects: &[(&str, &str)]) -> (String, Vec<String>) {
+    let files = projects
+        .iter()
+        .map(|(name, css)| {
+            t.write(&format!("work/{name}/package.json"), "{}");
+            t.write(&format!("work/{name}/src/a.css"), css)
+        })
+        .collect();
+    (jsp::join(&[&t.path(), "work"]), files)
+}
+
+#[test]
+fn stop_from_an_umbrella_cwd_finds_the_project_below_it() {
+    let t = Tmp::new();
+    let e = home_env(&t);
+    let (work, files) = umbrella(&t, &[("site", SIDE_TAB_CSS)]);
+    let edit = hook::run_hook(&rt_with(&work, e.clone()), &edit_event(&work, &files[0], "p1"));
+    let site = jsp::join(&[&work, "site"]);
+    assert_eq!(audit_str(&edit.audit, "cwd"), Some(site.as_str()));
+    let stop = hook::run_stop_hook(&rt_with(&work, e.clone()), &stop_event(&work, "p1"));
+    assert!(stop.stdout.contains("[side-tab]"), "{} {:?}", stop.stdout, stop.audit);
+    assert_eq!(audit_str(&stop.audit, "cwd"), Some(site.as_str()));
+    assert!(stop.audit.get("roots").is_none(), "{:?}", stop.audit);
+    // Nothing lands in the umbrella folder itself (#346).
+    assert!(!t.exists("work/.impeccable"));
+    // The second Stop has nothing new to say.
+    let again = hook::run_stop_hook(&rt_with(&work, e.clone()), &stop_event(&work, "p1"));
+    assert_eq!(again.stdout, "", "{:?}", again.audit);
+    assert_eq!(audit_str(&again.audit, "skipped"), Some("stop-clean"));
+    // Another session's Stop does not see this session's roots.
+    let other = hook::run_stop_hook(&rt_with(&work, e), &stop_event(&work, "p2"));
+    assert_eq!(audit_str(&other.audit, "skipped"), Some("no-touched-files"));
+}
+
+#[test]
+fn stop_reports_every_project_the_session_edited_within_the_caps() {
+    let t = Tmp::new();
+    let e = home_env(&t);
+    let (work, files) = umbrella(&t, &[("app", SIDE_TAB_CSS), ("site", SIDE_TAB_CSS)]);
+    for file in &files {
+        hook::run_hook(&rt_with(&work, e.clone()), &edit_event(&work, file, "p1"));
+    }
+    let stop = hook::run_stop_hook(&rt_with(&work, e.clone()), &stop_event(&work, "p1"));
+    assert!(stop.stdout.contains("app/src/a.css"), "{}", stop.stdout);
+    assert!(stop.stdout.contains("site/src/a.css"), "{}", stop.stdout);
+    assert_eq!(stop.audit["roots"], 2);
+    assert_eq!(stop.audit["freshFiles"], 2);
+    assert!(!t.exists("work/.impeccable"));
+    let again = hook::run_stop_hook(&rt_with(&work, e.clone()), &stop_event(&work, "p1"));
+    assert_eq!(again.stdout, "", "{:?}", again.audit);
+
+    // The lead project's caps bound the combined output.
+    let t = Tmp::new();
+    let e = home_env(&t);
+    let (work, files) = umbrella(&t, &[("app", SIDE_TAB_CSS), ("site", SIDE_TAB_CSS)]);
+    t.write("work/app/.impeccable/config.json", r#"{"hook":{"limits":{"maxFindings":1}}}"#);
+    for file in &files {
+        hook::run_hook(&rt_with(&work, e.clone()), &edit_event(&work, file, "p1"));
+    }
+    let stop = hook::run_stop_hook(&rt_with(&work, e.clone()), &stop_event(&work, "p1"));
+    let finding_lines = stop.stdout.matches("[side-tab]").count();
+    assert_eq!(finding_lines, 1, "{}", stop.stdout);
+    assert!(stop.stdout.contains("more in site/src/a.css"), "{}", stop.stdout);
+    // Both projects remembered what this Stop saw: the next is silent.
+    let again = hook::run_stop_hook(&rt_with(&work, e), &stop_event(&work, "p1"));
+    assert_eq!(again.stdout, "", "{:?}", again.audit);
+}
+
+#[test]
+fn a_disabled_or_native_project_drops_out_and_the_other_still_reports() {
+    let t = Tmp::new();
+    let e = home_env(&t);
+    let (work, files) = umbrella(&t, &[("app", SIDE_TAB_CSS), ("site", SIDE_TAB_CSS)]);
+    for file in &files {
+        hook::run_hook(&rt_with(&work, e.clone()), &edit_event(&work, file, "p1"));
+    }
+    t.write("work/app/.impeccable/config.json", r#"{"hook":{"enabled":false}}"#);
+    let stop = hook::run_stop_hook(&rt_with(&work, e.clone()), &stop_event(&work, "p1"));
+    assert!(stop.stdout.contains("[side-tab]"), "{}", stop.stdout);
+    assert!(!stop.stdout.contains("app/src"), "{}", stop.stdout);
+    assert_eq!(audit_str(&stop.audit, "cwd"), Some(jsp::join(&[&work, "site"]).as_str()));
+}
+
+#[test]
+fn without_a_session_id_stop_walks_up_as_before_and_records_nothing() {
+    let t = Tmp::new();
+    let e = home_env(&t);
+    let (work, files) = umbrella(&t, &[("site", SIDE_TAB_CSS)]);
+    let edit = json!({ "cwd": work, "hook_event_name": "PostToolUse", "tool_name": "Edit",
+        "tool_input": { "file_path": files[0] } }).to_string();
+    hook::run_hook(&rt_with(&work, e.clone()), &edit);
+    assert!(!std::path::Path::new(&index_dir(&t)).exists());
+    let stop = json!({ "cwd": work, "hook_event_name": "Stop", "stop_hook_active": false }).to_string();
+    let res = hook::run_stop_hook(&rt_with(&work, e.clone()), &stop);
+    assert_eq!(audit_str(&res.audit, "skipped"), Some("no-touched-files"));
+    // From the project itself the walk still finds it.
+    let site = jsp::join(&[&work, "site"]);
+    let stop = json!({ "cwd": site, "hook_event_name": "Stop", "stop_hook_active": false }).to_string();
+    let res = hook::run_stop_hook(&rt_with(&site, e), &stop);
+    assert!(res.stdout.contains("[side-tab]"), "{:?}", res.audit);
+}
+
+#[test]
+fn without_a_usable_home_stop_walks_up_as_before() {
+    let t = Tmp::new();
+    let (work, files) = umbrella(&t, &[("site", SIDE_TAB_CSS)]);
+    hook::run_hook(&rt(&work), &edit_event(&work, &files[0], "p1"));
+    let res = hook::run_stop_hook(&rt(&work), &stop_event(&work, "p1"));
+    assert_eq!(audit_str(&res.audit, "skipped"), Some("no-touched-files"));
+}
+
+/// An index root that is a symlink is never followed: nothing is created or
+/// removed behind it, and Stop falls back to the walk up.
+#[test]
+#[cfg(unix)]
+fn a_symlinked_index_root_is_never_followed() {
+    let t = Tmp::new();
+    let e = home_env(&t);
+    let (work, files) = umbrella(&t, &[("site", SIDE_TAB_CSS)]);
+    let victim = jsp::join(&[&t.path(), "victim"]);
+    t.write(&format!("victim/{OLD_CLAIM}/{OLD_CLAIM}"), &work);
+    t.write("home/.impeccable/keep.txt", "");
+    std::os::unix::fs::symlink(&victim, index_dir(&t)).unwrap();
+    hook::run_hook(&rt_with(&work, e.clone()), &edit_event(&work, &files[0], "p1"));
+    let res = hook::run_stop_hook(&rt_with(&work, e), &stop_event(&work, "p1"));
+    assert_eq!(audit_str(&res.audit, "skipped"), Some("no-touched-files"));
+    assert_eq!(names_in(&victim), vec![OLD_CLAIM.to_string()]);
+    assert_eq!(names_in(&jsp::join(&[&victim, OLD_CLAIM])), vec![OLD_CLAIM.to_string()]);
+}
+
+/// A root other users can write to is not trusted, for writing or reading.
+#[test]
+#[cfg(unix)]
+fn a_group_or_world_writable_index_root_is_not_used() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = Tmp::new();
+    let e = home_env(&t);
+    let (work, files) = umbrella(&t, &[("site", SIDE_TAB_CSS)]);
+    let root = index_dir(&t);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+    hook::run_hook(&rt_with(&work, e.clone()), &edit_event(&work, &files[0], "p1"));
+    assert!(names_in(&root).is_empty());
+    // A record planted under it is not read either.
+    let site = jsp::join(&[&work, "site"]);
+    let planted = jsp::join(&[&root, &sha256("p1"), &sha256(&site)]);
+    std::fs::create_dir_all(std::path::Path::new(&planted).parent().unwrap()).unwrap();
+    std::fs::write(&planted, &site).unwrap();
+    let res = hook::run_stop_hook(&rt_with(&work, e), &stop_event(&work, "p1"));
+    assert_eq!(audit_str(&res.audit, "skipped"), Some("no-touched-files"));
+}
+
+fn sha256(s: &str) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(s.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A record whose content does not hash to its name (a partial write, or a
+/// file that is not ours) is ignored.
+#[test]
+#[cfg(unix)]
+fn a_record_that_does_not_hash_to_its_name_is_ignored() {
+    let t = Tmp::new();
+    let e = home_env(&t);
+    let (work, files) = umbrella(&t, &[("site", SIDE_TAB_CSS)]);
+    hook::run_hook(&rt_with(&work, e.clone()), &edit_event(&work, &files[0], "p1"));
+    let session_dir = jsp::join(&[&index_dir(&t), &sha256("p1")]);
+    let site = jsp::join(&[&work, "site"]);
+    let record = jsp::join(&[&session_dir, &sha256(&site)]);
+    assert_eq!(std::fs::read_to_string(&record).unwrap(), site);
+    std::fs::write(&record, "/elsewhere").unwrap();
+    let res = hook::run_stop_hook(&rt_with(&work, e), &stop_event(&work, "p1"));
+    assert_eq!(audit_str(&res.audit, "skipped"), Some("no-touched-files"));
+}
+
+#[test]
+fn parallel_first_edits_record_each_root_once() {
+    let t = Tmp::new();
+    let e = home_env(&t);
+    let roots = [jsp::join(&[&t.path(), "work", "a"]), jsp::join(&[&t.path(), "work", "b"])];
+    std::thread::scope(|s| {
+        for i in 0..16 {
+            let (e, root) = (e.clone(), roots[i % 2].clone());
+            let cwd = t.path();
+            s.spawn(move || impeccable_hook::hook_sessions::record_root(&rt_with(&cwd, e), "p1", &root));
+        }
+    });
+    for root in &roots {
+        std::fs::create_dir_all(root).unwrap();
+    }
+    let session_dir = jsp::join(&[&index_dir(&t), &sha256("p1")]);
+    let mut expected: Vec<String> = roots.iter().map(|r| sha256(r)).collect();
+    expected.sort();
+    assert_eq!(names_in(&session_dir), expected);
+    let r = rt_with(&t.path(), e);
+    let mut recorded = impeccable_hook::hook_sessions::recorded_roots(&r, "p1");
+    recorded.sort();
+    assert_eq!(recorded, roots.to_vec());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for dir in [index_dir(&t), session_dir.clone()] {
+            assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700, "{dir}");
+        }
+        let file = jsp::join(&[&session_dir, &sha256(&roots[0])]);
+        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+}
+
+/// Session ids and roots become 64-hex names whatever characters they hold,
+/// so a Windows path or an id with `:` or `/` is a valid file name.
+#[test]
+fn index_names_are_safe_on_every_file_system() {
+    let t = Tmp::new();
+    let e = home_env(&t);
+    let r = rt_with(&t.path(), e);
+    let root = jsp::join(&[&t.path(), "proj"]);
+    std::fs::create_dir_all(&root).unwrap();
+    let session = r"a/b:c*?<>|\d";
+    impeccable_hook::hook_sessions::record_root(&r, session, &root);
+    // A recorded root that no longer exists is not returned.
+    impeccable_hook::hook_sessions::record_root(&r, session, &jsp::join(&[&t.path(), "gone"]));
+    let sessions = names_in(&index_dir(&t));
+    assert_eq!(sessions.len(), 1);
+    let records = names_in(&jsp::join(&[&index_dir(&t), &sessions[0]]));
+    for name in sessions.iter().chain(&records) {
+        assert!(name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit()), "{name}");
+    }
+    assert_eq!(impeccable_hook::hook_sessions::recorded_roots(&r, session), vec![root]);
+    // A relative root is not recorded.
+    impeccable_hook::hook_sessions::record_root(&r, "p2", "relative/dir");
+    assert_eq!(names_in(&index_dir(&t)).len(), 1);
+}
+
+/// A new session sweeps session dirs untouched for the expiry window. It
+/// removes only `<64 hex>` dirs and `<64 hex>` files in them: foreign names,
+/// foreign files, fresh sessions and symlinks stay.
+#[test]
+#[cfg(unix)]
+fn expiry_removes_only_old_session_dirs_of_ours() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = Tmp::new();
+    let e = home_env(&t);
+    let root = index_dir(&t);
+    let old_a = "a".repeat(64);
+    let old_b = "b".repeat(64);
+    let fresh = "c".repeat(64);
+    let linked = "d".repeat(64);
+    t.write(&format!("home/.impeccable/hook-sessions/{old_a}/{OLD_CLAIM}"), "/x");
+    t.write(&format!("home/.impeccable/hook-sessions/{old_b}/{OLD_CLAIM}"), "/x");
+    t.write(&format!("home/.impeccable/hook-sessions/{old_b}/notes.txt"), "not ours");
+    t.write(&format!("home/.impeccable/hook-sessions/{fresh}/{OLD_CLAIM}"), "/x");
+    t.write("home/.impeccable/hook-sessions/keep-me/x", "not ours");
+    t.write(&format!("outside/{OLD_CLAIM}"), "/x");
+    std::os::unix::fs::symlink(jsp::join(&[&t.path(), "outside"]), jsp::join(&[&root, &linked])).unwrap();
+    for d in [root.clone(), jsp::join(&[&root, &old_a]), jsp::join(&[&root, &old_b]), jsp::join(&[&root, &fresh]), jsp::join(&[&root, "keep-me"])] {
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let long_ago = std::time::SystemTime::now()
+        - std::time::Duration::from_secs(impeccable_hook::hook_sessions::EXPIRE_SECONDS + 3600);
+    for d in [&old_a, &old_b, &"keep-me".to_string()] {
+        std::fs::File::open(jsp::join(&[&root, d])).unwrap().set_modified(long_ago).unwrap();
+    }
+    impeccable_hook::hook_sessions::record_root(&rt_with(&t.path(), e), "new-session", &jsp::join(&[&t.path(), "p"]));
+    let names = names_in(&root);
+    assert!(!names.contains(&old_a), "{names:?}");
+    assert!(names.contains(&old_b) && names.contains(&fresh) && names.contains(&linked), "{names:?}");
+    assert!(names.contains(&"keep-me".to_string()) && names.contains(&sha256("new-session")), "{names:?}");
+    assert_eq!(names_in(&jsp::join(&[&root, &old_b])), vec!["notes.txt".to_string()]);
+    assert_eq!(names_in(&jsp::join(&[&root, &fresh])), vec![OLD_CLAIM.to_string()]);
+    assert!(t.exists(&format!("outside/{OLD_CLAIM}")));
+    assert!(t.exists("home/.impeccable/hook-sessions/keep-me/x"));
+}

@@ -1,8 +1,9 @@
 /**
  * `impeccable hook`, `hook-before-edit`, `hook-admin` corpus.
  * Workspace: hook-project (package.json, PRODUCT.md web, UI files with and
- * without findings). Multi-step cases share one staged workspace so the
- * session cache carries between steps.
+ * without findings); hook-umbrella (a plain folder holding the projects
+ * site/ and app/, for Stop from a cwd above them). Multi-step cases share
+ * one staged workspace so the session cache carries between steps.
  */
 
 import fs from 'node:fs';
@@ -217,6 +218,22 @@ export default [
     steps: [
       { stdin: claudeEdit('src/components/Card.module.css', { session_id: 'cx1', turn_id: 't-1' }) },
       { stdin: stop({ session_id: 'cx1', turn_id: 't-1' }) },
+    ],
+  },
+
+  // Umbrella session (#1101): the session cwd is a plain folder holding the
+  // projects, so the per-edit pass keys each cache to the project root below
+  // it. Stop finds them through the per-user session index (in the case's
+  // isolated HOME), reports both projects, and writes nothing in the
+  // umbrella folder. The second Stop is silent.
+  {
+    id: 'hook-stop-umbrella-cwd', verb: 'hook', workspace: 'hook-umbrella',
+    files: ['.impeccable/**', 'site/.impeccable/**', 'app/.impeccable/**'],
+    steps: [
+      { stdin: claudeEdit('site/src/a.css', { session_id: 'u1' }) },
+      { stdin: claudeEdit('app/src/b.css', { session_id: 'u1' }) },
+      { stdin: stop({ session_id: 'u1' }) },
+      { stdin: stop({ session_id: 'u1' }) },
     ],
   },
 
