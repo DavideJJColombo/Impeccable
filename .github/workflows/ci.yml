@@ -558,6 +558,9 @@ jobs:
           IMPECCABLE_E2E_INSTALL_TIMEOUT_MS: 180000
           IMPECCABLE_E2E_DEV_READY_TIMEOUT_MS: 120000
           IMPECCABLE_E2E_ARTIFACT_DIR: test-results/live-e2e/${{ matrix.group }}
+          # DEBUG-1081: temporary diagnostics, revert before merge.
+          IMPECCABLE_E2E_CONSOLE: 1
+          IMPECCABLE_E2E_DEBUG: 1
 
       - name: Upload live E2E failure artifacts
         if: failure()

@@ -2005,6 +2005,26 @@ async function runManualEditStage(page, stage, { t, fixture, session, agentMode,
           t.diagnostic(`--- source ${edit.expectedSourceFile} after visible-text failure ---`);
           t.diagnostic(readFileSync(join(tmp, edit.expectedSourceFile), 'utf-8'));
         }
+        // DEBUG-1081: which layer holds the stale text (DOM, React prop, Vite-served module)?
+        const probe = await page.evaluate(async ({ sel, expected, file }) => {
+          const el = document.querySelector(sel);
+          const propsKey = el && Object.keys(el).find((k) => k.startsWith('__reactProps$'));
+          const fiberKey = el && Object.keys(el).find((k) => k.startsWith('__reactFiber$'));
+          const fiber = fiberKey ? el[fiberKey] : null;
+          let served = null;
+          try { served = (await (await fetch('/' + file)).text()).includes(expected); } catch (e) { served = 'fetch error: ' + e.message; }
+          return {
+            dom: el ? el.textContent : null,
+            connected: el ? el.isConnected : null,
+            reactPropChildren: propsKey ? el[propsKey].children : '(no react props key)',
+            fiberMemoChildren: fiber ? fiber.memoizedProps?.children : null,
+            fiberStateNodeIsEl: fiber ? fiber.stateNode === el : null,
+            sameSelectorCount: document.querySelectorAll(sel).length,
+            viteServesNewText: served,
+            navEntries: performance.getEntriesByType('navigation').map((n) => n.type),
+          };
+        }, { sel: edit.leafSelector, expected: edit.expectedVisibleText, file: edit.expectedSourceFile || 'src/App.jsx' }).catch((e) => ({ probeError: e.message }));
+        t.diagnostic('DEBUG-1081 probe: ' + JSON.stringify(probe));
         throw err;
       }
     }
